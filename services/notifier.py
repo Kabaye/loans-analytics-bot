@@ -45,8 +45,6 @@ COMMISSION_RATES = {
 
 TAX_RATE = 0.13  # 13% income tax on gross profit
 
-MAX_NOTIFICATIONS_PER_USER = 50  # max notifications per user per poll cycle
-
 
 def _calc_commission(amount_return: float, service: str) -> float:
     """Calculate platform commission on the return amount."""
@@ -331,8 +329,6 @@ async def notify_users(
 
     sent = 0
     sent_pairs: set[tuple[int, str]] = set()  # (chat_id, entry_id) dedup
-    user_counts: dict[int, int] = {}  # per-user notification counter
-    user_limit_warned: set[int] = set()  # users already warned about limit
 
     for entry in entries:
         # Enrich from borrowers table (Zaimis, Kapusta, Mongo — no PDF enrichment)
@@ -345,22 +341,6 @@ async def notify_users(
             if not sub.matches(entry):
                 continue
 
-            # Per-user notification limit
-            if user_counts.get(chat_id, 0) >= MAX_NOTIFICATIONS_PER_USER:
-                if chat_id not in user_limit_warned:
-                    user_limit_warned.add(chat_id)
-                    try:
-                        await bot.send_message(
-                            chat_id,
-                            f"\u26a0\ufe0f \u041b\u0438\u043c\u0438\u0442 \u0443\u0432\u0435\u0434\u043e\u043c\u043b\u0435\u043d\u0438\u0439 ({MAX_NOTIFICATIONS_PER_USER}) \u0434\u043e\u0441\u0442\u0438\u0433\u043d\u0443\u0442!\n"
-                            f"\u041f\u0440\u043e\u0432\u0435\u0440\u044c\u0442\u0435 \u043f\u043e\u0434\u043f\u0438\u0441\u043a\u0438 \u2014 \u0432\u043e\u0437\u043c\u043e\u0436\u043d\u043e, \u0444\u0438\u043b\u044c\u0442\u0440\u044b \u0441\u043b\u0438\u0448\u043a\u043e\u043c \u0448\u0438\u0440\u043e\u043a\u0438\u0435.",
-                            parse_mode="HTML",
-                        )
-                    except Exception:
-                        pass
-                    log.warning("User %s hit notification limit (%d)", chat_id, MAX_NOTIFICATIONS_PER_USER)
-                continue
-
             sent_pairs.add((chat_id, entry.id))
 
             text = format_notification(entry, sub)
@@ -368,7 +348,6 @@ async def notify_users(
                 await bot.send_message(chat_id, text, parse_mode="HTML",
                                        disable_web_page_preview=True)
                 sent += 1
-                user_counts[chat_id] = user_counts.get(chat_id, 0) + 1
                 await asyncio.sleep(0.1)
             except TelegramRetryAfter as e:
                 log.warning("Flood control for %s: retry after %ds", chat_id, e.retry_after)

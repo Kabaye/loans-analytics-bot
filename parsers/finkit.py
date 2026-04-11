@@ -23,7 +23,7 @@ BORROWS_URL = "https://api-p2p.finkit.by/loans-to-invest/"
 LOAN_URL = "https://finkit.by/invest"
 
 NAME_ID_RE = re.compile(
-    r"Л,\s+([А-ЯЁA-Z]+(?:\s+[А-ЯЁA-Z]+){2}),\s+идентификационный\s+номер\s*([0-9A-Z]+)",
+    r"Я,\s+([А-ЯЁA-Z]+(?:\s+[А-ЯЁA-Z]+){2}),\s+идентификационный\s+номер\s*\n?\s*([0-9A-Z]+)",
     re.IGNORECASE | re.UNICODE | re.MULTILINE | re.DOTALL,
 )
 
@@ -35,6 +35,7 @@ BORROWER_WORK_MAP = {
     "entrepreneur": "ИП",
     "pensioner": "Пенсионер",
     "unemployed": "",
+    "other": "Другое",
 }
 
 

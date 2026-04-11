@@ -329,6 +329,7 @@ async def notify_users(
 
     sent = 0
     sent_pairs: set[tuple[int, str]] = set()  # (chat_id, entry_id) dedup
+    db = await get_db()
 
     for entry in entries:
         # Enrich from borrowers table (Zaimis, Kapusta, Mongo — no PDF enrichment)
@@ -339,6 +340,12 @@ async def notify_users(
             if (chat_id, entry.id) in sent_pairs:
                 continue
             if not sub.matches(entry):
+                continue
+
+            # Re-check subscription is still active (user may have pressed Stop All)
+            row = await db.execute_fetchone(
+                "SELECT is_active FROM subscriptions WHERE id = ?", (sub.id,))
+            if not row or not row["is_active"]:
                 continue
 
             sent_pairs.add((chat_id, entry.id))
@@ -352,6 +359,11 @@ async def notify_users(
             except TelegramRetryAfter as e:
                 log.warning("Flood control for %s: retry after %ds", chat_id, e.retry_after)
                 await asyncio.sleep(min(e.retry_after, 30))
+                # Re-check before retry
+                row = await db.execute_fetchone(
+                    "SELECT is_active FROM subscriptions WHERE id = ?", (sub.id,))
+                if not row or not row["is_active"]:
+                    continue
                 try:
                     await bot.send_message(chat_id, text, parse_mode="HTML",
                                            disable_web_page_preview=True)

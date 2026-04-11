@@ -13,6 +13,7 @@ import pdfplumber
 
 from bot.models import BorrowEntry, Subscription
 from bot.parsers.base import BaseParser
+from bot.database import save_session_cookies, load_session_cookies
 
 log = logging.getLogger(__name__)
 
@@ -85,9 +86,38 @@ def merge_filters(subs: list[Subscription]) -> tuple[dict, dict]:
 class ZaimisParser(BaseParser):
     SERVICE_NAME = "zaimis"
 
-    def __init__(self, **kwargs):
+    def __init__(self, chat_id: int | None = None, **kwargs):
         super().__init__(**kwargs)
         self._token: str | None = None
+        self._chat_id: int | None = chat_id
+
+    async def try_restore_session(self) -> bool:
+        """Try to restore JWT token from persisted storage."""
+        if not self._chat_id:
+            return False
+        result = await load_session_cookies("zaimis", self._chat_id)
+        if not result:
+            return False
+        cookies, _ = result
+        token = cookies.get("token")
+        if not token:
+            return False
+
+        # Test if token is still valid
+        session = await self._get_session()
+        try:
+            async with session.get(
+                f"{OFFERS_URL}?tab=give&skip=0&take=1",
+                headers={**HEADERS, "Authorization": f"Bearer {token}"},
+            ) as resp:
+                if resp.status == 200:
+                    self._token = token
+                    log.info("Zaimis session restored from DB for chat_id=%s", self._chat_id)
+                    return True
+                log.info("Zaimis saved token expired (status %s), will re-login", resp.status)
+        except Exception as e:
+            log.debug("Zaimis session restore check failed: %s", e)
+        return False
 
     async def login(self, username: str = "", password: str = "") -> bool:
         self._needs_reauth = False
@@ -107,6 +137,11 @@ class ZaimisParser(BaseParser):
                 if not self._token:
                     log.error("Zaimis login: no token in response")
                     return False
+                # Persist token for restart survival
+                if self._chat_id:
+                    await save_session_cookies(
+                        "zaimis", self._chat_id, {"token": self._token},
+                    )
                 log.info("Zaimis login OK")
                 return True
         except Exception as e:

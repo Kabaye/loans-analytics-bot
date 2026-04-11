@@ -1,4 +1,4 @@
-"""Search borrower handler — search by ФИО or ИН + manual add."""
+"""Search borrower handler — search by ФИО or ИН + quick ИН check + cross-search."""
 from __future__ import annotations
 
 import logging
@@ -17,6 +17,7 @@ from aiogram.types import (
 from bot.handlers.start import is_allowed
 from bot.database import (
     search_borrower_info, lookup_borrower_info, upsert_borrower_info,
+    search_borrowers,
 )
 from bot.services.opi_checker import OPIChecker
 
@@ -42,10 +43,15 @@ BACK_KB = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")]
 ])
 
+# 14 alphanumeric chars = likely ИН (identification number)
+IN_RE = re.compile(r"^[0-9A-Za-zА-Яа-я]{14}$")
+
+SVC_ICONS = {"kapusta": "🥔", "finkit": "🏦", "mongo": "🦊", "zaimis": "💎"}
+
 
 def _format_card(info: dict) -> str:
     """Format a borrower_info record as a readable card."""
-    lines = [f"<b>📋 Карточка заёмщика</b>"]
+    lines = ["<b>📋 Карточка заёмщика</b>"]
     lines.append(f"\n<b>ИН:</b> <code>{info['document_id']}</code>")
     if info.get("full_name"):
         lines.append(f"<b>ФИО:</b> {info['full_name']}")
@@ -70,16 +76,16 @@ def _format_card(info: dict) -> str:
 
     # OPI
     if info.get("opi_checked_at"):
+        checked = info["opi_checked_at"][:10] if info["opi_checked_at"] else "—"
         if info.get("opi_has_debt"):
             lines.append(f"\n❌ <b>ОПИ:</b> должен <b>{info.get('opi_debt_amount', 0):.2f}</b> BYN")
             if info.get("opi_full_name"):
                 lines.append(f"  Имя в ОПИ: {info['opi_full_name']}")
         else:
-            lines.append(f"\n✅ <b>ОПИ:</b> нет задолженности")
-        checked = info["opi_checked_at"][:19].replace("T", " ") if info["opi_checked_at"] else "—"
+            lines.append("\n✅ <b>ОПИ:</b> нет задолженности")
         lines.append(f"  Проверено: {checked}")
     else:
-        lines.append(f"\n⏳ ОПИ: не проверялось")
+        lines.append("\n⏳ ОПИ: не проверялось")
 
     if info.get("notes"):
         lines.append(f"\n📝 {info['notes']}")
@@ -87,6 +93,37 @@ def _format_card(info: dict) -> str:
     if info.get("source"):
         lines.append(f"\n<i>Источник: {info['source']}</i>")
 
+    return "\n".join(lines)
+
+
+def _format_borrower_row(b: dict, idx: int) -> str:
+    """Format a borrowers table row as a compact line."""
+    icon = SVC_ICONS.get(b["service"], "📋")
+    name = b.get("full_name") or "—"
+    doc = b.get("document_id") or "—"
+    total = b.get("total_loans") or 0
+    settled = b.get("settled_loans") or 0
+    invested = b.get("total_invested") or 0
+    return (
+        f"{idx}. {icon} {name}\n"
+        f"   ИН: <code>{doc}</code>\n"
+        f"   Займов: {total}, погашено: {settled}, инвест.: {invested:.0f}"
+    )
+
+
+def _format_opi_result(result, document_id: str) -> str:
+    """Format an OPI check result."""
+    lines = ["<b>🔍 Проверка ОПИ</b>\n", f"<b>ИН:</b> <code>{document_id}</code>\n"]
+    if result.error:
+        lines.append(f"⚠️ Ошибка: {result.error}")
+    elif result.has_debt:
+        lines.append(f"❌ <b>Должен: {result.debt_amount:.2f} BYN</b>")
+        if result.full_name:
+            lines.append(f"ФИО: {result.full_name}")
+    else:
+        lines.append("✅ Нет задолженности")
+        if result.full_name:
+            lines.append(f"ФИО: {result.full_name}")
     return "\n".join(lines)
 
 
@@ -103,7 +140,7 @@ async def cb_search_start(callback: CallbackQuery, state: FSMContext):
     ])
     await callback.message.edit_text(
         "🔍 <b>Поиск заёмщика</b>\n\n"
-        "Введите ФИО или ИН (идентификационный номер):",
+        "Введите ФИО или ИН (14 символов → мгновенная проверка ОПИ):",
         reply_markup=kb,
         parse_mode="HTML",
     )
@@ -119,9 +156,16 @@ async def msg_search_query(message: Message, state: FSMContext):
         await message.answer("❌ Слишком короткий запрос. Минимум 2 символа.")
         return
 
-    results = await search_borrower_info(query, limit=10)
+    # Quick ИН check: exactly 14 alphanumeric chars
+    if IN_RE.match(query):
+        await _handle_in_check(message, state, query.upper())
+        return
 
-    if not results:
+    # Cross-search: borrower_info + borrowers tables
+    bi_results = await search_borrower_info(query, limit=10)
+    b_results = await search_borrowers(query, limit=10)
+
+    if not bi_results and not b_results:
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="search_borrower")],
             [InlineKeyboardButton(text="➕ Добавить заёмщика", callback_data="add_borrower")],
@@ -134,10 +178,13 @@ async def msg_search_query(message: Message, state: FSMContext):
         )
         return
 
-    if len(results) == 1:
-        # Show full card
+    # If only one borrower_info result and no unique borrowers
+    bi_doc_ids = {r["document_id"] for r in bi_results}
+    unique_b = [b for b in b_results if b.get("document_id") not in bi_doc_ids]
+
+    if len(bi_results) == 1 and not unique_b:
         await state.clear()
-        info = results[0]
+        info = bi_results[0]
         text = _format_card(info)
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(
@@ -150,25 +197,110 @@ async def msg_search_query(message: Message, state: FSMContext):
         await message.answer(text, reply_markup=kb, parse_mode="HTML")
         return
 
-    # Multiple results — show list
+    # Show combined results
     await state.clear()
-    lines = [f"🔍 Найдено <b>{len(results)}</b> результатов:\n"]
+    lines = []
     buttons = []
-    for i, r in enumerate(results):
-        name = r.get("full_name") or "—"
-        doc = r["document_id"]
-        status = r.get("loan_status") or ""
-        lines.append(f"{i+1}. {name} / <code>{doc}</code> {status}")
-        buttons.append([InlineKeyboardButton(
-            text=f"{i+1}. {name[:30]}",
-            callback_data=f"bi_view:{doc}",
-        )])
+
+    if bi_results:
+        lines.append(f"<b>📋 Карточки ({len(bi_results)}):</b>\n")
+        for i, r in enumerate(bi_results):
+            name = r.get("full_name") or "—"
+            doc = r["document_id"]
+            status = r.get("loan_status") or ""
+            lines.append(f"{i+1}. {name} / <code>{doc}</code> {status}")
+            buttons.append([InlineKeyboardButton(
+                text=f"📋 {i+1}. {name[:30]}",
+                callback_data=f"bi_view:{doc}",
+            )])
+
+    if unique_b:
+        lines.append(f"\n<b>👥 Заёмщики из сервисов ({len(unique_b)}):</b>\n")
+        for j, b in enumerate(unique_b):
+            lines.append(_format_borrower_row(b, len(bi_results) + j + 1))
+            lines.append("")
 
     buttons.append([InlineKeyboardButton(text="🔍 Новый поиск", callback_data="search_borrower")])
     buttons.append([InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     await message.answer("\n".join(lines), reply_markup=kb, parse_mode="HTML")
 
+
+async def _handle_in_check(message: Message, state: FSMContext, document_id: str):
+    """Handle quick ИН check: lookup DB, then instant OPI check."""
+    await state.clear()
+
+    # First check if already in borrower_info
+    existing = await lookup_borrower_info(document_id)
+    if existing:
+        # Show existing card — user can re-check OPI from there
+        text = _format_card(existing)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="🔄 Проверить ОПИ",
+                callback_data=f"opi_check:{document_id}",
+            )],
+            [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="search_borrower")],
+            [InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")],
+        ])
+        await message.answer(text, reply_markup=kb, parse_mode="HTML")
+        return
+
+    # Not in DB — instant OPI check
+    status_msg = await message.answer("⏳ Проверяю ОПИ по ЕРИП...")
+
+    checker = OPIChecker()
+    try:
+        result = await checker.check(document_id, use_cache=False)
+    except Exception as ex:
+        log.warning("Quick ИН check failed for %s: %s", document_id, ex)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="search_borrower")],
+            [InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")],
+        ])
+        await status_msg.edit_text(f"⚠️ Ошибка при проверке: {ex}", reply_markup=kb)
+        return
+    finally:
+        await checker.close()
+
+    text = _format_opi_result(result, document_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="➕ Добавить в базу",
+            callback_data=f"quick_add:{document_id}",
+        )],
+        [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="search_borrower")],
+        [InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")],
+    ])
+    await status_msg.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+# --- Quick add after ИН check ---
+
+@router.callback_query(F.data.startswith("quick_add:"))
+async def cb_quick_add(callback: CallbackQuery, state: FSMContext):
+    if not await is_allowed(callback.message.chat.id):
+        return
+    doc_id = callback.data.split(":", 1)[1]
+
+    # Check if already exists
+    existing = await lookup_borrower_info(doc_id)
+    if existing:
+        await callback.answer("Уже есть в базе", show_alert=True)
+        return
+
+    await state.update_data(document_id=doc_id)
+    await state.set_state(AddBorrowerStates.waiting_full_name)
+    await callback.message.edit_text(
+        f"➕ <b>Добавить заёмщика</b>\n\n"
+        f"ИН: <code>{doc_id}</code>\n\n"
+        "Введите ФИО заёмщика:",
+        reply_markup=BACK_KB,
+        parse_mode="HTML",
+    )
+
+
+# --- View card ---
 
 @router.callback_query(F.data.startswith("bi_view:"))
 async def cb_view_card(callback: CallbackQuery):
@@ -191,6 +323,8 @@ async def cb_view_card(callback: CallbackQuery):
     ])
     await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
+
+# --- OPI check ---
 
 @router.callback_query(F.data.startswith("opi_check:"))
 async def cb_opi_check(callback: CallbackQuery):

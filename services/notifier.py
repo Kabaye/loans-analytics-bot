@@ -45,6 +45,8 @@ COMMISSION_RATES = {
 
 TAX_RATE = 0.13  # 13% income tax on gross profit
 
+MAX_NOTIFICATIONS_PER_USER = 50  # max notifications per user per poll cycle
+
 
 def _calc_commission(amount_return: float, service: str) -> float:
     """Calculate platform commission on the return amount."""
@@ -112,35 +114,68 @@ def format_notification(entry: BorrowEntry, sub: Subscription) -> str:
     borrower_lines = []
     if entry.full_name:
         borrower_lines.append(f"\n<b>{entry.full_name}</b>")
+    if entry.document_id:
+        borrower_lines.append(f"🆔 ИН: <code>{entry.document_id}</code>")
 
     # Employment + work type
     if entry.is_employed is not None:
         emp_text = "трудоустроен" if entry.is_employed else "безработный"
         emp_icon = "✅" if entry.is_employed else "⚠️"
-        if entry.display_name and entry.is_employed:
+        if entry.display_name:
             emp_text += f", {entry.display_name}"
         borrower_lines.append(f"{emp_icon}  {emp_text}")
 
-    # Settled loans / overdue history
-    settled = entry.loans_count_settled or entry.kb_settled
-    if settled is not None:
-        borrower_lines.append(f"✅  возвраты в срок:  {settled}")
+    # Previous nicknames (Zaimis)
+    if entry.kb_display_names and len(entry.kb_display_names) > 1:
+        prev = entry.kb_display_names[:-1]
+        borrower_lines.append(f"📛 ранее: {', '.join(prev)}")
 
-    overdue_count = entry.loans_count_overdue or entry.kb_overdue
-    if overdue_count is not None and overdue_count > 0:
+    # Total loans count (combined line)
+    settled = entry.loans_count_settled if entry.loans_count_settled is not None else entry.kb_settled
+    overdue_count = entry.loans_count_overdue if entry.loans_count_overdue is not None else entry.kb_overdue
+    total_loans = entry.loans_count or entry.kb_total_loans
+    if total_loans is not None or settled is not None:
+        parts = []
+        if total_loans is not None:
+            parts.append(f"всего: {total_loans}")
+        if settled is not None:
+            parts.append(f"в срок: {settled}")
+        if overdue_count is not None and overdue_count > 0:
+            parts.append(f"просроч: {overdue_count}")
+        borrower_lines.append(f"📊 займов: {', '.join(parts)}")
+    elif overdue_count is not None and overdue_count > 0:
         borrower_lines.append(f"⚠️  просрочки:  {overdue_count}")
-    elif entry.has_overdue is not None:
+
+    if entry.has_overdue is not None and overdue_count is None:
         borrower_lines.append(f"{'⚠️' if entry.has_overdue else '✅'}  просрочки:  {'были' if entry.has_overdue else 'нет'}")
 
     if entry.has_active_loan is not None:
         borrower_lines.append(f"{'⚠️' if entry.has_active_loan else '✅'}  активный займ:  {'Да' if entry.has_active_loan else 'Нет'}")
 
+    # Loan/repayment history (Finkit)
+    if entry.has_loan_history is not None:
+        borrower_lines.append(f"{'✅' if entry.has_loan_history else '❌'}  история займов:  {'да' if entry.has_loan_history else 'нет'}")
+    if entry.has_repayment_history is not None:
+        borrower_lines.append(f"{'✅' if entry.has_repayment_history else '❌'}  история погашений:  {'да' if entry.has_repayment_history else 'нет'}")
+
+    # Income confirmed (Zaimis)
+    if entry.is_income_confirmed is not None:
+        borrower_lines.append(f"{'✅' if entry.is_income_confirmed else '❌'}  доход подтв.:  {'да' if entry.is_income_confirmed else 'нет'}")
+
     # OPI
     if entry.opi_checked:
+        opi_date_str = ""
+        if entry.opi_checked_at:
+            try:
+                from datetime import datetime as _dt
+                _d = _dt.fromisoformat(entry.opi_checked_at)
+                opi_date_str = f" (пров. {_d.strftime('%d.%m')})"
+            except Exception:
+                opi_date_str = ""
         if entry.opi_has_debt:
-            borrower_lines.append(f"❌ ОПИ: должен <b>{entry.opi_debt_amount:.2f}</b>")
+            borrower_lines.append(f"❌ ОПИ: должен <b>{entry.opi_debt_amount:.2f}</b>{opi_date_str}")
         else:
-            borrower_lines.append("✅ ОПИ: нет задолженности")
+            borrower_lines.append(f"✅ ОПИ: нет задолженности{opi_date_str}")
 
     # Borrower info card (from Google Sheets / manual entry)
     if entry.bi_loan_status:
@@ -156,7 +191,7 @@ def format_notification(entry: BorrowEntry, sub: Subscription) -> str:
 
     # KB history
     if entry.kb_known and entry.kb_total_loans:
-        kb_parts = [f"займов: {entry.kb_total_loans}"]
+        kb_parts = [f"наших: {entry.kb_total_loans}"]
         if entry.kb_settled:
             kb_parts.append(f"погашено: {entry.kb_settled}")
         if entry.kb_overdue and entry.kb_overdue > 0:
@@ -258,6 +293,15 @@ async def enrich_entry_from_borrowers(entry: BorrowEntry) -> None:
         entry.opi_has_debt = bool(cached.get("opi_has_debt"))
         entry.opi_debt_amount = cached.get("opi_debt_amount")
         entry.opi_full_name = cached.get("opi_full_name")
+        entry.opi_checked_at = cached.get("opi_checked_at")
+    # Display names history (Zaimis nicknames)
+    if cached.get("display_names"):
+        try:
+            import json as _json
+            entry.kb_display_names = _json.loads(cached["display_names"])
+        except Exception:
+            pass
+
     # Investment stats from borrowers table
     if cached.get("total_loans") and cached["total_loans"] > 0:
         entry.kb_known = True
@@ -287,6 +331,8 @@ async def notify_users(
 
     sent = 0
     sent_pairs: set[tuple[int, str]] = set()  # (chat_id, entry_id) dedup
+    user_counts: dict[int, int] = {}  # per-user notification counter
+    user_limit_warned: set[int] = set()  # users already warned about limit
 
     for entry in entries:
         # Enrich from borrowers table (Zaimis, Kapusta, Mongo — no PDF enrichment)
@@ -299,6 +345,22 @@ async def notify_users(
             if not sub.matches(entry):
                 continue
 
+            # Per-user notification limit
+            if user_counts.get(chat_id, 0) >= MAX_NOTIFICATIONS_PER_USER:
+                if chat_id not in user_limit_warned:
+                    user_limit_warned.add(chat_id)
+                    try:
+                        await bot.send_message(
+                            chat_id,
+                            f"\u26a0\ufe0f \u041b\u0438\u043c\u0438\u0442 \u0443\u0432\u0435\u0434\u043e\u043c\u043b\u0435\u043d\u0438\u0439 ({MAX_NOTIFICATIONS_PER_USER}) \u0434\u043e\u0441\u0442\u0438\u0433\u043d\u0443\u0442!\n"
+                            f"\u041f\u0440\u043e\u0432\u0435\u0440\u044c\u0442\u0435 \u043f\u043e\u0434\u043f\u0438\u0441\u043a\u0438 \u2014 \u0432\u043e\u0437\u043c\u043e\u0436\u043d\u043e, \u0444\u0438\u043b\u044c\u0442\u0440\u044b \u0441\u043b\u0438\u0448\u043a\u043e\u043c \u0448\u0438\u0440\u043e\u043a\u0438\u0435.",
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
+                    log.warning("User %s hit notification limit (%d)", chat_id, MAX_NOTIFICATIONS_PER_USER)
+                continue
+
             sent_pairs.add((chat_id, entry.id))
 
             text = format_notification(entry, sub)
@@ -306,6 +368,7 @@ async def notify_users(
                 await bot.send_message(chat_id, text, parse_mode="HTML",
                                        disable_web_page_preview=True)
                 sent += 1
+                user_counts[chat_id] = user_counts.get(chat_id, 0) + 1
                 await asyncio.sleep(0.1)
             except TelegramRetryAfter as e:
                 log.warning("Flood control for %s: retry after %ds", chat_id, e.retry_after)

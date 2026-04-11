@@ -12,10 +12,20 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from bot import config
+import io
+import re
+
+import pdfplumber
+
 from bot.database import (
     get_db, get_site_settings,
     upsert_borrower_from_investment, get_stale_opi_documents,
     save_opi_result, upsert_borrower,
+)
+
+_NAME_ID_RE = re.compile(
+    r"Я,\s+([А-ЯЁA-Z]+(?:\s+[А-ЯЁA-Z]+){2}),\s+идентификационный\s+номер\s*([0-9A-Z]+)",
+    re.IGNORECASE | re.UNICODE | re.MULTILINE | re.DOTALL,
 )
 from bot.models import BorrowEntry, UserCredentials
 from bot.parsers.kapusta import KapustaParser, KapustaBlockedError
@@ -54,8 +64,9 @@ _kapusta_backoff_until: Optional[datetime] = None
 # === Per-site last poll timestamps (for custom intervals + time-based filtering) ===
 _last_poll: dict[str, datetime] = {}
 
-# === Per-site seen entry IDs (for reliable freshness detection) ===
+# === Per-site seen entry IDs (in-memory cache, backed by DB) ===
 _seen_ids: dict[str, set[str]] = {}
+_seen_ids_loaded: dict[str, bool] = {}
 
 # === Error tracking — notify admin once per site failure ===
 _error_notified: dict[str, bool] = {
@@ -72,18 +83,73 @@ def _get_cutoff(service: str) -> datetime | None:
     return _last_poll.get(service)
 
 
-def _compute_fresh(entries: list[BorrowEntry], service: str) -> list[BorrowEntry]:
-    """Compute fresh entries using ID-based tracking.
-    First poll initialises the set and returns empty (no flood on startup).
-    Subsequent polls return entries whose ID was not in the previous set."""
+async def _compute_fresh(entries: list[BorrowEntry], service: str) -> list[BorrowEntry]:
+    """Compute fresh entries using ID-based tracking backed by DB.
+    First poll loads from DB; entries not in DB are fresh (unless first-ever run).
+    Updates DB with current entry IDs and prunes entries older than 7 days."""
     current_ids = {e.id for e in entries}
-    if service not in _seen_ids:
-        _seen_ids[service] = current_ids
-        return []
+
+    # Load from DB on first call for this service
+    if not _seen_ids_loaded.get(service):
+        db = await get_db()
+        try:
+            rows = await db.execute_fetchall(
+                "SELECT entry_id FROM seen_entries WHERE service = ?", (service,)
+            )
+            _seen_ids[service] = {r["entry_id"] for r in rows}
+        finally:
+            await db.close()
+        _seen_ids_loaded[service] = True
+
+        if not _seen_ids[service]:
+            # First-ever run: seed DB, no notifications
+            await _save_seen_ids(service, current_ids)
+            _seen_ids[service] = current_ids
+            return []
+
     prev = _seen_ids[service]
     fresh = [e for e in entries if e.id not in prev]
     _seen_ids[service] = current_ids
+
+    # Persist changes to DB
+    new_ids = current_ids - prev
+    gone_ids = prev - current_ids
+    if new_ids or gone_ids:
+        db = await get_db()
+        try:
+            if new_ids:
+                await db.executemany(
+                    "INSERT OR IGNORE INTO seen_entries (service, entry_id) VALUES (?, ?)",
+                    [(service, eid) for eid in new_ids],
+                )
+            if gone_ids:
+                await db.executemany(
+                    "DELETE FROM seen_entries WHERE service = ? AND entry_id = ?",
+                    [(service, eid) for eid in gone_ids],
+                )
+            # Prune entries older than 7 days
+            await db.execute(
+                "DELETE FROM seen_entries WHERE service = ? AND first_seen < datetime('now', '-7 days')",
+                (service,),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
     return fresh
+
+
+async def _save_seen_ids(service: str, ids: set[str]) -> None:
+    """Bulk-insert seen IDs for initial seeding."""
+    db = await get_db()
+    try:
+        await db.executemany(
+            "INSERT OR IGNORE INTO seen_entries (service, entry_id) VALUES (?, ?)",
+            [(service, eid) for eid in ids],
+        )
+        await db.commit()
+    finally:
+        await db.close()
 
 
 def _is_fresh(entry: BorrowEntry, cutoff: datetime | None) -> bool:
@@ -194,7 +260,7 @@ async def poll_kapusta(bot: Bot) -> None:
         _clear_error("kapusta")
         _kapusta_backoff_until = None
         if entries:
-            fresh = _compute_fresh(entries, "kapusta")
+            fresh = await _compute_fresh(entries, "kapusta")
             if fresh:
                 cnt = await notify_users(bot, fresh, "kapusta")
                 log.info("Sent %d notifications for kapusta (%d fresh / %d total)", cnt, len(fresh), len(entries))
@@ -222,7 +288,7 @@ async def poll_mongo(bot: Bot) -> None:
         entries = await _mongo.fetch_borrows()
         _clear_error("mongo")
         if entries:
-            fresh = _compute_fresh(entries, "mongo")
+            fresh = await _compute_fresh(entries, "mongo")
             if fresh:
                 cnt = await notify_users(bot, fresh, "mongo")
                 log.info("Sent %d notifications for mongo (%d fresh / %d total)", cnt, len(fresh), len(entries))
@@ -245,11 +311,14 @@ async def poll_finkit(bot: Bot) -> None:
         for cred in creds_list:
             parser = _finkit_parsers.get(cred.chat_id)
             if parser is None:
-                parser = FinkitParser()
-                ok = await parser.login(cred.login, cred.password)
-                if not ok:
-                    log.warning("Finkit login failed for chat_id=%s", cred.chat_id)
-                    continue
+                parser = FinkitParser(chat_id=cred.chat_id)
+                # Try to restore saved session first
+                restored = await parser.try_restore_session()
+                if not restored:
+                    ok = await parser.login(cred.login, cred.password)
+                    if not ok:
+                        log.warning("Finkit login failed for chat_id=%s", cred.chat_id)
+                        continue
                 _finkit_parsers[cred.chat_id] = parser
 
             entries = await parser.fetch_borrows()
@@ -258,7 +327,7 @@ async def poll_finkit(bot: Bot) -> None:
             if parser.needs_reauth:
                 log.info("Finkit session expired for chat_id=%s — re-logging in", cred.chat_id)
                 await parser.close()
-                new_parser = FinkitParser()
+                new_parser = FinkitParser(chat_id=cred.chat_id)
                 ok = await new_parser.login(cred.login, cred.password)
                 if ok:
                     _finkit_parsers[cred.chat_id] = new_parser
@@ -292,7 +361,7 @@ async def poll_finkit(bot: Bot) -> None:
                     all_entries.append(entry)
 
         # ID-based freshness for aggregated entries
-        fresh_entries = _compute_fresh(all_entries, "finkit")
+        fresh_entries = await _compute_fresh(all_entries, "finkit")
 
         # OPI check for fresh entries that have document_id but no cached OPI
         if fresh_entries:
@@ -343,11 +412,13 @@ async def poll_zaimis(bot: Bot) -> None:
         for cred in creds_list:
             parser = _zaimis_parsers.get(cred.chat_id)
             if parser is None:
-                parser = ZaimisParser()
-                ok = await parser.login(cred.login, cred.password)
-                if not ok:
-                    log.warning("Zaimis login failed for chat_id=%s", cred.chat_id)
-                    continue
+                parser = ZaimisParser(chat_id=cred.chat_id)
+                restored = await parser.try_restore_session()
+                if not restored:
+                    ok = await parser.login(cred.login, cred.password)
+                    if not ok:
+                        log.warning("Zaimis login failed for chat_id=%s", cred.chat_id)
+                        continue
                 _zaimis_parsers[cred.chat_id] = parser
 
             entries = await parser.fetch_borrows(subscriptions=subs_list)
@@ -356,7 +427,7 @@ async def poll_zaimis(bot: Bot) -> None:
             if parser.needs_reauth:
                 log.info("Zaimis token expired for chat_id=%s — re-logging in", cred.chat_id)
                 await parser.close()
-                new_parser = ZaimisParser()
+                new_parser = ZaimisParser(chat_id=cred.chat_id)
                 ok = await new_parser.login(cred.login, cred.password)
                 if ok:
                     _zaimis_parsers[cred.chat_id] = new_parser
@@ -372,8 +443,17 @@ async def poll_zaimis(bot: Bot) -> None:
                         seen_entry_ids.add(entry.id)
                         all_entries.append(entry)
 
+        # Save all Zaimis borrowers we see (track nicknames)
+        for entry in all_entries:
+            if entry.borrower_user_id:
+                await upsert_borrower(
+                    service="zaimis",
+                    borrower_user_id=entry.borrower_user_id,
+                    display_name=entry.display_name,
+                )
+
         # ID-based freshness for aggregated entries
-        fresh = _compute_fresh(all_entries, "zaimis")
+        fresh = await _compute_fresh(all_entries, "zaimis")
         if fresh:
             cnt = await notify_users(bot, fresh, "zaimis")
             log.info("Sent %d notifications for zaimis (%d fresh / %d total)", cnt, len(fresh), len(all_entries))
@@ -398,15 +478,17 @@ async def midnight_refresh_investments(bot: Bot) -> None:
         db = await get_db()
         try:
             creds = await db.execute_fetchall(
-                "SELECT login, password FROM credentials WHERE service='finkit'"
+                "SELECT chat_id, login, password FROM credentials WHERE service='finkit'"
             )
         finally:
             await db.close()
 
         for cred in creds:
             try:
-                fp = FinkitParser()
-                ok = await fp.login(cred["login"], cred["password"])
+                chat_id = cred["chat_id"] if "chat_id" in cred.keys() else None
+                fp = FinkitParser(chat_id=chat_id)
+                restored = await fp.try_restore_session() if chat_id else False
+                ok = restored or await fp.login(cred["login"], cred["password"])
                 if not ok:
                     errors.append(f"Finkit login failed: {cred['login']}")
                     continue
@@ -415,8 +497,8 @@ async def midnight_refresh_investments(bot: Bot) -> None:
                 cookie_str = "; ".join(f"{k}={v}" for k, v in fp._session_cookies.items())
                 headers = {"Accept": "application/json", "Referer": "https://finkit.by/", "Cookie": cookie_str}
 
-                # Aggregate per borrower from investments
-                borrower_stats: dict[str, dict] = {}
+                # Step 1: collect all investments from list endpoint
+                all_investments: list[dict] = []
                 page = 1
                 while True:
                     url = f"https://api-p2p.finkit.by/user/investments/?page={page}"
@@ -424,51 +506,120 @@ async def midnight_refresh_investments(bot: Bot) -> None:
                         if resp.status != 200:
                             break
                         data = await resp.json()
-
-                    for inv in data.get("results", []):
-                        buid = inv.get("user")
-                        if not buid:
-                            buid = inv.get("loan")  # fallback
-                        if not buid:
-                            continue
-                        buid = str(buid)
-                        bname = inv.get("borrower_full_name", "")
-                        if buid not in borrower_stats:
-                            borrower_stats[buid] = {
-                                "full_name": bname, "total": 0, "settled": 0,
-                                "overdue": 0, "ratings": [], "invested": 0.0,
-                            }
-                        s = borrower_stats[buid]
-                        s["total"] += 1
-                        if inv.get("status") == "settled":
-                            s["settled"] += 1
-                        if inv.get("is_overdue"):
-                            s["overdue"] += 1
-                        try:
-                            s["invested"] += float(inv.get("amount", 0))
-                        except (ValueError, TypeError):
-                            pass
-                        try:
-                            rating = float(inv.get("borrower_score", 0))
-                            if rating > 0:
-                                s["ratings"].append(rating)
-                        except (ValueError, TypeError):
-                            pass
-                        total_finkit += 1
-
+                    all_investments.extend(data.get("results", []))
                     if not data.get("next"):
                         break
                     page += 1
 
-                for buid, s in borrower_stats.items():
+                log.info("Finkit %s: fetched %d investments from list",
+                         cred["login"], len(all_investments))
+
+                # Step 2: aggregate stats per borrower_full_name
+                name_stats: dict[str, dict] = {}
+                name_to_inv_ids: dict[str, list[str]] = {}
+                for inv in all_investments:
+                    bname = (inv.get("borrower_full_name") or "").strip()
+                    if not bname:
+                        continue
+                    if bname not in name_stats:
+                        name_stats[bname] = {
+                            "total": 0, "settled": 0, "overdue": 0,
+                            "ratings": [], "invested": 0.0,
+                        }
+                        name_to_inv_ids[bname] = []
+                    s = name_stats[bname]
+                    s["total"] += 1
+                    status = inv.get("status", "")
+                    if status == "settled" and inv.get("closed", False):
+                        s["settled"] += 1
+                    if inv.get("is_overdue"):
+                        s["overdue"] += 1
+                    try:
+                        s["invested"] += float(inv.get("amount", 0))
+                    except (ValueError, TypeError):
+                        pass
+                    try:
+                        rating = float(inv.get("borrower_score", 0))
+                        if rating > 0:
+                            s["ratings"].append(rating)
+                    except (ValueError, TypeError):
+                        pass
+                    total_finkit += 1
+                    inv_id = inv.get("id")
+                    if inv_id:
+                        name_to_inv_ids[bname].append(inv_id)
+
+                # Step 3: resolve borrower_user_id for each unique borrower
+                db2 = await get_db()
+                try:
+                    existing = await db2.execute_fetchall(
+                        "SELECT borrower_user_id, full_name FROM borrowers WHERE service='finkit'"
+                    )
+                finally:
+                    await db2.close()
+                name_to_buid: dict[str, str] = {
+                    row["full_name"]: row["borrower_user_id"]
+                    for row in existing if row["full_name"]
+                }
+
+                pdf_enriched = 0
+                for bname, s in name_stats.items():
+                    buid = name_to_buid.get(bname)
+
+                    # Unknown borrower → fetch detail + PDF to extract ИН
+                    if not buid and name_to_inv_ids.get(bname):
+                        inv_id = name_to_inv_ids[bname][0]
+                        detail_url = f"https://api-p2p.finkit.by/user/investments/{inv_id}/"
+                        try:
+                            async with session.get(detail_url, headers=headers) as resp:
+                                if resp.status == 200:
+                                    detail = await resp.json()
+                                    loan_uuid = detail.get("loan", inv_id)
+                                    buid = str(loan_uuid)
+                                    # Try PDF extraction for ИН
+                                    pdf_url = detail.get("latest_contract_url")
+                                    if pdf_url:
+                                        try:
+                                            async with session.get(pdf_url) as pdf_resp:
+                                                if pdf_resp.status == 200:
+                                                    pdf_bytes = await pdf_resp.read()
+                                                    doc_id = None
+                                                    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                                                        for pg in pdf.pages:
+                                                            text = pg.extract_text() or ""
+                                                            m = _NAME_ID_RE.search(text)
+                                                            if m:
+                                                                doc_id = m.group(2).strip()
+                                                                break
+                                                    if doc_id and len(doc_id) == 14:
+                                                        await upsert_borrower(
+                                                            service="finkit",
+                                                            borrower_user_id=buid,
+                                                            full_name=bname,
+                                                            document_id=doc_id,
+                                                        )
+                                                        pdf_enriched += 1
+                                                        log.info("Finkit midnight PDF: %s → ИН %s", bname, doc_id)
+                                        except Exception as ex:
+                                            log.debug("Finkit midnight PDF error for %s: %s", bname, ex)
+                            await asyncio.sleep(0.2)
+                        except Exception as ex:
+                            log.warning("Finkit detail fetch error for %s: %s", bname, ex)
+
+                    if not buid:
+                        continue
+
                     avg_r = sum(s["ratings"]) / len(s["ratings"]) if s["ratings"] else None
                     await upsert_borrower_from_investment(
                         service="finkit", borrower_user_id=buid,
-                        full_name=s["full_name"] or None,
+                        full_name=bname or None,
                         total_loans=s["total"], settled_loans=s["settled"],
                         overdue_loans=s["overdue"], avg_rating=avg_r,
                         total_invested=s["invested"],
                     )
+
+                if pdf_enriched:
+                    log.info("Finkit midnight: enriched %d new borrowers with ИН from PDF", pdf_enriched)
 
                 await fp.close()
             except Exception as ex:
@@ -481,15 +632,17 @@ async def midnight_refresh_investments(bot: Bot) -> None:
         db = await get_db()
         try:
             creds = await db.execute_fetchall(
-                "SELECT login, password FROM credentials WHERE service='zaimis'"
+                "SELECT chat_id, login, password FROM credentials WHERE service='zaimis'"
             )
         finally:
             await db.close()
 
         for cred in creds:
             try:
-                zp = ZaimisParser()
-                ok = await zp.login(cred["login"], cred["password"])
+                chat_id = cred["chat_id"] if "chat_id" in cred.keys() else None
+                zp = ZaimisParser(chat_id=chat_id)
+                restored = await zp.try_restore_session() if chat_id else False
+                ok = restored or await zp.login(cred["login"], cred["password"])
                 if not ok:
                     errors.append(f"Zaimis login failed: {cred['login']}")
                     continue

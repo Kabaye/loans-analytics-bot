@@ -39,6 +39,7 @@ class SubForm(StatesGroup):
     interest_min = State()
     require_employed = State()
     min_settled_loans = State()
+    confirm = State()
 
 
 class SubEditForm(StatesGroup):
@@ -124,6 +125,7 @@ async def _show_subscriptions(target, chat_id: int, edit: bool = False):
     if has_night_paused:
         buttons.append([InlineKeyboardButton(text="☀️ Утренний старт", callback_data="sub_night_resume")])
 
+    buttons.append([InlineKeyboardButton(text="🛑 Стоп все уведомления", callback_data="subs_stop_all")])
     buttons.append([InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     text = "\n".join(lines)
@@ -216,6 +218,10 @@ async def sub_set_label(message: Message, state: FSMContext):
 
 @router.message(SubForm.sum_min)
 async def sub_set_sum_min(message: Message, state: FSMContext):
+    ok, err = _validate_number(message.text)
+    if not ok:
+        await message.answer(err, parse_mode="HTML")
+        return
     await state.update_data(sum_min=_parse_float(message.text))
     await message.answer("💰 Макс. сумма? (<code>-</code> пропустить)", parse_mode="HTML")
     await state.set_state(SubForm.sum_max)
@@ -223,6 +229,10 @@ async def sub_set_sum_min(message: Message, state: FSMContext):
 
 @router.message(SubForm.sum_max)
 async def sub_set_sum_max(message: Message, state: FSMContext):
+    ok, err = _validate_number(message.text)
+    if not ok:
+        await message.answer(err, parse_mode="HTML")
+        return
     await state.update_data(sum_max=_parse_float(message.text))
     await message.answer("📊 Мин. рейтинг? (<code>-</code> пропустить)", parse_mode="HTML")
     await state.set_state(SubForm.rating_min)
@@ -230,6 +240,10 @@ async def sub_set_sum_max(message: Message, state: FSMContext):
 
 @router.message(SubForm.rating_min)
 async def sub_set_rating_min(message: Message, state: FSMContext):
+    ok, err = _validate_number(message.text)
+    if not ok:
+        await message.answer(err, parse_mode="HTML")
+        return
     await state.update_data(rating_min=_parse_float(message.text))
     await message.answer("📅 Мин. срок (дней)? (<code>-</code> пропустить)", parse_mode="HTML")
     await state.set_state(SubForm.period_min)
@@ -237,6 +251,10 @@ async def sub_set_rating_min(message: Message, state: FSMContext):
 
 @router.message(SubForm.period_min)
 async def sub_set_period_min(message: Message, state: FSMContext):
+    ok, err = _validate_number(message.text, allow_float=False)
+    if not ok:
+        await message.answer(err, parse_mode="HTML")
+        return
     await state.update_data(period_min=_parse_int(message.text))
     await message.answer("📅 Макс. срок (дней)? (<code>-</code> пропустить)", parse_mode="HTML")
     await state.set_state(SubForm.period_max)
@@ -244,6 +262,10 @@ async def sub_set_period_min(message: Message, state: FSMContext):
 
 @router.message(SubForm.period_max)
 async def sub_set_period_max(message: Message, state: FSMContext):
+    ok, err = _validate_number(message.text, allow_float=False)
+    if not ok:
+        await message.answer(err, parse_mode="HTML")
+        return
     await state.update_data(period_max=_parse_int(message.text))
     await message.answer("💵 Мин. ставка (%/день)? (<code>-</code> пропустить)", parse_mode="HTML")
     await state.set_state(SubForm.interest_min)
@@ -251,6 +273,10 @@ async def sub_set_period_max(message: Message, state: FSMContext):
 
 @router.message(SubForm.interest_min)
 async def sub_set_interest_min(message: Message, state: FSMContext):
+    ok, err = _validate_number(message.text)
+    if not ok:
+        await message.answer(err, parse_mode="HTML")
+        return
     await state.update_data(interest_min=_parse_float(message.text))
 
     data = await state.get_data()
@@ -268,7 +294,7 @@ async def sub_set_interest_min(message: Message, state: FSMContext):
         await state.set_state(SubForm.require_employed)
     else:
         await state.update_data(require_employed=None, min_settled_loans=None)
-        await _save_subscription(message, state)
+        await _show_confirmation(message, state)
 
 
 @router.callback_query(F.data.startswith("sub_emp_"))
@@ -288,16 +314,86 @@ async def sub_set_employed(callback: CallbackQuery, state: FSMContext):
         await state.set_state(SubForm.min_settled_loans)
     else:
         await state.update_data(min_settled_loans=None)
-        await _save_subscription(callback.message, state, edit=True)
+        await _show_confirmation(callback.message, state, edit=True)
 
 
 @router.message(SubForm.min_settled_loans)
 async def sub_set_min_settled(message: Message, state: FSMContext):
+    ok, err = _validate_number(message.text, allow_float=False)
+    if not ok:
+        await message.answer(err, parse_mode="HTML")
+        return
     val = _parse_int(message.text)
     if val is not None and val <= 0:
         val = None
     await state.update_data(min_settled_loans=val)
-    await _save_subscription(message, state)
+    await _show_confirmation(message, state)
+
+
+SERVICES_RU = {
+    "kapusta": "🥔 Капуста",
+    "finkit": "🏦 Финкит",
+    "mongo": "🦊 Монго",
+    "zaimis": "💎 Займись",
+}
+
+
+async def _show_confirmation(target, state: FSMContext, edit: bool = False):
+    """Show subscription summary and ask for confirmation."""
+    data = await state.get_data()
+    service = data.get("service", "?")
+    svc_name = SERVICES_RU.get(service, service)
+    label = data.get("label") or "—"
+
+    lines = [f"📋 <b>Подтвердите подписку:</b>", f"{svc_name} — {label}", ""]
+
+    def _fmt(val, suffix=""):
+        return f"<b>{val}{suffix}</b>" if val is not None else "—"
+
+    sum_min = data.get("sum_min")
+    sum_max = data.get("sum_max")
+    lines.append(f"💰 Сумма: {_fmt(sum_min)} .. {_fmt(sum_max)}")
+    lines.append(f"📊 Рейтинг: ≥ {_fmt(data.get('rating_min'))}")
+
+    period_min = data.get("period_min")
+    period_max = data.get("period_max")
+    lines.append(f"📅 Срок: {_fmt(period_min, ' д.')} .. {_fmt(period_max, ' д.')}")
+    lines.append(f"💵 Ставка: ≥ {_fmt(data.get('interest_min'), '%/д')}")
+
+    if data.get("require_employed"):
+        lines.append("🏢 Только трудоустроенных")
+    if data.get("min_settled_loans"):
+        lines.append(f"📊 Мин. возвратов: {data['min_settled_loans']}")
+
+    text_msg = "\n".join(lines)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Создать", callback_data="sub_confirm_yes"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="sub_confirm_no"),
+        ]
+    ])
+
+    await state.set_state(SubForm.confirm)
+    if edit:
+        await target.edit_text(text_msg, reply_markup=kb, parse_mode="HTML")
+    else:
+        await target.answer(text_msg, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(F.data == "sub_confirm_yes")
+async def sub_confirm_yes(callback: CallbackQuery, state: FSMContext):
+    await _save_subscription(callback.message, state, edit=True)
+
+
+@router.callback_query(F.data == "sub_confirm_no")
+async def sub_confirm_no(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔔 Подписки", callback_data="subs_menu")],
+        [InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")],
+    ])
+    await callback.message.edit_text("❌ Подписка отменена.", reply_markup=kb)
+
 
 
 async def _save_subscription(target, state: FSMContext, edit: bool = False):
@@ -648,7 +744,52 @@ async def sub_back(callback: CallbackQuery, state: FSMContext):
     await _show_subscriptions(callback.message, callback.message.chat.id, edit=True)
 
 
+
+@router.callback_query(F.data == "subs_stop_all")
+async def sub_stop_all(callback: CallbackQuery, state: FSMContext):
+    """Deactivate ALL subscriptions for this user immediately."""
+    chat_id = callback.message.chat.id
+    db = await get_db()
+    try:
+        await db.execute(
+            "UPDATE subscriptions SET is_active = 0 WHERE chat_id = ?",
+            (chat_id,),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+    await state.clear()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔔 Подписки", callback_data="subs_menu")],
+        [InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")],
+    ])
+    await callback.message.edit_text(
+        "🛑 Все подписки отключены!\n"
+        "Уведомления больше не будут приходить.\n\n"
+        "Чтобы снова получать — включите нужные подписки в меню.",
+        reply_markup=kb,
+    )
+
+
+
 # ---- Helpers ----
+
+def _validate_number(text, allow_float=True):
+    """Check if text is a valid number or skip marker."""
+    if not text or text.strip() in ("-", "—", ""):
+        return True, ""
+    cleaned = text.strip().replace(",", ".")
+    try:
+        if allow_float:
+            float(cleaned)
+        else:
+            int(cleaned)
+        return True, ""
+    except ValueError:
+        kind = "число" if allow_float else "целое число"
+        return False, f"❌ «{text.strip()}» — не {kind}. Введите {kind} или <code>-</code> для пропуска."
+
+
 
 def _parse_float(text: str | None) -> float | None:
     if not text or text.strip() in ("-", "—", ""):

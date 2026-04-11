@@ -38,6 +38,8 @@ class BorrowEntry:
     is_employed: Optional[bool] = None
     has_active_loan: Optional[bool] = None
     has_overdue: Optional[bool] = None
+    has_loan_history: Optional[bool] = None
+    has_repayment_history: Optional[bool] = None
     note: Optional[str] = None
     status: Optional[str] = None
     contract_url: Optional[str] = None
@@ -54,6 +56,7 @@ class BorrowEntry:
     opi_debt_amount: Optional[float] = None
     opi_full_name: Optional[str] = None
     opi_error: Optional[str] = None
+    opi_checked_at: Optional[str] = None  # ISO date string
 
     # Known borrower enrichment (from investment history)
     kb_known: bool = False
@@ -65,6 +68,7 @@ class BorrowEntry:
     kb_avg_rating: Optional[float] = None
     kb_last_rating: Optional[float] = None
     kb_total_invested: Optional[float] = None
+    kb_display_names: Optional[list] = None  # historical nicknames
 
     # Borrower info card (from borrower_info table / Google Sheets import)
     bi_loan_status: Optional[str] = None    # в срок / просрочка / все плохо

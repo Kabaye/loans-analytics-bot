@@ -16,7 +16,7 @@ class BaseParser(abc.ABC):
 
     SERVICE_NAME: str = ""
 
-    def __init__(self, session: Optional[aiohttp.ClientSession] = None):
+    def __init__(self, session: Optional[aiohttp.ClientSession] = None, **kwargs):
         self._session = session
         self._owns_session = session is None
         self._needs_reauth = False

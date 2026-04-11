@@ -11,6 +11,7 @@ from aiogram.exceptions import TelegramRetryAfter
 
 from bot.database import get_db, lookup_borrower
 from bot.models import BorrowEntry, Subscription
+from bot.services.fsm_guard import is_busy, enqueue
 
 log = logging.getLogger(__name__)
 
@@ -343,14 +344,21 @@ async def notify_users(
                 continue
 
             # Re-check subscription is still active (user may have pressed Stop All)
-            row = await db.execute_fetchone(
+            rows = await db.execute_fetchall(
                 "SELECT is_active FROM subscriptions WHERE id = ?", (sub.id,))
-            if not row or not row["is_active"]:
+            if not rows or not rows[0]["is_active"]:
                 continue
 
             sent_pairs.add((chat_id, entry.id))
 
             text = format_notification(entry, sub)
+
+            # Queue notification if user is in active FSM flow
+            if is_busy(chat_id):
+                enqueue(chat_id, text)
+                log.debug("Queued notification for busy user %s", chat_id)
+                continue
+
             try:
                 await bot.send_message(chat_id, text, parse_mode="HTML",
                                        disable_web_page_preview=True)
@@ -360,9 +368,9 @@ async def notify_users(
                 log.warning("Flood control for %s: retry after %ds", chat_id, e.retry_after)
                 await asyncio.sleep(min(e.retry_after, 30))
                 # Re-check before retry
-                row = await db.execute_fetchone(
+                rows = await db.execute_fetchall(
                     "SELECT is_active FROM subscriptions WHERE id = ?", (sub.id,))
-                if not row or not row["is_active"]:
+                if not rows or not rows[0]["is_active"]:
                     continue
                 try:
                     await bot.send_message(chat_id, text, parse_mode="HTML",

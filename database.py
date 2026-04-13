@@ -331,7 +331,7 @@ async def lookup_borrower_info(document_id: str) -> dict | None:
 
 
 async def search_borrower_info(query: str, limit: int = 10) -> list[dict]:
-    """Search borrower_info by ФИО or ИН (partial match)."""
+    """Search borrower_info + borrowers by ФИО or ИН (partial match)."""
     db = await get_db()
     try:
         q = query.strip()
@@ -342,12 +342,45 @@ async def search_borrower_info(query: str, limit: int = 10) -> list[dict]:
                 (f"%{q}%", limit),
             )
         else:
-            # Search by full_name (case-insensitive)
+            # Search borrower_info by full_name
             rows = await db.execute_fetchall(
                 "SELECT * FROM borrower_info WHERE full_name LIKE ? COLLATE NOCASE LIMIT ?",
                 (f"%{q}%", limit),
             )
-        return [dict(r) for r in rows]
+            # Also search borrowers table for entries not in borrower_info
+            found_docs = {r["document_id"] for r in rows if r["document_id"]}
+            extra = await db.execute_fetchall(
+                """SELECT DISTINCT full_name, document_id, service,
+                          total_loans, settled_loans, overdue_loans
+                   FROM borrowers
+                   WHERE full_name LIKE ? COLLATE NOCASE
+                   LIMIT ?""",
+                (f"%{q}%", limit),
+            )
+            for r in extra:
+                doc = r["document_id"]
+                if doc and doc in found_docs:
+                    continue
+                # Build a pseudo borrower_info dict
+                rows.append({
+                    "document_id": doc,
+                    "full_name": r["full_name"],
+                    "loan_status": None,
+                    "sum_category": None,
+                    "rating": None,
+                    "notes": f"из {r['service']}" if r["service"] else None,
+                    "last_loan_date": None,
+                    "loan_count": r["total_loans"],
+                    "source": r["service"],
+                    "opi_has_debt": None,
+                    "opi_debt_amount": None,
+                    "opi_checked_at": None,
+                    "opi_full_name": None,
+                    "total_invested": None,
+                })
+                if doc:
+                    found_docs.add(doc)
+        return [dict(r) for r in rows[:limit]]
     finally:
         await db.close()
 

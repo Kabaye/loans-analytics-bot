@@ -432,15 +432,19 @@ async def notify_users(
     bot: Bot,
     entries: list[BorrowEntry],
     service: str,
-) -> int:
-    """Match entries against subscriptions and send notifications. Returns count sent."""
+) -> list[tuple[str, int, int, Subscription]]:
+    """Match entries against subscriptions and send notifications.
+
+    Returns list of (entry_id, chat_id, message_id, sub) for sent messages
+    that can later be edited via update_sent_notifications().
+    """
     from bot.services.fsm_guard import is_busy, enqueue
 
     subs = await get_active_subscriptions(service)
     if not subs:
-        return 0
+        return []
 
-    sent = 0
+    sent_refs: list[tuple[str, int, int, Subscription]] = []
     for entry in entries:
         # Enrich from borrowers table (Zaimis, Kapusta — no PDF enrichment)
         if service != "finkit":
@@ -463,27 +467,91 @@ async def notify_users(
             # If user is busy creating a subscription, queue the notification
             if is_busy(chat_id):
                 enqueue(chat_id, text, kb)
-                sent += 1
                 continue
 
             try:
-                await bot.send_message(chat_id, text, parse_mode="HTML",
-                                       disable_web_page_preview=True,
-                                       reply_markup=kb)
-                sent += 1
+                msg = await bot.send_message(chat_id, text, parse_mode="HTML",
+                                             disable_web_page_preview=True,
+                                             reply_markup=kb)
+                sent_refs.append((entry.id, chat_id, msg.message_id, sub))
                 await asyncio.sleep(0.1)
             except TelegramRetryAfter as e:
                 log.warning("Flood control for %s: retry after %ds", chat_id, e.retry_after)
                 await asyncio.sleep(min(e.retry_after, 30))
                 try:
-                    await bot.send_message(chat_id, text, parse_mode="HTML",
-                                           disable_web_page_preview=True,
-                                           reply_markup=kb)
-                    sent += 1
+                    msg = await bot.send_message(chat_id, text, parse_mode="HTML",
+                                                 disable_web_page_preview=True,
+                                                 reply_markup=kb)
+                    sent_refs.append((entry.id, chat_id, msg.message_id, sub))
                 except Exception:
                     pass
             except Exception as e:
                 log.warning("Failed to send notification to %s: %s", chat_id, e)
 
-    log.info("Sent %d notifications for %s", sent, service)
-    return sent
+    log.info("Sent %d notifications for %s", len(sent_refs), service)
+    return sent_refs
+
+
+async def update_sent_notifications(
+    bot: Bot,
+    entries: list[BorrowEntry],
+    sent_refs: list[tuple[str, int, int, Subscription]],
+    service: str,
+) -> int:
+    """Edit previously sent notifications with enriched data.
+
+    Compares new text with original; only edits if content actually changed.
+    Returns count of messages edited.
+    """
+    if not sent_refs:
+        return 0
+
+    entry_map = {e.id: e for e in entries}
+    edited = 0
+    for entry_id, chat_id, message_id, sub in sent_refs:
+        entry = entry_map.get(entry_id)
+        if not entry:
+            continue
+
+        new_text = format_notification(entry, sub)
+
+        # Rebuild raw_data button
+        raw_key = _store_raw_data(entry.raw_data)
+        kb = None
+        if raw_key:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📋 Исходные данные", callback_data=f"raw_{raw_key}")]
+            ])
+
+        try:
+            await bot.edit_message_text(
+                new_text,
+                chat_id=chat_id,
+                message_id=message_id,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=kb,
+            )
+            edited += 1
+            await asyncio.sleep(0.1)
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(min(e.retry_after, 30))
+            try:
+                await bot.edit_message_text(
+                    new_text,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    reply_markup=kb,
+                )
+                edited += 1
+            except Exception:
+                pass
+        except Exception as e:
+            if "message is not modified" not in str(e).lower():
+                log.warning("Failed to edit notification %s/%s: %s", chat_id, message_id, e)
+
+    if edited:
+        log.info("Edited %d/%d notifications for %s", edited, len(sent_refs), service)
+    return edited

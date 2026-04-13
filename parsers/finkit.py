@@ -184,9 +184,9 @@ class FinkitParser(BaseParser):
                             item.get("borrower_work", ""), item.get("borrower_work")
                         ),
                         borrower_user_id=item.get("user"),
-                        loans_count=item.get("borrower_loans_count"),
-                        loans_count_settled=item.get("borrower_loans_count_settled"),
-                        loans_count_overdue=item.get("borrower_loans_count_overdue"),
+                        loans_count=None,
+                        loans_count_settled=item.get("borrower_repaid_on_time_loans_count"),
+                        loans_count_overdue=item.get("borrower_repaid_with_overdue_loans_count"),
                         loan_url=f"{LOAN_URL}/{loan_id}",
                         raw_data=item,
                     )

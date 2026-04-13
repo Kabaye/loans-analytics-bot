@@ -336,7 +336,8 @@ async def search_borrower_info(query: str, limit: int = 10) -> list[dict]:
         q = query.strip()
         # SQLite COLLATE NOCASE only works for ASCII;
         # Cyrillic names are stored uppercase, so uppercase the query.
-        q_upper = q.upper()
+        # Normalize Ё→Е for search (Russians rarely type Ё).
+        q_upper = q.upper().replace("Ё", "Е")
         # If looks like ИН (alphanumeric, 10+ chars), search by document_id
         if len(q) >= 10 and q.replace(" ", "").isalnum():
             rows = await db.execute_fetchall(
@@ -344,9 +345,9 @@ async def search_borrower_info(query: str, limit: int = 10) -> list[dict]:
                 (f"%{q_upper}%", limit),
             )
         else:
-            # Search borrower_info by full_name
+            # Search borrower_info by full_name (normalize Ё in stored names too)
             rows = await db.execute_fetchall(
-                "SELECT * FROM borrower_info WHERE full_name LIKE ? LIMIT ?",
+                "SELECT * FROM borrower_info WHERE REPLACE(full_name, 'Ё', 'Е') LIKE ? LIMIT ?",
                 (f"%{q_upper}%", limit),
             )
             # Also search borrowers table for entries not in borrower_info
@@ -355,7 +356,7 @@ async def search_borrower_info(query: str, limit: int = 10) -> list[dict]:
                 """SELECT DISTINCT full_name, document_id, service,
                           total_loans, settled_loans, overdue_loans
                    FROM borrowers
-                   WHERE full_name LIKE ?
+                   WHERE REPLACE(full_name, 'Ё', 'Е') LIKE ?
                    LIMIT ?""",
                 (f"%{q_upper}%", limit),
             )

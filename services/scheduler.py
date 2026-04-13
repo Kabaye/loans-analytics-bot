@@ -905,4 +905,7 @@ def get_parser(service: str, chat_id: int | None = None):
             if cid == chat_id:
                 return p
         return None
+    elif service == "mongo":
+        from bot.parsers.mongo import MongoParser
+        return MongoParser()
     return None

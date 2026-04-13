@@ -340,8 +340,9 @@ async def search_borrower_info(query: str, limit: int = 10) -> list[dict]:
         # Cyrillic names are stored uppercase, so uppercase the query.
         # Normalize Ё→Е for search (Russians rarely type Ё).
         q_upper = q.upper().replace("Ё", "Е")
-        # If looks like ИН (alphanumeric, 10+ chars), search by document_id
-        if len(q) >= 10 and q.replace(" ", "").isalnum():
+        # Detect ИН: contains digits (Cyrillic names don't)
+        has_digits = any(c.isdigit() for c in q)
+        if has_digits and len(q) >= 7 and q.replace(" ", "").isalnum():
             rows = await db.execute_fetchall(
                 "SELECT * FROM borrower_info WHERE document_id LIKE ? LIMIT ?",
                 (f"%{q_upper}%", limit),

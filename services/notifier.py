@@ -2,17 +2,62 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
+import uuid
+from collections import OrderedDict
 from typing import Optional
 
-from aiogram import Bot
+from aiogram import Bot, Router, F
 from aiogram.exceptions import TelegramRetryAfter
+from aiogram.types import (
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery,
+)
 
 from bot.database import get_db, lookup_borrower
 from bot.models import BorrowEntry, Subscription
 
 log = logging.getLogger(__name__)
+
+router = Router(name="notifier")
+
+# In-memory cache for raw_data (limited size, FIFO eviction)
+_RAW_DATA_CACHE: OrderedDict[str, dict] = OrderedDict()
+_RAW_DATA_CACHE_MAX = 500
+
+
+def _store_raw_data(raw_data: dict | None) -> str | None:
+    """Store raw_data and return a short key for the inline button callback."""
+    if not raw_data:
+        return None
+    key = uuid.uuid4().hex[:12]
+    _RAW_DATA_CACHE[key] = raw_data
+    # Evict oldest if over limit
+    while len(_RAW_DATA_CACHE) > _RAW_DATA_CACHE_MAX:
+        _RAW_DATA_CACHE.popitem(last=False)
+    return key
+
+
+@router.callback_query(F.data.startswith("raw_"))
+async def cb_show_raw_data(callback: CallbackQuery):
+    """Show raw JSON data for a notification entry."""
+    key = callback.data.replace("raw_", "")
+    raw = _RAW_DATA_CACHE.get(key)
+    if not raw:
+        await callback.answer("⏳ Данные устарели (перезапуск бота)", show_alert=True)
+        return
+
+    import html as html_mod
+    text = json.dumps(raw, ensure_ascii=False, indent=2, default=str)
+    # Telegram message limit is 4096 chars
+    if len(text) > 3900:
+        text = text[:3900] + "\n... (обрезано)"
+    escaped = html_mod.escape(text)
+    await callback.message.reply(f"<pre>{escaped}</pre>", parse_mode="HTML")
+    await callback.answer()
 
 SERVICE_ICONS = {
     "kapusta": "🥬",
@@ -401,6 +446,14 @@ async def notify_users(
         if service != "finkit":
             await enrich_entry_from_borrowers(entry)
 
+        # Prepare raw_data button
+        raw_key = _store_raw_data(entry.raw_data)
+        kb = None
+        if raw_key:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📋 Исходные данные", callback_data=f"raw_{raw_key}")]
+            ])
+
         for chat_id, sub in subs:
             if not sub.matches(entry):
                 continue
@@ -409,13 +462,14 @@ async def notify_users(
 
             # If user is busy creating a subscription, queue the notification
             if is_busy(chat_id):
-                enqueue(chat_id, text)
+                enqueue(chat_id, text, kb)
                 sent += 1
                 continue
 
             try:
                 await bot.send_message(chat_id, text, parse_mode="HTML",
-                                       disable_web_page_preview=True)
+                                       disable_web_page_preview=True,
+                                       reply_markup=kb)
                 sent += 1
                 await asyncio.sleep(0.1)
             except TelegramRetryAfter as e:
@@ -423,7 +477,8 @@ async def notify_users(
                 await asyncio.sleep(min(e.retry_after, 30))
                 try:
                     await bot.send_message(chat_id, text, parse_mode="HTML",
-                                           disable_web_page_preview=True)
+                                           disable_web_page_preview=True,
+                                           reply_markup=kb)
                     sent += 1
                 except Exception:
                     pass

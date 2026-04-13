@@ -152,10 +152,11 @@ async def cb_subs_menu(callback: CallbackQuery, state: FSMContext):
     queued = drain(chat_id)
     await _show_subscriptions(callback.message, chat_id, edit=True)
     if queued:
-        for ntf in queued:
+        for ntf_text, ntf_kb in queued:
             try:
                 await callback.bot.send_message(
-                    chat_id, ntf, parse_mode="HTML", disable_web_page_preview=True)
+                    chat_id, ntf_text, parse_mode="HTML", disable_web_page_preview=True,
+                    reply_markup=ntf_kb)
                 await asyncio.sleep(0.1)
             except Exception:
                 pass
@@ -445,10 +446,11 @@ async def sub_confirm_no(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("❌ Подписка отменена.", reply_markup=kb)
     # Flush queued notifications
     if queued:
-        for ntf in queued:
+        for ntf_text, ntf_kb in queued:
             try:
                 await callback.message.bot.send_message(
-                    chat_id, ntf, parse_mode="HTML", disable_web_page_preview=True)
+                    chat_id, ntf_text, parse_mode="HTML", disable_web_page_preview=True,
+                    reply_markup=ntf_kb)
                 await asyncio.sleep(0.1)
             except Exception:
                 pass
@@ -503,10 +505,11 @@ async def _save_subscription(target, state: FSMContext, edit: bool = False):
         await target.answer(text, reply_markup=kb, parse_mode="HTML")
     # Flush queued notifications
     if queued:
-        for ntf in queued:
+        for ntf_text, ntf_kb in queued:
             try:
                 await target.bot.send_message(
-                    chat_id, ntf, parse_mode="HTML", disable_web_page_preview=True)
+                    chat_id, ntf_text, parse_mode="HTML", disable_web_page_preview=True,
+                    reply_markup=ntf_kb)
                 await asyncio.sleep(0.1)
             except Exception:
                 pass
@@ -816,10 +819,11 @@ async def sub_back(callback: CallbackQuery, state: FSMContext):
     queued = drain(chat_id)
     await _show_subscriptions(callback.message, chat_id, edit=True)
     if queued:
-        for ntf in queued:
+        for ntf_text, ntf_kb in queued:
             try:
                 await callback.bot.send_message(
-                    chat_id, ntf, parse_mode="HTML", disable_web_page_preview=True)
+                    chat_id, ntf_text, parse_mode="HTML", disable_web_page_preview=True,
+                    reply_markup=ntf_kb)
                 await asyncio.sleep(0.1)
             except Exception:
                 pass

@@ -14,6 +14,7 @@ from bot import config
 from bot.database import init_db
 from bot.handlers import start, subscriptions, credentials, admin, export, search
 from bot.services.scheduler import setup_scheduler, shutdown_parsers
+from bot.services.notifier import router as notifier_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,6 +70,7 @@ async def main() -> None:
     dp.include_router(export.router)
     dp.include_router(search.router)
     dp.include_router(admin.router)
+    dp.include_router(notifier_router)
 
     # Startup hook
     dp.startup.register(on_startup)

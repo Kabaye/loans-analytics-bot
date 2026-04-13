@@ -122,10 +122,11 @@ async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
     chat_id = callback.message.chat.id
     set_free(chat_id)
     queued = drain(chat_id)
-    for text in queued:
+    for ntf_text, ntf_kb in queued:
         try:
-            await callback.bot.send_message(chat_id, text, parse_mode="HTML",
-                                            disable_web_page_preview=True)
+            await callback.bot.send_message(chat_id, ntf_text, parse_mode="HTML",
+                                            disable_web_page_preview=True,
+                                            reply_markup=ntf_kb)
             await asyncio.sleep(0.1)
         except Exception as e:
             log.warning("Failed to send queued notification to %s: %s", chat_id, e)

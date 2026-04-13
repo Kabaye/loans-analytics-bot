@@ -11,11 +11,11 @@ from bot.services.scheduler import cached_loans, cached_at
 
 log = logging.getLogger(__name__)
 
-VALID_SERVICES = {"kapusta", "finkit", "mongo", "zaimis"}
+VALID_SERVICES = {"kapusta", "finkit", "zaimis"}
 
 
 async def handle_loans(request: web.Request) -> web.Response:
-    """GET /api/loans?services=kapusta,finkit,mongo,zaimis
+    """GET /api/loans?services=kapusta,finkit,zaimis
 
     Query params:
         services — comma-separated list of services (default: all)

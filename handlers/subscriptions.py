@@ -365,13 +365,6 @@ async def sub_builder_set_value(message: Message, state: FSMContext):
     await _show_builder(message, state, edit=False)
 
 
-SERVICES_RU = {
-    "kapusta": "🥔 Капуста",
-    "finkit": "🏦 Финкит",
-    "mongo": "🦊 Монго",
-    "zaimis": "💎 Займись",
-}
-
 
 @router.callback_query(F.data == "sub_confirm_yes")
 async def sub_confirm_yes(callback: CallbackQuery, state: FSMContext):

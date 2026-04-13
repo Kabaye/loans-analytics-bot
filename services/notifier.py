@@ -369,6 +369,7 @@ async def get_active_subscriptions(service: str) -> list[tuple[int, Subscription
                 period_max=row["period_max"],
                 interest_min=row["interest_min"],
                 require_employed=bool(row["require_employed"]) if row["require_employed"] is not None else None,
+                require_income_confirmed=bool(row["require_income_confirmed"]) if row["require_income_confirmed"] is not None else None,
                 min_settled_loans=row["min_settled_loans"] if row["min_settled_loans"] else None,
             )
             result.append((row["chat_id"], sub))

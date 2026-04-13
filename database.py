@@ -244,7 +244,6 @@ async def init_db() -> None:
         for svc, enabled, interval, h_start, h_end in [
             ("kapusta", 1, 600, 8, 23),
             ("finkit", 1, 60, 0, 24),
-            ("mongo", 1, 60, 0, 24),
             ("zaimis", 1, 60, 0, 24),
         ]:
             await db.execute(
@@ -362,7 +361,7 @@ async def search_borrower_info(query: str, limit: int = 10) -> list[dict]:
             )
             for r in extra:
                 doc = r["document_id"]
-                if doc and doc in found_docs:
+                if not doc or doc in found_docs:
                     continue
                 # Build a pseudo borrower_info dict
                 rows.append({
@@ -381,8 +380,7 @@ async def search_borrower_info(query: str, limit: int = 10) -> list[dict]:
                     "opi_full_name": None,
                     "total_invested": None,
                 })
-                if doc:
-                    found_docs.add(doc)
+                found_docs.add(doc)
         return [dict(r) for r in rows[:limit]]
     finally:
         await db.close()

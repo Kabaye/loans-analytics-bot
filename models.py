@@ -10,7 +10,7 @@ from typing import Optional
 class BorrowEntry:
     """Unified borrow request from any platform."""
     id: str
-    service: str  # 'kapusta' | 'finkit' | 'mongo' | 'zaimis'
+    service: str  # 'kapusta' | 'finkit' | 'zaimis'
     request_type: str = "borrow"  # 'borrow' or 'lend'
     amount: float = 0.0
     period_days: int = 0

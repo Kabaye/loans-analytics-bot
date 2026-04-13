@@ -293,7 +293,7 @@ async def poll_finkit(bot: Bot) -> None:
             pkey = (cred.chat_id, cred.login)
             parser = _finkit_parsers.get(pkey)
             if parser is None:
-                parser = FinkitParser(chat_id=cred.chat_id)
+                parser = FinkitParser()
                 # Try to restore saved session first
                 restored = await parser.try_restore_session()
                 if not restored:
@@ -309,7 +309,7 @@ async def poll_finkit(bot: Bot) -> None:
             if parser.needs_reauth:
                 log.info("Finkit session expired for chat_id=%s login=%s — re-logging in", cred.chat_id, cred.login)
                 await parser.close()
-                new_parser = FinkitParser(chat_id=cred.chat_id)
+                new_parser = FinkitParser()
                 ok = await new_parser.login(cred.login, cred.password)
                 if ok:
                     _finkit_parsers[pkey] = new_parser
@@ -395,7 +395,7 @@ async def poll_zaimis(bot: Bot) -> None:
             pkey = (cred.chat_id, cred.login)
             parser = _zaimis_parsers.get(pkey)
             if parser is None:
-                parser = ZaimisParser(chat_id=cred.chat_id)
+                parser = ZaimisParser()
                 restored = await parser.try_restore_session()
                 if not restored:
                     ok = await parser.login(cred.login, cred.password)
@@ -410,7 +410,7 @@ async def poll_zaimis(bot: Bot) -> None:
             if parser.needs_reauth:
                 log.info("Zaimis token expired for chat_id=%s login=%s — re-logging in", cred.chat_id, cred.login)
                 await parser.close()
-                new_parser = ZaimisParser(chat_id=cred.chat_id)
+                new_parser = ZaimisParser()
                 ok = await new_parser.login(cred.login, cred.password)
                 if ok:
                     _zaimis_parsers[pkey] = new_parser
@@ -481,7 +481,7 @@ async def midnight_refresh_investments(bot: Bot) -> None:
         for cred in creds:
             try:
                 chat_id = cred["chat_id"] if "chat_id" in cred.keys() else None
-                fp = FinkitParser(chat_id=chat_id)
+                fp = FinkitParser()
                 restored = await fp.try_restore_session() if chat_id else False
                 ok = restored or await fp.login(cred["login"], cred["password"])
                 if not ok:
@@ -635,7 +635,7 @@ async def midnight_refresh_investments(bot: Bot) -> None:
         for cred in creds:
             try:
                 chat_id = cred["chat_id"] if "chat_id" in cred.keys() else None
-                zp = ZaimisParser(chat_id=chat_id)
+                zp = ZaimisParser()
                 restored = await zp.try_restore_session() if chat_id else False
                 ok = restored or await zp.login(cred["login"], cred["password"])
                 if not ok:

@@ -197,38 +197,45 @@ class FinkitParser(BaseParser):
         log.info("Finkit: fetched %d borrow entries", len(all_entries))
         return all_entries
 
+    @staticmethod
+    async def enrich_from_cache(entries: list[BorrowEntry]) -> list[BorrowEntry]:
+        """Fast DB-only enrichment. Returns list of entries NOT found in cache
+        (i.e. entries that still need PDF download)."""
+        uncached: list[BorrowEntry] = []
+        for entry in entries:
+            if not entry.borrower_user_id:
+                uncached.append(entry)
+                continue
+            cached = await lookup_borrower("finkit", entry.borrower_user_id)
+            if cached and cached.get("document_id"):
+                entry.full_name = cached.get("full_name")
+                entry.document_id = cached.get("document_id")
+                if cached.get("opi_checked_at"):
+                    entry.opi_checked = True
+                    entry.opi_has_debt = bool(cached.get("opi_has_debt"))
+                    entry.opi_debt_amount = cached.get("opi_debt_amount")
+                    entry.opi_full_name = cached.get("opi_full_name")
+                if cached.get("total_loans") and cached["total_loans"] > 0:
+                    entry.kb_known = True
+                    entry.kb_total_loans = cached.get("total_loans")
+                    entry.kb_settled = cached.get("settled_loans")
+                    entry.kb_overdue = cached.get("overdue_loans")
+                    entry.kb_avg_rating = cached.get("avg_rating")
+                    entry.kb_total_invested = cached.get("total_invested")
+                log.debug("Finkit cache hit for %s → %s", entry.id, entry.borrower_user_id)
+            else:
+                uncached.append(entry)
+        return uncached
+
     async def enrich_with_pdf(self, entries: list[BorrowEntry], max_concurrent: int = 6) -> None:
-        """Download PDFs and extract full name + document ID (for OPI check).
-        Uses borrowers table cache to avoid re-downloading PDFs."""
+        """Download PDFs for entries NOT in cache and extract full name + document ID."""
+        entries_to_download = [e for e in entries if e.contract_url and not e.document_id]
+        if not entries_to_download:
+            return
+
         sem = asyncio.Semaphore(max_concurrent)
 
-        async def _enrich_one(entry: BorrowEntry):
-            # Try cache by borrower_user_id (primary key)
-            if entry.borrower_user_id:
-                cached = await lookup_borrower("finkit", entry.borrower_user_id)
-                if cached and cached.get("document_id"):
-                    entry.full_name = cached.get("full_name")
-                    entry.document_id = cached.get("document_id")
-                    # OPI data from borrower_info (via JOIN)
-                    if cached.get("opi_checked_at"):
-                        entry.opi_checked = True
-                        entry.opi_has_debt = bool(cached.get("opi_has_debt"))
-                        entry.opi_debt_amount = cached.get("opi_debt_amount")
-                        entry.opi_full_name = cached.get("opi_full_name")
-                    # Investment stats from borrowers
-                    if cached.get("total_loans") and cached["total_loans"] > 0:
-                        entry.kb_known = True
-                        entry.kb_total_loans = cached.get("total_loans")
-                        entry.kb_settled = cached.get("settled_loans")
-                        entry.kb_overdue = cached.get("overdue_loans")
-                        entry.kb_avg_rating = cached.get("avg_rating")
-                        entry.kb_total_invested = cached.get("total_invested")
-                    log.debug("Finkit cache hit for %s → %s", entry.id, entry.borrower_user_id)
-                    return
-
-            if not entry.contract_url:
-                return
-
+        async def _download_one(entry: BorrowEntry):
             async with sem:
                 try:
                     session = await self._get_session()
@@ -252,7 +259,6 @@ class FinkitParser(BaseParser):
                         entry.document_id = m.group(2).strip()
                         log.info("Finkit PDF enriched: %s → %s / %s", entry.id, entry.full_name, entry.document_id)
 
-                        # Save by borrower_user_id (main key)
                         if entry.borrower_user_id:
                             await upsert_borrower(
                                 service="finkit",
@@ -265,7 +271,7 @@ class FinkitParser(BaseParser):
                 except Exception as e:
                     log.warning("Finkit PDF enrich error for %s: %s", entry.id, e)
 
-        await asyncio.gather(*[_enrich_one(e) for e in entries])
+        await asyncio.gather(*[_download_one(e) for e in entries_to_download])
 
 
 def _parse_work(code: str | None) -> bool | None:

@@ -31,7 +31,7 @@ from bot.models import BorrowEntry, UserCredentials
 from bot.parsers.kapusta import KapustaParser, KapustaBlockedError
 from bot.parsers.finkit import FinkitParser
 from bot.parsers.zaimis import ZaimisParser
-from bot.services.notifier import notify_users, update_sent_notifications, get_active_subscriptions, has_active_subscriptions
+from bot.services.notifier import notify_users, update_sent_notifications, enrich_entry_from_borrowers, get_active_subscriptions, has_active_subscriptions
 from bot.services.opi_checker import OPIChecker
 
 
@@ -287,10 +287,10 @@ async def poll_finkit(bot: Bot) -> None:
         if not creds_list:
             return
 
-        # Phase 1: Fetch entries from all credentials
+        # ── Stage 1: FETCH entries from all credentials ──
         all_entries: list[BorrowEntry] = []
         seen_entry_ids: set[str] = set()
-        parser_entries: list[tuple] = []  # (parser, entries) for enrichment later
+        parser_entries: list[tuple] = []  # (parser, entries) for PDF enrichment later
 
         for cred in creds_list:
             pkey = (cred.chat_id, cred.login)
@@ -329,32 +329,43 @@ async def poll_finkit(bot: Bot) -> None:
                     seen_entry_ids.add(entry.id)
                     all_entries.append(entry)
 
-        # Phase 2: Compute fresh and send BASIC notifications immediately
+        # ── Stage 2: Compute fresh + DB cache enrichment (fast) + SEND ──
         fresh_entries = await _compute_fresh(all_entries, "finkit")
         sent_refs = []
         if fresh_entries:
+            # Fast DB-only enrichment — entries with cached ФИО/ИН get them immediately
+            uncached_fresh = await FinkitParser.enrich_from_cache(fresh_entries)
             sent_refs = await notify_users(bot, fresh_entries, "finkit")
-            log.info("Sent %d basic notifications for finkit (%d fresh / %d total)",
-                     len(sent_refs), len(fresh_entries), len(all_entries))
+            log.info("Sent %d notifications for finkit (%d fresh, %d uncached)",
+                     len(sent_refs), len(fresh_entries), len(uncached_fresh))
 
-        # Phase 3: Enrich ALL entries with PDF (populates cache + names for fresh)
-        for parser, entries in parser_entries:
-            await parser.enrich_with_pdf(entries)
+            # ── Stage 3: PDF enrichment for uncached entries + EDIT #1 ──
+            if uncached_fresh and sent_refs:
+                uncached_fresh_ids = {e.id for e in uncached_fresh}
+                # Find a parser to download PDFs (any logged-in parser works)
+                for parser, _entries in parser_entries:
+                    await parser.enrich_with_pdf(uncached_fresh)
+                    break  # one parser is enough — same cookies access same PDFs
 
-        # Save all borrowers
-        for entry in all_entries:
-            if entry.borrower_user_id:
-                await upsert_borrower(
-                    service="finkit",
-                    borrower_user_id=entry.borrower_user_id,
-                    full_name=entry.full_name,
-                    document_id=entry.document_id,
-                )
+                # Save newly enriched borrowers
+                for entry in uncached_fresh:
+                    if entry.borrower_user_id:
+                        await upsert_borrower(
+                            service="finkit",
+                            borrower_user_id=entry.borrower_user_id,
+                            full_name=entry.full_name,
+                            document_id=entry.document_id,
+                        )
 
-        # Phase 4: OPI check for fresh entries that have document_id
-        if fresh_entries:
+                # Edit messages for entries that got new data from PDF
+                pdf_enriched_refs = [r for r in sent_refs if r[0] in uncached_fresh_ids]
+                if pdf_enriched_refs:
+                    edited = await update_sent_notifications(bot, fresh_entries, pdf_enriched_refs, "finkit")
+                    log.info("Edit #1 (PDF): edited %d messages", edited)
+
+            # ── Stage 4: OPI check + EDIT #2 ──
             entries_needing_opi = [e for e in fresh_entries if e.document_id and not e.opi_checked]
-            if entries_needing_opi:
+            if entries_needing_opi and sent_refs:
                 subs = await get_active_subscriptions("finkit")
                 if subs:
                     matched_ids = set()
@@ -367,7 +378,7 @@ async def poll_finkit(bot: Bot) -> None:
                     if entries_to_check:
                         if _opi_checker is None:
                             _opi_checker = OPIChecker()
-                        log.info("OPI check for %d entries (fresh + matched)", len(entries_to_check))
+                        log.info("OPI check for %d entries", len(entries_to_check))
                         for entry in entries_to_check:
                             result = await _opi_checker.check(entry.document_id)
                             entry.opi_checked = True
@@ -375,9 +386,28 @@ async def poll_finkit(bot: Bot) -> None:
                             entry.opi_debt_amount = result.debt_amount
                             entry.opi_full_name = result.full_name
 
-        # Phase 5: Edit sent notifications with enriched data
-        if sent_refs and fresh_entries:
-            await update_sent_notifications(bot, fresh_entries, sent_refs, "finkit")
+                        opi_ids = {e.id for e in entries_to_check}
+                        opi_refs = [r for r in sent_refs if r[0] in opi_ids]
+                        if opi_refs:
+                            edited = await update_sent_notifications(bot, fresh_entries, opi_refs, "finkit")
+                            log.info("Edit #2 (OPI): edited %d messages", edited)
+
+        # Enrich remaining (non-fresh) entries for cache building
+        for parser, entries in parser_entries:
+            non_fresh = [e for e in entries if not e.document_id]
+            if non_fresh:
+                await FinkitParser.enrich_from_cache(non_fresh)
+                await parser.enrich_with_pdf(non_fresh)
+
+        # Save all borrowers (including non-fresh for cache)
+        for entry in all_entries:
+            if entry.borrower_user_id and entry.full_name:
+                await upsert_borrower(
+                    service="finkit",
+                    borrower_user_id=entry.borrower_user_id,
+                    full_name=entry.full_name,
+                    document_id=entry.document_id,
+                )
 
         _clear_error("finkit")
     except Exception as e:
@@ -386,6 +416,7 @@ async def poll_finkit(bot: Bot) -> None:
 
 
 async def poll_zaimis(bot: Bot) -> None:
+    global _opi_checker
     if not await _should_poll("zaimis"):
         return
     try:
@@ -440,11 +471,32 @@ async def poll_zaimis(bot: Bot) -> None:
                     full_name=entry.display_name,
                 )
 
-        # ID-based freshness for aggregated entries
+        # ── Stage 1: Compute fresh + SEND basic notifications ──
         fresh = await _compute_fresh(all_entries, "zaimis")
+        sent_refs = []
         if fresh:
-            refs = await notify_users(bot, fresh, "zaimis")
-            log.info("Sent %d notifications for zaimis (%d fresh / %d total)", len(refs), len(fresh), len(all_entries))
+            sent_refs = await notify_users(bot, fresh, "zaimis", skip_enrichment=True)
+            log.info("Sent %d basic notifications for zaimis (%d fresh / %d total)",
+                     len(sent_refs), len(fresh), len(all_entries))
+
+            # ── Stage 2: Enrich from DB + OPI + EDIT ──
+            if sent_refs:
+                for entry in fresh:
+                    await enrich_entry_from_borrowers(entry)
+
+                # OPI for entries with document_id
+                entries_needing_opi = [e for e in fresh if e.document_id and not e.opi_checked]
+                if entries_needing_opi:
+                    if _opi_checker is None:
+                        _opi_checker = OPIChecker()
+                    for entry in entries_needing_opi:
+                        result = await _opi_checker.check(entry.document_id)
+                        entry.opi_checked = True
+                        entry.opi_has_debt = result.has_debt
+                        entry.opi_debt_amount = result.debt_amount
+                        entry.opi_full_name = result.full_name
+
+                await update_sent_notifications(bot, fresh, sent_refs, "zaimis")
 
         _clear_error("zaimis")
     except Exception as e:

@@ -432,11 +432,16 @@ async def notify_users(
     bot: Bot,
     entries: list[BorrowEntry],
     service: str,
+    *,
+    skip_enrichment: bool = False,
 ) -> list[tuple[str, int, int, Subscription]]:
     """Match entries against subscriptions and send notifications.
 
     Returns list of (entry_id, chat_id, message_id, sub) for sent messages
     that can later be edited via update_sent_notifications().
+
+    If skip_enrichment=True, skip the enrich_entry_from_borrowers step
+    (caller handles enrichment separately).
     """
     from bot.services.fsm_guard import is_busy, enqueue
 
@@ -446,8 +451,8 @@ async def notify_users(
 
     sent_refs: list[tuple[str, int, int, Subscription]] = []
     for entry in entries:
-        # Enrich from borrowers table (Zaimis, Kapusta — no PDF enrichment)
-        if service != "finkit":
+        # Enrich from borrowers table (unless caller handles it)
+        if not skip_enrichment and service != "finkit":
             await enrich_entry_from_borrowers(entry)
 
         # Prepare raw_data button

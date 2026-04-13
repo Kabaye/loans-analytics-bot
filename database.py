@@ -335,17 +335,20 @@ async def search_borrower_info(query: str, limit: int = 10) -> list[dict]:
     db = await get_db()
     try:
         q = query.strip()
+        # SQLite COLLATE NOCASE only works for ASCII;
+        # Cyrillic names are stored uppercase, so uppercase the query.
+        q_upper = q.upper()
         # If looks like ИН (alphanumeric, 10+ chars), search by document_id
         if len(q) >= 10 and q.replace(" ", "").isalnum():
             rows = await db.execute_fetchall(
                 "SELECT * FROM borrower_info WHERE document_id LIKE ? LIMIT ?",
-                (f"%{q}%", limit),
+                (f"%{q_upper}%", limit),
             )
         else:
             # Search borrower_info by full_name
             rows = await db.execute_fetchall(
-                "SELECT * FROM borrower_info WHERE full_name LIKE ? COLLATE NOCASE LIMIT ?",
-                (f"%{q}%", limit),
+                "SELECT * FROM borrower_info WHERE full_name LIKE ? LIMIT ?",
+                (f"%{q_upper}%", limit),
             )
             # Also search borrowers table for entries not in borrower_info
             found_docs = {r["document_id"] for r in rows if r["document_id"]}
@@ -353,9 +356,9 @@ async def search_borrower_info(query: str, limit: int = 10) -> list[dict]:
                 """SELECT DISTINCT full_name, document_id, service,
                           total_loans, settled_loans, overdue_loans
                    FROM borrowers
-                   WHERE full_name LIKE ? COLLATE NOCASE
+                   WHERE full_name LIKE ?
                    LIMIT ?""",
-                (f"%{q}%", limit),
+                (f"%{q_upper}%", limit),
             )
             for r in extra:
                 doc = r["document_id"]

@@ -427,7 +427,7 @@ async def poll_zaimis(bot: Bot) -> None:
                 await upsert_borrower(
                     service="zaimis",
                     borrower_user_id=entry.borrower_user_id,
-                    display_name=entry.display_name,
+                    full_name=entry.display_name,
                 )
 
         # ID-based freshness for aggregated entries

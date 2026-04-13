@@ -94,17 +94,17 @@ async def _show_subscriptions(target, chat_id: int, edit: bool = False):
         if row["interest_min"] is not None:
             filters.append(f"ставка≥{row['interest_min']:.1f}%")
         try:
-            if row["require_employed"]:
-                filters.append("👔")
+            if row["require_employed"] and row["service"] in ("finkit", "zaimis"):
+                filters.append("👔 трудоустр.")
         except (IndexError, KeyError):
             pass
         try:
-            if row["require_income_confirmed"]:
-                filters.append("💼")
+            if row["require_income_confirmed"] and row["service"] == "zaimis":
+                filters.append("💼 доход подтв.")
         except (IndexError, KeyError):
             pass
         try:
-            if row["min_settled_loans"]:
+            if row["min_settled_loans"] and row["service"] == "finkit":
                 filters.append(f"возвр≥{row['min_settled_loans']}")
         except (IndexError, KeyError):
             pass

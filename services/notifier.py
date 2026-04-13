@@ -271,12 +271,13 @@ def _format_enrichment_section(entry: BorrowEntry) -> list[str]:
         not_returned = total - settled - overdue
         if not_returned < 0:
             not_returned = 0
-        lines.append(f"Брала {total}")
-        lines.append(f"Вернула {settled} в срок")
-        if overdue > 0:
-            lines.append(f"\t{overdue} с просрочкой")
+        lines.append(f"ℹ️ Брала {total}")
+        if settled > 0:
+            lines.append(f"✅ Вернула {settled}")
         if not_returned > 0:
-            lines.append(f"\t{not_returned} не вернула")
+            lines.append(f"⚠️ Текущие {not_returned}")
+        if overdue > 0:
+            lines.append(f"❌ Просрочка {overdue}")
 
     return lines
 

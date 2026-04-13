@@ -565,40 +565,20 @@ async def midnight_refresh_investments(bot: Bot) -> None:
                 log.info("Finkit %s: fetched %d investments from list",
                          cred["login"], len(all_investments))
 
-                # Step 2: aggregate stats per borrower user UUID (preferred) or full name (fallback)
-                buid_stats: dict[str, dict] = {}
-                buid_to_name: dict[str, str] = {}
-                name_fallback_inv_ids: dict[str, list[str]] = {}  # name → inv IDs for borrowers without UUID in list
-
+                # Step 2: aggregate stats per borrower_full_name
+                name_stats: dict[str, dict] = {}
+                name_to_inv_ids: dict[str, list[str]] = {}
                 for inv in all_investments:
                     bname = (inv.get("borrower_full_name") or "").strip()
-                    buid = inv.get("user")  # borrower UUID — may be in list items
-                    if buid:
-                        buid = str(buid)
-                    if not bname and not buid:
+                    if not bname:
                         continue
-
-                    # If we have UUID, group by it; otherwise collect for name-based fallback
-                    if buid:
-                        if buid not in buid_stats:
-                            buid_stats[buid] = {
-                                "total": 0, "settled": 0, "overdue": 0,
-                                "ratings": [], "invested": 0.0, "name": bname,
-                            }
-                        s = buid_stats[buid]
-                    else:
-                        # No UUID in list item — need detail fetch later
-                        if bname not in name_fallback_inv_ids:
-                            name_fallback_inv_ids[bname] = []
-                            buid_stats[f"name:{bname}"] = {
-                                "total": 0, "settled": 0, "overdue": 0,
-                                "ratings": [], "invested": 0.0, "name": bname,
-                            }
-                        inv_id = inv.get("id")
-                        if inv_id:
-                            name_fallback_inv_ids[bname].append(inv_id)
-                        s = buid_stats[f"name:{bname}"]
-
+                    if bname not in name_stats:
+                        name_stats[bname] = {
+                            "total": 0, "settled": 0, "overdue": 0,
+                            "ratings": [], "invested": 0.0,
+                        }
+                        name_to_inv_ids[bname] = []
+                    s = name_stats[bname]
                     s["total"] += 1
                     status = inv.get("status", "")
                     if status == "settled" and inv.get("closed", False):
@@ -616,98 +596,83 @@ async def midnight_refresh_investments(bot: Bot) -> None:
                     except (ValueError, TypeError):
                         pass
                     total_finkit += 1
+                    inv_id = inv.get("id")
+                    if inv_id:
+                        name_to_inv_ids[bname].append(inv_id)
 
-                # Step 3: resolve borrower_user_id for name-based fallback entries
-                if name_fallback_inv_ids:
-                    db2 = await get_db()
-                    try:
-                        existing = await db2.execute_fetchall(
-                            "SELECT borrower_user_id, full_name FROM borrowers WHERE service='finkit'"
-                        )
-                    finally:
-                        await db2.close()
-                    name_to_buid: dict[str, str] = {
-                        row["full_name"]: row["borrower_user_id"]
-                        for row in existing if row["full_name"]
-                    }
+                # Step 3: resolve borrower_user_id for each unique borrower
+                db2 = await get_db()
+                try:
+                    existing = await db2.execute_fetchall(
+                        "SELECT borrower_user_id, full_name FROM borrowers WHERE service='finkit'"
+                    )
+                finally:
+                    await db2.close()
+                name_to_buid: dict[str, str] = {
+                    row["full_name"]: row["borrower_user_id"]
+                    for row in existing if row["full_name"]
+                }
 
-                    pdf_enriched = 0
-                    for bname, inv_ids in name_fallback_inv_ids.items():
-                        placeholder_key = f"name:{bname}"
-                        stats = buid_stats.pop(placeholder_key, None)
-                        if not stats:
-                            continue
+                pdf_enriched = 0
+                for bname, s in name_stats.items():
+                    buid = name_to_buid.get(bname)
 
-                        buid = name_to_buid.get(bname)
+                    # Unknown borrower → fetch detail + PDF to extract ИН
+                    if not buid and name_to_inv_ids.get(bname):
+                        inv_id = name_to_inv_ids[bname][0]
+                        detail_url = f"https://api-p2p.finkit.by/user/investments/{inv_id}/"
+                        try:
+                            async with session.get(detail_url, headers=headers) as resp:
+                                if resp.status == 200:
+                                    detail = await resp.json()
+                                    # 'loan' is the loan UUID — use as borrower key
+                                    # ('user' is the investor UUID, not the borrower)
+                                    loan_uuid = detail.get("loan", inv_id)
+                                    buid = str(loan_uuid)
+                                    # Try PDF extraction for ИН
+                                    pdf_url = detail.get("latest_contract_url")
+                                    if pdf_url:
+                                        try:
+                                            async with session.get(pdf_url) as pdf_resp:
+                                                if pdf_resp.status == 200:
+                                                    pdf_bytes = await pdf_resp.read()
+                                                    doc_id = None
+                                                    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                                                        for pg in pdf.pages:
+                                                            text = pg.extract_text() or ""
+                                                            m = _NAME_ID_RE.search(text)
+                                                            if m:
+                                                                doc_id = m.group(2).strip()
+                                                                break
+                                                    if doc_id and len(doc_id) == 14:
+                                                        await upsert_borrower(
+                                                            service="finkit",
+                                                            borrower_user_id=buid,
+                                                            full_name=bname,
+                                                            document_id=doc_id,
+                                                        )
+                                                        pdf_enriched += 1
+                                                        log.info("Finkit midnight PDF: %s → ИН %s", bname, doc_id)
+                                        except Exception as ex:
+                                            log.debug("Finkit midnight PDF error for %s: %s", bname, ex)
+                            await asyncio.sleep(0.2)
+                        except Exception as ex:
+                            log.warning("Finkit detail fetch error for %s: %s", bname, ex)
 
-                        # Unknown borrower → fetch detail to get user UUID + PDF for ИН
-                        if not buid and inv_ids:
-                            inv_id = inv_ids[0]
-                            detail_url = f"https://api-p2p.finkit.by/user/investments/{inv_id}/"
-                            try:
-                                async with session.get(detail_url, headers=headers) as resp:
-                                    if resp.status == 200:
-                                        detail = await resp.json()
-                                        buid = str(detail.get("user", detail.get("loan", inv_id)))
-                                        # Try PDF extraction for ИН
-                                        pdf_url = detail.get("latest_contract_url")
-                                        if pdf_url:
-                                            try:
-                                                async with session.get(pdf_url) as pdf_resp:
-                                                    if pdf_resp.status == 200:
-                                                        pdf_bytes = await pdf_resp.read()
-                                                        doc_id = None
-                                                        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                                                            for pg in pdf.pages:
-                                                                text = pg.extract_text() or ""
-                                                                m = _NAME_ID_RE.search(text)
-                                                                if m:
-                                                                    doc_id = m.group(2).strip()
-                                                                    break
-                                                        if doc_id and len(doc_id) == 14:
-                                                            await upsert_borrower(
-                                                                service="finkit",
-                                                                borrower_user_id=buid,
-                                                                full_name=bname,
-                                                                document_id=doc_id,
-                                                            )
-                                                            pdf_enriched += 1
-                                                            log.info("Finkit midnight PDF: %s → ИН %s", bname, doc_id)
-                                            except Exception as ex:
-                                                log.debug("Finkit midnight PDF error for %s: %s", bname, ex)
-                                await asyncio.sleep(0.2)
-                            except Exception as ex:
-                                log.warning("Finkit detail fetch error for %s: %s", bname, ex)
-
-                        if buid:
-                            # Merge into buid_stats (may already exist if same user had UUID items too)
-                            if buid in buid_stats:
-                                existing_s = buid_stats[buid]
-                                existing_s["total"] += stats["total"]
-                                existing_s["settled"] += stats["settled"]
-                                existing_s["overdue"] += stats["overdue"]
-                                existing_s["ratings"].extend(stats["ratings"])
-                                existing_s["invested"] += stats["invested"]
-                            else:
-                                stats["name"] = bname
-                                buid_stats[buid] = stats
-
-                    if pdf_enriched:
-                        log.info("Finkit midnight: enriched %d new borrowers with ИН from PDF", pdf_enriched)
-
-                # Step 4: upsert all borrower stats
-                for buid, s in buid_stats.items():
-                    if buid.startswith("name:"):
-                        continue  # unresolved fallback — skip
+                    if not buid:
+                        continue
 
                     avg_r = sum(s["ratings"]) / len(s["ratings"]) if s["ratings"] else None
                     await upsert_borrower_from_investment(
                         service="finkit", borrower_user_id=buid,
-                        full_name=s.get("name") or None,
+                        full_name=bname or None,
                         total_loans=s["total"], settled_loans=s["settled"],
                         overdue_loans=s["overdue"], avg_rating=avg_r,
                         total_invested=s["invested"],
                     )
+
+                if pdf_enriched:
+                    log.info("Finkit midnight: enriched %d new borrowers with ИН from PDF", pdf_enriched)
 
                 await fp.close()
             except Exception as ex:

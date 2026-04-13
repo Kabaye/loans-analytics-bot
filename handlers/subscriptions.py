@@ -32,14 +32,8 @@ SERVICES = {
 class SubForm(StatesGroup):
     service = State()
     label = State()
-    sum_min = State()
-    sum_max = State()
-    rating_min = State()
-    period_min = State()
-    period_max = State()
-    interest_min = State()
-    require_employed = State()
-    min_settled_loans = State()
+    builder = State()       # interactive builder: pick fields to set
+    waiting_value = State()  # user entering a value for a chosen field
     confirm = State()
 
 
@@ -102,6 +96,11 @@ async def _show_subscriptions(target, chat_id: int, edit: bool = False):
         try:
             if row["require_employed"]:
                 filters.append("👔")
+        except (IndexError, KeyError):
+            pass
+        try:
+            if row["require_income_confirmed"]:
+                filters.append("💼")
         except (IndexError, KeyError):
             pass
         try:
@@ -226,156 +225,144 @@ async def sub_pick_service(callback: CallbackQuery, state: FSMContext):
 async def sub_set_label(message: Message, state: FSMContext):
     label = message.text.strip() if message.text.strip() != "-" else None
     await state.update_data(label=label)
-    await message.answer("💰 Мин. сумма? (<code>-</code> или <code>0</code> — пропустить)", parse_mode="HTML")
-    await state.set_state(SubForm.sum_min)
+    await _show_builder(message, state, edit=False)
 
 
-@router.message(SubForm.sum_min)
-async def sub_set_sum_min(message: Message, state: FSMContext):
-    ok, err = _validate_number(message.text)
-    if not ok:
-        await message.answer(err, parse_mode="HTML")
-        return
-    await state.update_data(sum_min=_parse_float(message.text))
-    await message.answer("💰 Макс. сумма? (<code>-</code> или <code>0</code> — пропустить)", parse_mode="HTML")
-    await state.set_state(SubForm.sum_max)
+# ---- Builder: field-based subscription creation ----
+
+# Fields available for the builder, keyed by field name
+BUILDER_FIELDS = {
+    "label": ("✏️ Название", "text"),
+    "sum_min": ("💰 Мин. сумма", "float"),
+    "sum_max": ("💰 Макс. сумма", "float"),
+    "rating_min": ("📊 Мин. рейтинг", "float"),
+    "period_min": ("📅 Мин. срок (дней)", "int"),
+    "period_max": ("📅 Макс. срок (дней)", "int"),
+    "interest_min": ("💵 Мин. ставка (%)", "float"),
+    "require_employed": ("🏢 Трудоустройство", "bool"),
+    "require_income_confirmed": ("💼 Доход подтвержден", "bool"),
+    "min_settled_loans": ("📊 Мин. возвратов в срок", "int"),
+}
+
+# Which fields are shown for which service
+def _fields_for_service(service: str) -> list[str]:
+    base = ["label", "sum_min", "sum_max", "period_min", "period_max",
+            "interest_min", "rating_min"]
+    if service == "finkit":
+        base += ["require_employed", "min_settled_loans"]
+    elif service == "zaimis":
+        base += ["require_employed", "require_income_confirmed"]
+    return base
 
 
-@router.message(SubForm.sum_max)
-async def sub_set_sum_max(message: Message, state: FSMContext):
-    ok, err = _validate_number(message.text)
-    if not ok:
-        await message.answer(err, parse_mode="HTML")
-        return
-    await state.update_data(sum_max=_parse_float(message.text))
-    await message.answer("📅 Мин. срок (дней)? (<code>-</code> или <code>0</code> — пропустить)", parse_mode="HTML")
-    await state.set_state(SubForm.period_min)
-
-
-@router.message(SubForm.rating_min)
-async def sub_set_rating_min(message: Message, state: FSMContext):
-    ok, err = _validate_number(message.text)
-    if not ok:
-        await message.answer(err, parse_mode="HTML")
-        return
-    await state.update_data(rating_min=_parse_float(message.text))
-
+async def _show_builder(target, state: FSMContext, edit: bool = True):
+    """Show interactive builder for new subscription."""
     data = await state.get_data()
-    service = data.get("service")
+    service = data.get("service", "?")
+    svc_name = SERVICES.get(service, service)
+    label = data.get("label") or "—"
 
-    # Employment filter for zaimis/finkit
-    if service in ("zaimis", "finkit"):
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Только трудоустроенных", callback_data="sub_emp_yes"),
-                InlineKeyboardButton(text="➡️ Не важно", callback_data="sub_emp_skip"),
-            ],
+    lines = [f"📋 <b>Новая подписка:</b>", f"{svc_name} — {label}", ""]
+
+    fields = _fields_for_service(service)
+    buttons = []
+
+    for field in fields:
+        name, ftype = BUILDER_FIELDS[field]
+        val = data.get(field)
+
+        if ftype == "bool":
+            display = "✅ Да" if val else "—"
+        elif val is not None:
+            display = str(val)
+        else:
+            display = "—"
+
+        lines.append(f"  {name}: <b>{display}</b>")
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{name}: {display}",
+                callback_data=f"sub_bf_{field}",
+            )
         ])
-        await message.answer(
-            "🏢 Фильтр по трудоустройству?\n"
-            "(<code>+</code> — да, <code>-</code> — не важно)",
-            reply_markup=kb, parse_mode="HTML",
-        )
-        await state.set_state(SubForm.require_employed)
+
+    buttons.append([
+        InlineKeyboardButton(text="✅ Создать", callback_data="sub_confirm_yes"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data="sub_confirm_no"),
+    ])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    text_msg = "\n".join(lines)
+    await state.set_state(SubForm.builder)
+    if edit:
+        await target.edit_text(text_msg, reply_markup=kb, parse_mode="HTML")
     else:
-        await state.update_data(require_employed=None, min_settled_loans=None)
-        await _show_confirmation(message, state)
+        await target.answer(text_msg, reply_markup=kb, parse_mode="HTML")
 
 
-@router.message(SubForm.period_min)
-async def sub_set_period_min(message: Message, state: FSMContext):
-    ok, err = _validate_number(message.text, allow_float=False)
-    if not ok:
-        await message.answer(err, parse_mode="HTML")
+@router.callback_query(F.data.startswith("sub_bf_"))
+async def sub_builder_field(callback: CallbackQuery, state: FSMContext):
+    """Handle builder field selection."""
+    field = callback.data.replace("sub_bf_", "")
+    if field not in BUILDER_FIELDS:
+        await callback.answer("Неизвестное поле")
         return
-    await state.update_data(period_min=_parse_int(message.text))
-    await message.answer("📅 Макс. срок (дней)? (<code>-</code> или <code>0</code> — пропустить)", parse_mode="HTML")
-    await state.set_state(SubForm.period_max)
 
-
-@router.message(SubForm.period_max)
-async def sub_set_period_max(message: Message, state: FSMContext):
-    ok, err = _validate_number(message.text, allow_float=False)
-    if not ok:
-        await message.answer(err, parse_mode="HTML")
-        return
-    await state.update_data(period_max=_parse_int(message.text))
-    await message.answer("💵 Мин. ставка (%/день)? (<code>-</code> или <code>0</code> — пропустить)", parse_mode="HTML")
-    await state.set_state(SubForm.interest_min)
-
-
-@router.message(SubForm.interest_min)
-async def sub_set_interest_min(message: Message, state: FSMContext):
-    ok, err = _validate_number(message.text)
-    if not ok:
-        await message.answer(err, parse_mode="HTML")
-        return
-    await state.update_data(interest_min=_parse_float(message.text))
-    await message.answer("📊 Мин. рейтинг? (<code>-</code> или <code>0</code> — пропустить)", parse_mode="HTML")
-    await state.set_state(SubForm.rating_min)
-
-
-@router.callback_query(F.data.startswith("sub_emp_"))
-async def sub_set_employed(callback: CallbackQuery, state: FSMContext):
-    val = True if callback.data == "sub_emp_yes" else None
-    await state.update_data(require_employed=val)
-
+    name, ftype = BUILDER_FIELDS[field]
     data = await state.get_data()
-    service = data.get("service")
 
-    # min_settled_loans for finkit
-    if service == "finkit":
-        await callback.message.edit_text(
-            "📊 Мин. кол-во возвратов в срок? (<code>-</code> или <code>0</code> — не важно)",
-            parse_mode="HTML",
-        )
-        await state.set_state(SubForm.min_settled_loans)
-    else:
-        await state.update_data(min_settled_loans=None)
-        await _show_confirmation(callback.message, state, edit=True)
+    if ftype == "bool":
+        # Toggle directly
+        current = data.get(field)
+        new_val = None if current else True
+        await state.update_data(**{field: new_val})
+        await callback.answer(f"{name}: {'✅' if new_val else '—'}")
+        await _show_builder(callback.message, state, edit=True)
+        return
+
+    # For value fields, ask user for input
+    await state.update_data(builder_field=field)
+    await callback.message.edit_text(
+        f"Введите значение для <b>{name}</b>\n"
+        "(<code>-</code> или <code>0</code> чтобы убрать фильтр)",
+        parse_mode="HTML",
+    )
+    await state.set_state(SubForm.waiting_value)
 
 
-@router.message(SubForm.require_employed)
-async def sub_set_employed_text(message: Message, state: FSMContext):
-    """Handle text input +/- for employment question."""
+@router.message(SubForm.waiting_value)
+async def sub_builder_set_value(message: Message, state: FSMContext):
+    """Handle value input for builder field."""
+    data = await state.get_data()
+    field = data.get("builder_field", "")
+    if field not in BUILDER_FIELDS:
+        await message.answer("Ошибка. Попробуйте заново.")
+        return
+
+    name, ftype = BUILDER_FIELDS[field]
     text = (message.text or "").strip()
-    if text == "+":
-        val = True
-    elif text in ("-", "0"):
+
+    if text in ("-", "—", ""):
         val = None
+    elif ftype == "float":
+        ok, err = _validate_number(text)
+        if not ok:
+            await message.answer(err, parse_mode="HTML")
+            return
+        val = _parse_float(text)
+    elif ftype == "int":
+        ok, err = _validate_number(text, allow_float=False)
+        if not ok:
+            await message.answer(err, parse_mode="HTML")
+            return
+        val = _parse_int(text)
+        if val is not None and val <= 0:
+            val = None
     else:
-        await message.answer(
-            "Введите <code>+</code> (да) или <code>-</code> (нет), "
-            "либо нажмите кнопку выше.",
-            parse_mode="HTML",
-        )
-        return
-    await state.update_data(require_employed=val)
+        val = text if text != "0" else None
 
-    data = await state.get_data()
-    service = data.get("service")
-    if service == "finkit":
-        await message.answer(
-            "📊 Мин. кол-во возвратов в срок? (<code>-</code> или <code>0</code> — не важно)",
-            parse_mode="HTML",
-        )
-        await state.set_state(SubForm.min_settled_loans)
-    else:
-        await state.update_data(min_settled_loans=None)
-        await _show_confirmation(message, state)
-
-
-@router.message(SubForm.min_settled_loans)
-async def sub_set_min_settled(message: Message, state: FSMContext):
-    ok, err = _validate_number(message.text, allow_float=False)
-    if not ok:
-        await message.answer(err, parse_mode="HTML")
-        return
-    val = _parse_int(message.text)
-    if val is not None and val <= 0:
-        val = None
-    await state.update_data(min_settled_loans=val)
-    await _show_confirmation(message, state)
+    await state.update_data(**{field: val})
+    await _show_builder(message, state, edit=False)
 
 
 SERVICES_RU = {
@@ -384,48 +371,6 @@ SERVICES_RU = {
     "mongo": "🦊 Монго",
     "zaimis": "💎 Займись",
 }
-
-
-async def _show_confirmation(target, state: FSMContext, edit: bool = False):
-    """Show subscription summary and ask for confirmation."""
-    data = await state.get_data()
-    service = data.get("service", "?")
-    svc_name = SERVICES_RU.get(service, service)
-    label = data.get("label") or "—"
-
-    lines = [f"📋 <b>Подтвердите подписку:</b>", f"{svc_name} — {label}", ""]
-
-    def _fmt(val, suffix=""):
-        return f"<b>{val}{suffix}</b>" if val is not None else "—"
-
-    sum_min = data.get("sum_min")
-    sum_max = data.get("sum_max")
-    lines.append(f"💰 Сумма: {_fmt(sum_min)} .. {_fmt(sum_max)}")
-    lines.append(f"📊 Рейтинг: ≥ {_fmt(data.get('rating_min'))}")
-
-    period_min = data.get("period_min")
-    period_max = data.get("period_max")
-    lines.append(f"📅 Срок: {_fmt(period_min, ' д.')} .. {_fmt(period_max, ' д.')}")
-    lines.append(f"💵 Ставка: ≥ {_fmt(data.get('interest_min'), '%/д')}")
-
-    if data.get("require_employed"):
-        lines.append("🏢 Только трудоустроенных")
-    if data.get("min_settled_loans"):
-        lines.append(f"📊 Мин. возвратов: {data['min_settled_loans']}")
-
-    text_msg = "\n".join(lines)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Создать", callback_data="sub_confirm_yes"),
-            InlineKeyboardButton(text="❌ Отмена", callback_data="sub_confirm_no"),
-        ]
-    ])
-
-    await state.set_state(SubForm.confirm)
-    if edit:
-        await target.edit_text(text_msg, reply_markup=kb, parse_mode="HTML")
-    else:
-        await target.answer(text_msg, reply_markup=kb, parse_mode="HTML")
 
 
 @router.callback_query(F.data == "sub_confirm_yes")
@@ -469,8 +414,8 @@ async def _save_subscription(target, state: FSMContext, edit: bool = False):
             INSERT INTO subscriptions
             (chat_id, service, label, sum_min, sum_max, rating_min,
              period_min, period_max, interest_min,
-             require_employed, min_settled_loans)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             require_employed, require_income_confirmed, min_settled_loans)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 chat_id,
@@ -483,6 +428,7 @@ async def _save_subscription(target, state: FSMContext, edit: bool = False):
                 data.get("period_max"),
                 data.get("interest_min"),
                 1 if data.get("require_employed") else None,
+                1 if data.get("require_income_confirmed") else None,
                 data.get("min_settled_loans"),
             ),
         )
@@ -526,6 +472,7 @@ EDITABLE_FIELDS = {
     "period_max": ("Макс. срок (дней)", "int"),
     "interest_min": ("Мин. ставка (%)", "float"),
     "require_employed": ("Трудоустройство", "bool"),
+    "require_income_confirmed": ("Доход подтвержден", "bool"),
     "min_settled_loans": ("Мин. возвратов в срок", "int"),
 }
 
@@ -584,19 +531,20 @@ async def sub_edit_show(callback: CallbackQuery):
     buttons = []
 
     for field, (name, _ftype) in EDITABLE_FIELDS.items():
-        # Skip employment/settled for services that don't support them
-        if field in ("require_employed", "min_settled_loans") and row["service"] not in ("finkit", "zaimis"):
-            if field == "min_settled_loans":
-                continue
-            if field == "require_employed":
-                continue
+        # Skip fields irrelevant for certain services
+        if field in ("require_employed",) and row["service"] not in ("finkit", "zaimis"):
+            continue
+        if field == "require_income_confirmed" and row["service"] != "zaimis":
+            continue
+        if field == "min_settled_loans" and row["service"] != "finkit":
+            continue
 
         try:
             val = row[field]
         except (KeyError, IndexError):
             val = None
 
-        if field == "require_employed":
+        if field in ("require_employed", "require_income_confirmed"):
             display = "✅ Да" if val else "❌ Нет"
         elif val is None:
             display = "—"

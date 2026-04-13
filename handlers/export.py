@@ -29,6 +29,7 @@ SERVICES = {
     "kapusta": "🥬 Kapusta",
     "finkit": "🔵 FinKit",
     "zaimis": "🟪 ЗАЙМись",
+    "mongo": "🦊 Mongo",
 }
 
 # Rate limiting: last export timestamps per key
@@ -66,6 +67,7 @@ async def cb_export_menu(callback: CallbackQuery):
         ],
         [
             InlineKeyboardButton(text="🟪 ЗАЙМись", callback_data="exp_fmt_zaimis"),
+            InlineKeyboardButton(text="🦊 Mongo", callback_data="exp_fmt_mongo"),
         ],
         [InlineKeyboardButton(text="📁 Все — CSV", callback_data="exp_do_all_csv")],
         [InlineKeyboardButton(text="📋 Все — JSON", callback_data="exp_do_all_json")],

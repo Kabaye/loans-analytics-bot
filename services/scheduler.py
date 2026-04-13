@@ -823,4 +823,7 @@ def get_parser(service: str, chat_id: int | None = None):
         return _finkit_parsers.get(chat_id)
     elif service == "zaimis" and chat_id:
         return _zaimis_parsers.get(chat_id)
+    elif service == "mongo":
+        from bot.parsers.mongo import MongoParser
+        return MongoParser()
     return None

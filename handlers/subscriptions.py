@@ -23,10 +23,9 @@ log = logging.getLogger(__name__)
 router = Router(name="subscriptions")
 
 SERVICES = {
-    "kapusta": "🥔 Капуста",
-    "finkit": "🏦 Финкит",
-    "mongo": "🦊 Монго",
-    "zaimis": "💎 Займись",
+    "kapusta": "🥬 Kapusta",
+    "finkit": "🔵 FinKit",
+    "zaimis": "🟪 ЗАЙМись",
 }
 
 
@@ -148,8 +147,18 @@ async def cb_subs_menu(callback: CallbackQuery, state: FSMContext):
     if not await is_allowed(callback.message.chat.id):
         return
     await state.clear()
-    set_free(callback.message.chat.id)
-    await _show_subscriptions(callback.message, callback.message.chat.id, edit=True)
+    chat_id = callback.message.chat.id
+    set_free(chat_id)
+    queued = drain(chat_id)
+    await _show_subscriptions(callback.message, chat_id, edit=True)
+    if queued:
+        for ntf in queued:
+            try:
+                await callback.bot.send_message(
+                    chat_id, ntf, parse_mode="HTML", disable_web_page_preview=True)
+                await asyncio.sleep(0.1)
+            except Exception:
+                pass
 
 
 # ---- Night pause / resume ----
@@ -802,8 +811,18 @@ async def sub_toggle(callback: CallbackQuery):
 @router.callback_query(F.data == "sub_back")
 async def sub_back(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    set_free(callback.message.chat.id)
-    await _show_subscriptions(callback.message, callback.message.chat.id, edit=True)
+    chat_id = callback.message.chat.id
+    set_free(chat_id)
+    queued = drain(chat_id)
+    await _show_subscriptions(callback.message, chat_id, edit=True)
+    if queued:
+        for ntf in queued:
+            try:
+                await callback.bot.send_message(
+                    chat_id, ntf, parse_mode="HTML", disable_web_page_preview=True)
+                await asyncio.sleep(0.1)
+            except Exception:
+                pass
 
 
 

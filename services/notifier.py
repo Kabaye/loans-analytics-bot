@@ -11,28 +11,24 @@ from aiogram.exceptions import TelegramRetryAfter
 
 from bot.database import get_db, lookup_borrower
 from bot.models import BorrowEntry, Subscription
-from bot.services.fsm_guard import is_busy, enqueue
 
 log = logging.getLogger(__name__)
 
 SERVICE_ICONS = {
-    "kapusta": "🥔",
-    "finkit": "🏦",
-    "mongo": "🦊",
-    "zaimis": "💎",
+    "kapusta": "🥬",
+    "finkit": "🔵",
+    "zaimis": "🟪",
 }
 
 SERVICE_NAMES = {
-    "kapusta": "Капуста",
-    "finkit": "Финкит",
-    "mongo": "Монго",
-    "zaimis": "Займись",
+    "kapusta": "Kapusta",
+    "finkit": "FinKit",
+    "zaimis": "ЗАЙМись",
 }
 
 SERVICE_URLS = {
     "kapusta": "https://kapusta.by/borrow-requests",
-    "finkit": "https://finkit.by/invest",
-    "mongo": "https://mongo.by/p2p",
+    "finkit": "https://finkit.by/app/invest-manually",
     "zaimis": "https://zaimis.by/app/all-loans?tab=giveLoan",
 }
 
@@ -40,7 +36,6 @@ SERVICE_URLS = {
 COMMISSION_RATES = {
     "finkit": 0.05,   # 2% + 3%
     "kapusta": 0.045,  # 4.5%
-    "mongo": 0.05,     # 5%
     "zaimis": 0.05,    # 5%
 }
 
@@ -87,136 +82,216 @@ def calc_profits(entry: BorrowEntry) -> dict:
     }
 
 
+def _build_finkit_url(entry: BorrowEntry) -> str:
+    """Build a direct FinKit invest-manually URL with filters matching this loan."""
+    params = []
+    params.append(f"ordering=-borrower_score_value")
+    amt = int(entry.amount)
+    params.append(f"amount_min={amt}")
+    params.append(f"amount_max={amt}")
+    score = int(entry.credit_score)
+    params.append(f"borrower_score_min={score}")
+    params.append(f"borrower_score_max={score}")
+    return "https://finkit.by/app/invest-manually?" + "&".join(params)
+
+
+def _format_opi_line(entry: BorrowEntry) -> str | None:
+    """Format OPI line with date and appropriate icon."""
+    if not entry.opi_checked:
+        return None
+    from datetime import datetime, timezone
+    date_str = datetime.now(timezone.utc).strftime("%d.%m")
+    if entry.opi_has_debt:
+        debt = entry.opi_debt_amount or 0
+        icon = "❌" if debt >= 1000 else "⚠️"
+        return f"{icon} ОПИ: долг {debt:.0f} ({date_str})"
+    return f"✅ ОПИ: нет задолженности ({date_str})"
+
+
+def _format_finkit_borrower(entry: BorrowEntry) -> list[str]:
+    """Format borrower section for FinKit notifications."""
+    lines = []
+    if entry.full_name:
+        lines.append(f"\n<b>{entry.full_name}</b>")
+    if entry.document_id:
+        lines.append(f"🆔 ИН: {entry.document_id}")
+
+    # Work type with status icon
+    if entry.is_employed is not None:
+        work_name = entry.display_name or ("Рабочий / служащий" if entry.is_employed else "безработный")
+        safe_jobs = {"Рабочий / служащий", "По договору подряда / услуг", "ИП"}
+        icon = "✅" if work_name in safe_jobs else "⚠️"
+        lines.append(f"{icon} {work_name}")
+
+    # Settled loans from API
+    settled = entry.loans_count_settled
+    if settled is not None:
+        icon = "✅" if settled > 0 else "⚠️"
+        lines.append(f"{icon} Возвраты в срок: {settled}")
+
+    # Overdue from API
+    overdue = entry.loans_count_overdue
+    if overdue is not None and overdue > 0:
+        lines.append(f"⚠️ Возвраты с просрочкой: {overdue}")
+
+    # OPI
+    opi_line = _format_opi_line(entry)
+    if opi_line:
+        lines.append(opi_line)
+
+    return lines
+
+
+def _format_zaimis_borrower(entry: BorrowEntry) -> list[str]:
+    """Format borrower section for Zaimis notifications."""
+    lines = []
+    if entry.display_name:
+        lines.append(f"\n<b>{entry.display_name}</b>")
+
+    # Employment
+    if entry.is_employed is not None:
+        icon = "✅" if entry.is_employed else "⚠️"
+        text = "трудоустроен" if entry.is_employed else "безработный"
+        lines.append(f"{icon}  {text}")
+
+    # Income confirmed
+    if entry.is_income_confirmed is not None:
+        icon = "✅" if entry.is_income_confirmed else "⚠️"
+        text = "доход подтвержден" if entry.is_income_confirmed else "доход не подтвержден"
+        lines.append(f"{icon}  {text}")
+
+    # Note / purpose
+    if entry.note:
+        lines.append(f"📝 {entry.note}")
+
+    return lines
+
+
+def _format_kapusta_borrower(entry: BorrowEntry) -> list[str]:
+    """Format borrower section for Kapusta notifications."""
+    lines = []
+    if entry.display_name:
+        lines.append(f"\n<b>{entry.display_name}</b>")
+    return lines
+
+
+def _format_enrichment_section(entry: BorrowEntry) -> list[str]:
+    """Format the enrichment section with data from our DB (not from API).
+    This section is shown separately to distinguish DB-sourced data."""
+    lines = []
+    has_enrichment = False
+
+    # Full name from DB (only if not already shown from API)
+    enriched_name = None
+    enriched_doc_id = None
+    enriched_opi = None
+    enriched_history = False
+
+    # For Zaimis: full_name and document_id come from our DB enrichment
+    if entry.service == "zaimis":
+        if entry.full_name:
+            enriched_name = entry.full_name
+            has_enrichment = True
+        if entry.document_id:
+            enriched_doc_id = entry.document_id
+            has_enrichment = True
+
+    # OPI data for non-finkit (comes from enrichment)
+    if entry.service != "finkit" and entry.opi_checked:
+        enriched_opi = _format_opi_line(entry)
+        if enriched_opi:
+            has_enrichment = True
+
+    # KB history from our borrowers table
+    if entry.kb_known and entry.kb_total_loans and entry.kb_total_loans > 0:
+        enriched_history = True
+        has_enrichment = True
+
+    if not has_enrichment:
+        return []
+
+    lines.append("\n<i>Инфа из займов:</i>")
+    if enriched_name:
+        lines.append(f"<b>{enriched_name}</b>")
+    if enriched_doc_id:
+        lines.append(f"🆔 ИН: {enriched_doc_id}")
+    if enriched_opi:
+        lines.append(enriched_opi)
+
+    if enriched_history:
+        lines.append("История займов:")
+        total = entry.kb_total_loans or 0
+        settled = entry.kb_settled or 0
+        overdue = entry.kb_overdue or 0
+        not_returned = total - settled - overdue
+        if not_returned < 0:
+            not_returned = 0
+        lines.append(f"Брала {total}")
+        lines.append(f"Вернула {settled} в срок")
+        if overdue > 0:
+            lines.append(f"\t{overdue} с просрочкой")
+        if not_returned > 0:
+            lines.append(f"\t{not_returned} не вернула")
+
+    return lines
+
+
 def format_notification(entry: BorrowEntry, sub: Subscription) -> str:
     icon = SERVICE_ICONS.get(entry.service, "📋")
     svc = SERVICE_NAMES.get(entry.service, entry.service)
     label = sub.label or ""
 
-    # Recalculate profits using correct formulas
     p = calc_profits(entry)
 
-    # Header
+    # === Block 1: Header ===
     lines = [f"{icon} <b>{svc}</b>  —  {label}", ""]
 
-    # Core loan data (compact)
+    # === Block 2: Loan info ===
     lines.append(f"<b>{entry.amount:.0f}</b> сумма")
     lines.append(f"<b>{entry.period_days}</b> д. срок")
     lines.append(f"<b>{entry.interest_day:.1f}</b> ставка ({entry.interest_year:.1f}%)")
     lines.append(f"<b>{entry.credit_score:.0f}</b> рейтинг")
     lines.append(f"<b>{p['amount_return']:.2f}</b> возврат")
 
-    # Penalty only for Zaimis
     if entry.service == "zaimis" and entry.penalty_interest:
         lines.append(f"<b>{entry.penalty_interest:.2f}</b>%/д пеня")
 
-    # Borrower info section
-    borrower_lines = []
-    if entry.full_name:
-        borrower_lines.append(f"\n<b>{entry.full_name}</b>")
-    if entry.document_id:
-        borrower_lines.append(f"🆔 ИН: <code>{entry.document_id}</code>")
-
-    # Employment + work type
-    if entry.is_employed is not None:
-        emp_text = "трудоустроен" if entry.is_employed else "безработный"
-        emp_icon = "✅" if entry.is_employed else "⚠️"
-        if entry.display_name:
-            emp_text += f", {entry.display_name}"
-        borrower_lines.append(f"{emp_icon}  {emp_text}")
-
-    # Previous nicknames (Zaimis)
-    if entry.kb_display_names and len(entry.kb_display_names) > 1:
-        prev = entry.kb_display_names[:-1]
-        borrower_lines.append(f"📛 ранее: {', '.join(prev)}")
-
-    # Total loans count (combined line)
-    settled = entry.loans_count_settled if entry.loans_count_settled is not None else entry.kb_settled
-    overdue_count = entry.loans_count_overdue if entry.loans_count_overdue is not None else entry.kb_overdue
-    total_loans = entry.loans_count or entry.kb_total_loans
-    if total_loans is not None or settled is not None:
-        parts = []
-        if total_loans is not None:
-            parts.append(f"всего: {total_loans}")
-        if settled is not None:
-            parts.append(f"в срок: {settled}")
-        if overdue_count is not None and overdue_count > 0:
-            parts.append(f"просроч: {overdue_count}")
-        borrower_lines.append(f"📊 займов: {', '.join(parts)}")
-    elif overdue_count is not None and overdue_count > 0:
-        borrower_lines.append(f"⚠️  просрочки:  {overdue_count}")
-
-    if entry.has_overdue is not None and overdue_count is None:
-        borrower_lines.append(f"{'⚠️' if entry.has_overdue else '✅'}  просрочки:  {'были' if entry.has_overdue else 'нет'}")
-
-    if entry.has_active_loan is not None:
-        borrower_lines.append(f"{'⚠️' if entry.has_active_loan else '✅'}  активный займ:  {'Да' if entry.has_active_loan else 'Нет'}")
-
-    # Loan/repayment history (Finkit)
-    if entry.has_loan_history is not None:
-        borrower_lines.append(f"{'✅' if entry.has_loan_history else '❌'}  история займов:  {'да' if entry.has_loan_history else 'нет'}")
-    if entry.has_repayment_history is not None:
-        borrower_lines.append(f"{'✅' if entry.has_repayment_history else '❌'}  история погашений:  {'да' if entry.has_repayment_history else 'нет'}")
-
-    # Income confirmed (Zaimis)
-    if entry.is_income_confirmed is not None:
-        borrower_lines.append(f"{'✅' if entry.is_income_confirmed else '❌'}  доход подтв.:  {'да' if entry.is_income_confirmed else 'нет'}")
-
-    # OPI
-    if entry.opi_checked:
-        opi_date_str = ""
-        if entry.opi_checked_at:
-            try:
-                from datetime import datetime as _dt
-                _d = _dt.fromisoformat(entry.opi_checked_at)
-                opi_date_str = f" (пров. {_d.strftime('%d.%m')})"
-            except Exception:
-                opi_date_str = ""
-        if entry.opi_has_debt:
-            borrower_lines.append(f"❌ ОПИ: должен <b>{entry.opi_debt_amount:.2f}</b>{opi_date_str}")
-        else:
-            borrower_lines.append(f"✅ ОПИ: нет задолженности{opi_date_str}")
-
-    # Borrower info card (from Google Sheets / manual entry)
-    if entry.bi_loan_status:
-        status_icon = {"в срок": "✅", "просрочка": "⚠️", "все плохо": "🔴"}.get(
-            entry.bi_loan_status.split()[0] if entry.bi_loan_status else "", "📋"
-        )
-        bi_parts = [f"{status_icon} Карточка: {entry.bi_loan_status}"]
-        if entry.bi_sum_category:
-            bi_parts.append(f"суммы: {entry.bi_sum_category}")
-        if entry.bi_rating is not None:
-            bi_parts.append(f"рейтинг: {entry.bi_rating:.0f}")
-        borrower_lines.append(", ".join(bi_parts))
-
-    # KB history
-    if entry.kb_known and entry.kb_total_loans:
-        kb_parts = [f"наших: {entry.kb_total_loans}"]
-        if entry.kb_settled:
-            kb_parts.append(f"погашено: {entry.kb_settled}")
-        if entry.kb_overdue and entry.kb_overdue > 0:
-            kb_parts.append(f"просрочено: {entry.kb_overdue}")
-        if entry.kb_total_invested:
-            kb_parts.append(f"инвест.: {entry.kb_total_invested:.0f}")
-        borrower_lines.append(f"📋 {', '.join(kb_parts)}")
+    # === Block 3: Borrower info from API ===
+    if entry.service == "finkit":
+        borrower_lines = _format_finkit_borrower(entry)
+    elif entry.service == "zaimis":
+        borrower_lines = _format_zaimis_borrower(entry)
+    else:
+        borrower_lines = _format_kapusta_borrower(entry)
 
     if borrower_lines:
         lines.extend(borrower_lines)
 
-    # Profit section
+    # === Block 4: Enrichment from our DB ===
+    enrichment_lines = _format_enrichment_section(entry)
+    if enrichment_lines:
+        lines.extend(enrichment_lines)
+
+    # === Block 5: Profit summary ===
     lines.append("")
     lines.append(f"<b>{p['gross']:.2f}</b>  прибыль (грязная)")
     lines.append(f"<b>{p['net']:.2f}</b>  прибыль (чистая)")
     lines.append(f"<b>{p['after_tax']:.2f}</b>  после налога")
     lines.append(f"{p['commission']:.2f} комисс. / {p['tax']:.2f} налог")
 
-    # Note/purpose
-    if entry.note:
-        lines.append(f"\n📝 {entry.note}")
-
-    # Link — always use general service page
-    svc_url = SERVICE_URLS.get(entry.service)
-    if svc_url:
-        lines.append(f"\n<a href=\"{svc_url}\">Открыть</a>")
+    # === Block 6: Link ===
+    if entry.service == "finkit":
+        # Direct link with loan ID + date as text
+        url = _build_finkit_url(entry)
+        link_text = entry.id or "Открыть"
+        if entry.created_at:
+            dt_str = entry.created_at.strftime("%d.%m %H:%M:%S")
+            link_text = f"{entry.id}  {dt_str}"
+        lines.append(f"\n<a href=\"{url}\">{link_text}</a>")
+    else:
+        svc_url = SERVICE_URLS.get(entry.service)
+        if svc_url:
+            lines.append(f"\n<a href=\"{svc_url}\">Открыть</a>")
 
     return "\n".join(lines)
 
@@ -244,9 +319,11 @@ async def get_active_subscriptions(service: str) -> list[tuple[int, Subscription
                 sum_min=row["sum_min"],
                 sum_max=row["sum_max"],
                 rating_min=row["rating_min"],
+                rating_max=row["rating_max"],
                 period_min=row["period_min"],
                 period_max=row["period_max"],
                 interest_min=row["interest_min"],
+                interest_max=row["interest_max"],
                 require_employed=bool(row["require_employed"]) if row["require_employed"] is not None else None,
                 require_income_confirmed=bool(row["require_income_confirmed"]) if row["require_income_confirmed"] is not None else None,
                 min_settled_loans=row["min_settled_loans"] if row["min_settled_loans"] else None,
@@ -292,15 +369,6 @@ async def enrich_entry_from_borrowers(entry: BorrowEntry) -> None:
         entry.opi_has_debt = bool(cached.get("opi_has_debt"))
         entry.opi_debt_amount = cached.get("opi_debt_amount")
         entry.opi_full_name = cached.get("opi_full_name")
-        entry.opi_checked_at = cached.get("opi_checked_at")
-    # Display names history (Zaimis nicknames)
-    if cached.get("display_names"):
-        try:
-            import json as _json
-            entry.kb_display_names = _json.loads(cached["display_names"])
-        except Exception:
-            pass
-
     # Investment stats from borrowers table
     if cached.get("total_loans") and cached["total_loans"] > 0:
         entry.kb_known = True
@@ -324,39 +392,28 @@ async def notify_users(
     service: str,
 ) -> int:
     """Match entries against subscriptions and send notifications. Returns count sent."""
+    from bot.services.fsm_guard import is_busy, enqueue
+
     subs = await get_active_subscriptions(service)
     if not subs:
         return 0
 
     sent = 0
-    sent_pairs: set[tuple[int, str]] = set()  # (chat_id, entry_id) dedup
-    db = await get_db()
-
     for entry in entries:
-        # Enrich from borrowers table (Zaimis, Kapusta, Mongo — no PDF enrichment)
+        # Enrich from borrowers table (Zaimis, Kapusta — no PDF enrichment)
         if service != "finkit":
             await enrich_entry_from_borrowers(entry)
 
         for chat_id, sub in subs:
-            if (chat_id, entry.id) in sent_pairs:
-                continue
             if not sub.matches(entry):
                 continue
 
-            # Re-check subscription is still active (user may have pressed Stop All)
-            rows = await db.execute_fetchall(
-                "SELECT is_active FROM subscriptions WHERE id = ?", (sub.id,))
-            if not rows or not rows[0]["is_active"]:
-                continue
-
-            sent_pairs.add((chat_id, entry.id))
-
             text = format_notification(entry, sub)
 
-            # Queue notification if user is in active FSM flow
+            # If user is busy creating a subscription, queue the notification
             if is_busy(chat_id):
                 enqueue(chat_id, text)
-                log.debug("Queued notification for busy user %s", chat_id)
+                sent += 1
                 continue
 
             try:
@@ -367,11 +424,6 @@ async def notify_users(
             except TelegramRetryAfter as e:
                 log.warning("Flood control for %s: retry after %ds", chat_id, e.retry_after)
                 await asyncio.sleep(min(e.retry_after, 30))
-                # Re-check before retry
-                rows = await db.execute_fetchall(
-                    "SELECT is_active FROM subscriptions WHERE id = ?", (sub.id,))
-                if not rows or not rows[0]["is_active"]:
-                    continue
                 try:
                     await bot.send_message(chat_id, text, parse_mode="HTML",
                                            disable_web_page_preview=True)

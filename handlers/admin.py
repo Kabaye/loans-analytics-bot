@@ -26,10 +26,9 @@ log = logging.getLogger(__name__)
 router = Router(name="admin")
 
 SVC_NAMES = {
-    "kapusta": "🥔 Капуста",
-    "finkit": "🏦 Финкит",
-    "mongo": "🦊 Монго",
-    "zaimis": "💎 Займись",
+    "kapusta": "🥬 Kapusta",
+    "finkit": "🔵 FinKit",
+    "zaimis": "🟪 ЗАЙМись",
 }
 
 
@@ -441,23 +440,22 @@ async def adm_test_app(callback: CallbackQuery):
 
     from bot.parsers.kapusta import KapustaParser
     from bot.parsers.finkit import FinkitParser
-    from bot.parsers.mongo import MongoParser
     from bot.parsers.zaimis import ZaimisParser
     from bot.services.opi_checker import OPIChecker
 
     results: list[str] = []
 
-    # --- Капуста ---
+    # --- Kapusta ---
     try:
         kp = KapustaParser()
         try:
             ok = await asyncio.wait_for(kp.login(), timeout=15)
             if ok:
                 entries_k = await asyncio.wait_for(kp.fetch_borrows(), timeout=30)
-                results.append(f"🥔 <b>Капуста</b>: {len(entries_k)} заявок")
+                results.append(f"🥬 <b>Kapusta</b>: {len(entries_k)} заявок")
             else:
                 entries_k = []
-                results.append("🥔 <b>Капуста</b>: ❌ anti-bot failed")
+                results.append("🥬 <b>Kapusta</b>: ❌ anti-bot failed")
         finally:
             await kp.close()
         if entries_k:
@@ -465,9 +463,9 @@ async def adm_test_app(callback: CallbackQuery):
             amt = e.amount if hasattr(e, "amount") else e.get("amount", 0) if isinstance(e, dict) else 0
             results.append(f"  └ первая: {amt:.0f} BYN")
     except Exception as ex:
-        results.append(f"🥔 <b>Капуста</b>: ❌ {ex}")
+        results.append(f"🥬 <b>Kapusta</b>: ❌ {ex}")
 
-    # --- Финкит ---
+    # --- FinKit ---
     try:
         db = await get_db()
         try:
@@ -477,16 +475,16 @@ async def adm_test_app(callback: CallbackQuery):
         finally:
             await db.close()
         if not creds_f:
-            results.append("🏦 <b>Финкит</b>: ⚠️ Нет credentials")
+            results.append("🔵 <b>FinKit</b>: ⚠️ Нет credentials")
         else:
             fp = FinkitParser()
             try:
                 ok = await fp.login(creds_f[0]["login"], creds_f[0]["password"])
                 if not ok:
-                    results.append("🏦 <b>Финкит</b>: ❌ Ошибка логина")
+                    results.append("🔵 <b>FinKit</b>: ❌ Ошибка логина")
                 else:
                     entries_f = await fp.fetch_borrows()
-                    results.append(f"🏦 <b>Финкит</b>: {len(entries_f)} заявок")
+                    results.append(f"🔵 <b>FinKit</b>: {len(entries_f)} заявок")
                     if entries_f:
                         e = entries_f[0]
                         results.append(
@@ -522,27 +520,9 @@ async def adm_test_app(callback: CallbackQuery):
             finally:
                 await fp.close()
     except Exception as ex:
-        results.append(f"🏦 <b>Финкит</b>: ❌ {ex}")
+        results.append(f"🔵 <b>FinKit</b>: ❌ {ex}")
 
-    # --- Монго ---
-    try:
-        mp = MongoParser()
-        try:
-            await mp.login()
-            entries_m = await mp.fetch_borrows()
-            results.append(f"🦊 <b>Монго</b>: {len(entries_m)} заявок")
-            if entries_m:
-                e = entries_m[0]
-                results.append(
-                    f"  └ #{e.id}: {e.amount:.0f} BYN, {e.period_days}д, "
-                    f"рейт {e.credit_score:.0f}, {e.interest_day:.2f}%/д"
-                )
-        finally:
-            await mp.close()
-    except Exception as ex:
-        results.append(f"🦊 <b>Монго</b>: ❌ {ex}")
-
-    # --- Займись ---
+    # --- ЗАЙМись ---
     try:
         db = await get_db()
         try:
@@ -552,16 +532,16 @@ async def adm_test_app(callback: CallbackQuery):
         finally:
             await db.close()
         if not creds_z:
-            results.append("💎 <b>Займись</b>: ⚠️ Нет credentials")
+            results.append("🟪 <b>ЗАЙМись</b>: ⚠️ Нет credentials")
         else:
             zp = ZaimisParser()
             try:
                 ok = await zp.login(creds_z[0]["login"], creds_z[0]["password"])
                 if not ok:
-                    results.append("💎 <b>Займись</b>: ❌ Ошибка логина")
+                    results.append("🟪 <b>ЗАЙМись</b>: ❌ Ошибка логина")
                 else:
                     entries_z = await zp.fetch_borrows()
-                    results.append(f"💎 <b>Займись</b>: {len(entries_z)} заявок")
+                    results.append(f"🟪 <b>ЗАЙМись</b>: {len(entries_z)} заявок")
                     if entries_z:
                         e = entries_z[0]
                         results.append(
@@ -571,7 +551,7 @@ async def adm_test_app(callback: CallbackQuery):
             finally:
                 await zp.close()
     except Exception as ex:
-        results.append(f"💎 <b>Займись</b>: ❌ {ex}")
+        results.append(f"🟪 <b>ЗАЙМись</b>: ❌ {ex}")
 
     # --- Borrowers + borrower_info stats ---
     try:
@@ -613,10 +593,9 @@ async def adm_test_notif_menu(callback: CallbackQuery):
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📨 Все сервисы (по 1 шт.)", callback_data="adm_test_notif_all")],
-        [InlineKeyboardButton(text="🥔 Капуста", callback_data="adm_test_notif_kapusta")],
-        [InlineKeyboardButton(text="🏦 Финкит", callback_data="adm_test_notif_finkit")],
-        [InlineKeyboardButton(text="🦊 Монго", callback_data="adm_test_notif_mongo")],
-        [InlineKeyboardButton(text="💎 Займись", callback_data="adm_test_notif_zaimis")],
+        [InlineKeyboardButton(text="🥬 Kapusta", callback_data="adm_test_notif_kapusta")],
+        [InlineKeyboardButton(text="🔵 FinKit", callback_data="adm_test_notif_finkit")],
+        [InlineKeyboardButton(text="🟪 ЗАЙМись", callback_data="adm_test_notif_zaimis")],
         [InlineKeyboardButton(text="🧪 Меню тестов", callback_data="adm_test_menu")],
     ])
     await callback.message.edit_text(
@@ -630,7 +609,6 @@ async def _send_test_notification(callback: CallbackQuery, services: list[str]):
     """Fetch one real entry from each service and send formatted notification."""
     from bot.parsers.kapusta import KapustaParser
     from bot.parsers.finkit import FinkitParser
-    from bot.parsers.mongo import MongoParser
     from bot.parsers.zaimis import ZaimisParser
     from bot.services.notifier import format_notification
 
@@ -672,16 +650,6 @@ async def _send_test_notification(callback: CallbackQuery, services: list[str]):
                                 entry = entries[0]
                     finally:
                         await fp.close()
-
-            elif svc == "mongo":
-                mp = MongoParser()
-                try:
-                    await mp.login()
-                    entries = await mp.fetch_borrows()
-                    if entries:
-                        entry = entries[0]
-                finally:
-                    await mp.close()
 
             elif svc == "zaimis":
                 db = await get_db()
@@ -738,7 +706,7 @@ async def _send_test_notification(callback: CallbackQuery, services: list[str]):
 async def adm_test_notif_all(callback: CallbackQuery):
     if not await is_admin(callback.message.chat.id):
         return
-    await _send_test_notification(callback, ["kapusta", "finkit", "mongo", "zaimis"])
+    await _send_test_notification(callback, ["kapusta", "finkit", "zaimis"])
 
 
 @router.callback_query(F.data.startswith("adm_test_notif_"))

@@ -1,6 +1,7 @@
 """Start / help handler + inline button main menu + whitelist middleware."""
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from aiogram import Router, F
@@ -14,6 +15,7 @@ from aiogram.types import (
 )
 
 from bot.database import get_db
+from bot.services.fsm_guard import set_free, drain
 
 log = logging.getLogger(__name__)
 router = Router(name="start")
@@ -117,6 +119,16 @@ async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
     if not await is_allowed(callback.message.chat.id):
         return
     await state.clear()
+    chat_id = callback.message.chat.id
+    set_free(chat_id)
+    queued = drain(chat_id)
+    for text in queued:
+        try:
+            await callback.bot.send_message(chat_id, text, parse_mode="HTML",
+                                            disable_web_page_preview=True)
+            await asyncio.sleep(0.1)
+        except Exception as e:
+            log.warning("Failed to send queued notification to %s: %s", chat_id, e)
     admin = await is_admin(callback.message.chat.id)
     kb = get_main_menu_kb(admin)
     await callback.message.edit_text(MAIN_MENU_TEXT, reply_markup=kb, parse_mode="HTML")
@@ -135,16 +147,15 @@ async def cb_help(callback: CallbackQuery):
         "Бот периодически проверяет сайты P2P займов и отправляет уведомления "
         "о новых заявках заёмщиков, которые соответствуют вашим фильтрам.\n\n"
         "<b>Поддерживаемые сайты:</b>\n"
-        "🥔 Капуста (kapusta.by) — без регистрации\n"
-        "🏦 Финкит (finkit.by) — нужен логин/пароль\n"
-        "🍃 Монго (mongo.by) — без регистрации\n"
-        "💰 Займись (zaimis.by) — нужен логин/пароль\n\n"
+        "🥬 Kapusta (kapusta.by) — без регистрации\n"
+        "🔵 FinKit (finkit.by) — нужен логин/пароль\n"
+        "🟪 ЗАЙМись (zaimis.by) — нужен логин/пароль\n\n"
         "<b>Как начать:</b>\n"
-        "1. 🔑 Учёт. данные — введите логин/пароль для Финкит/Займись\n"
+        "1. 🔑 Учёт. данные — введите логин/пароль для FinKit/ЗАЙМись\n"
         "2. 🔔 Подписки — создайте подписки с фильтрами\n"
         "3. Готово! Уведомления будут приходить автоматически.\n\n"
         "<b>ОПИ проверка:</b>\n"
-        "Для заявок на Финкит автоматически проверяется наличие исполнительных "
+        "Для заявок на FinKit автоматически проверяется наличие исполнительных "
         "производств через ЕРИП (доступно благодаря PDF контрактам).",
         reply_markup=kb,
         parse_mode="HTML",

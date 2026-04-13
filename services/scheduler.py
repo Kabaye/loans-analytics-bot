@@ -30,7 +30,6 @@ _NAME_ID_RE = re.compile(
 from bot.models import BorrowEntry, UserCredentials
 from bot.parsers.kapusta import KapustaParser, KapustaBlockedError
 from bot.parsers.finkit import FinkitParser
-from bot.parsers.mongo import MongoParser
 from bot.parsers.zaimis import ZaimisParser
 from bot.services.notifier import notify_users, get_active_subscriptions, has_active_subscriptions
 from bot.services.opi_checker import OPIChecker
@@ -48,7 +47,6 @@ log = logging.getLogger(__name__)
 
 # Global parser instances (reused across runs)
 _kapusta: Optional[KapustaParser] = None
-_mongo: Optional[MongoParser] = None
 _opi_checker: Optional[OPIChecker] = None
 
 # Per-user parser instances for authenticated services
@@ -72,7 +70,6 @@ _seen_ids_loaded: dict[str, bool] = {}
 _error_notified: dict[str, bool] = {
     "kapusta": False,
     "finkit": False,
-    "mongo": False,
     "zaimis": False,
 }
 
@@ -174,7 +171,7 @@ async def _notify_error(bot: Bot, service: str, error: Exception) -> None:
     tb = traceback.format_exception(type(error), error, error.__traceback__)
     tb_str = "".join(tb)[-1500:]  # last 1500 chars of traceback
 
-    svc_names = {"kapusta": "🥔 Капуста", "finkit": "🏦 Финкит", "mongo": "🍃 Монго", "zaimis": "💰 Займись"}
+    svc_names = {"kapusta": "🥬 Kapusta", "finkit": "🔵 FinKit", "zaimis": "🟪 ЗАЙМись"}
     svc = svc_names.get(service, service)
 
     text = (
@@ -275,26 +272,6 @@ async def poll_kapusta(bot: Bot) -> None:
         log.exception("Kapusta poll error: %s", e)
         _kapusta = None
         await _notify_error(bot, "kapusta", e)
-
-
-async def poll_mongo(bot: Bot) -> None:
-    global _mongo
-    if not await _should_poll("mongo"):
-        return
-    try:
-        if _mongo is None:
-            _mongo = MongoParser()
-
-        entries = await _mongo.fetch_borrows()
-        _clear_error("mongo")
-        if entries:
-            fresh = await _compute_fresh(entries, "mongo")
-            if fresh:
-                cnt = await notify_users(bot, fresh, "mongo")
-                log.info("Sent %d notifications for mongo (%d fresh / %d total)", cnt, len(fresh), len(entries))
-    except Exception as e:
-        log.exception("Mongo poll error: %s", e)
-        _mongo = None
 
 
 async def poll_finkit(bot: Bot) -> None:
@@ -795,10 +772,6 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
                       args=[bot], id="finkit", name="Finkit poll",
                       misfire_grace_time=60)
 
-    _scheduler.add_job(poll_mongo, "interval", seconds=BASE,
-                      args=[bot], id="mongo", name="Mongo poll",
-                      misfire_grace_time=60)
-
     _scheduler.add_job(poll_zaimis, "interval", seconds=BASE,
                       args=[bot], id="zaimis", name="Zaimis poll",
                       misfire_grace_time=60)
@@ -826,8 +799,8 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
 
 async def shutdown_parsers():
     """Clean up parser sessions on shutdown."""
-    global _kapusta, _mongo, _opi_checker
-    for p in [_kapusta, _mongo, _opi_checker]:
+    global _kapusta, _opi_checker
+    for p in [_kapusta, _opi_checker]:
         if p:
             try:
                 await p.close()
@@ -846,8 +819,6 @@ def get_parser(service: str, chat_id: int | None = None):
     """Get an active parser instance for on-demand use (e.g., export)."""
     if service == "kapusta":
         return _kapusta
-    elif service == "mongo":
-        return _mongo
     elif service == "finkit" and chat_id:
         return _finkit_parsers.get(chat_id)
     elif service == "zaimis" and chat_id:

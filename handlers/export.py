@@ -26,10 +26,9 @@ log = logging.getLogger(__name__)
 router = Router(name="export")
 
 SERVICES = {
-    "kapusta": "🥔 Капуста",
-    "finkit": "🏦 Финкит",
-    "mongo": "🍃 Монго",
-    "zaimis": "💰 Займись",
+    "kapusta": "🥬 Kapusta",
+    "finkit": "🔵 FinKit",
+    "zaimis": "🟪 ЗАЙМись",
 }
 
 # Rate limiting: last export timestamps per key
@@ -58,16 +57,15 @@ async def cb_export_menu(callback: CallbackQuery):
 
     lines = ["<b>📥 Скачать данные</b>\n"]
     lines.append("<i>Данные загружаются свежие с каждого сервиса.\n"
-                 "Финкит: обогащение ПДФ + ОПИ + история заёмщиков.</i>")
+                 "FinKit: обогащение ПДФ + ОПИ + история заёмщиков.</i>")
 
     buttons = [
         [
-            InlineKeyboardButton(text="🥔 Капуста", callback_data="exp_fmt_kapusta"),
-            InlineKeyboardButton(text="🏦 Финкит", callback_data="exp_fmt_finkit"),
+            InlineKeyboardButton(text="🥬 Kapusta", callback_data="exp_fmt_kapusta"),
+            InlineKeyboardButton(text="🔵 FinKit", callback_data="exp_fmt_finkit"),
         ],
         [
-            InlineKeyboardButton(text="🍃 Монго", callback_data="exp_fmt_mongo"),
-            InlineKeyboardButton(text="💰 Займись", callback_data="exp_fmt_zaimis"),
+            InlineKeyboardButton(text="🟪 ЗАЙМись", callback_data="exp_fmt_zaimis"),
         ],
         [InlineKeyboardButton(text="📁 Все — CSV", callback_data="exp_do_all_csv")],
         [InlineKeyboardButton(text="📋 Все — JSON", callback_data="exp_do_all_json")],

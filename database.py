@@ -266,6 +266,8 @@ async def upsert_borrower(
     document_id: str | None = None,
 ) -> None:
     """Insert or update a borrower mapping record."""
+    if full_name:
+        full_name = full_name.upper()
     db = await get_db()
     try:
         await db.execute(
@@ -400,6 +402,8 @@ async def upsert_borrower_info(
     source: str = "auto",
 ) -> None:
     """Insert or update a borrower_info record."""
+    if full_name:
+        full_name = full_name.upper()
     db = await get_db()
     try:
         await db.execute(

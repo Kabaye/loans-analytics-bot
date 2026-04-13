@@ -49,15 +49,19 @@ log = logging.getLogger(__name__)
 _kapusta: Optional[KapustaParser] = None
 _opi_checker: Optional[OPIChecker] = None
 
-# Per-user parser instances for authenticated services
-_finkit_parsers: dict[int, FinkitParser] = {}
-_zaimis_parsers: dict[int, ZaimisParser] = {}
+# Per-user parser instances for authenticated services (keyed by (chat_id, login))
+_finkit_parsers: dict[tuple[int, str], FinkitParser] = {}
+_zaimis_parsers: dict[tuple[int, str], ZaimisParser] = {}
 
 # Exposed scheduler instance for dynamic reconfiguration
 _scheduler: Optional[AsyncIOScheduler] = None
 
 # === Kapusta backoff on 403 ===
 _kapusta_backoff_until: Optional[datetime] = None
+
+# === Investment refresh tracking (every 3 days) ===
+_last_investment_refresh: Optional[datetime] = None
+INVESTMENT_REFRESH_INTERVAL_DAYS = 3
 
 # === Per-site last poll timestamps (for custom intervals + time-based filtering) ===
 _last_poll: dict[str, datetime] = {}
@@ -223,7 +227,7 @@ async def _get_user_credentials(service: str) -> list[UserCredentials]:
     try:
         rows = await db.execute_fetchall(
             """
-            SELECT c.chat_id, c.login, c.password
+            SELECT c.id, c.chat_id, c.login, c.password
             FROM credentials c
             JOIN users u ON c.chat_id = u.chat_id
             WHERE c.service = ? AND u.is_allowed = 1
@@ -231,7 +235,7 @@ async def _get_user_credentials(service: str) -> list[UserCredentials]:
             (service,),
         )
         return [
-            UserCredentials(chat_id=r["chat_id"], service=service, login=r["login"], password=r["password"])
+            UserCredentials(id=r["id"], chat_id=r["chat_id"], service=service, login=r["login"], password=r["password"])
             for r in rows
         ]
     finally:
@@ -286,7 +290,8 @@ async def poll_finkit(bot: Bot) -> None:
         all_entries: list[BorrowEntry] = []
         seen_entry_ids: set[str] = set()
         for cred in creds_list:
-            parser = _finkit_parsers.get(cred.chat_id)
+            pkey = (cred.chat_id, cred.login)
+            parser = _finkit_parsers.get(pkey)
             if parser is None:
                 parser = FinkitParser(chat_id=cred.chat_id)
                 # Try to restore saved session first
@@ -294,24 +299,24 @@ async def poll_finkit(bot: Bot) -> None:
                 if not restored:
                     ok = await parser.login(cred.login, cred.password)
                     if not ok:
-                        log.warning("Finkit login failed for chat_id=%s", cred.chat_id)
+                        log.warning("Finkit login failed for chat_id=%s login=%s", cred.chat_id, cred.login)
                         continue
-                _finkit_parsers[cred.chat_id] = parser
+                _finkit_parsers[pkey] = parser
 
             entries = await parser.fetch_borrows()
 
             # Auto re-login on session expiry
             if parser.needs_reauth:
-                log.info("Finkit session expired for chat_id=%s — re-logging in", cred.chat_id)
+                log.info("Finkit session expired for chat_id=%s login=%s — re-logging in", cred.chat_id, cred.login)
                 await parser.close()
                 new_parser = FinkitParser(chat_id=cred.chat_id)
                 ok = await new_parser.login(cred.login, cred.password)
                 if ok:
-                    _finkit_parsers[cred.chat_id] = new_parser
+                    _finkit_parsers[pkey] = new_parser
                     entries = await new_parser.fetch_borrows()
                 else:
-                    log.warning("Finkit re-login failed for chat_id=%s", cred.chat_id)
-                    _finkit_parsers.pop(cred.chat_id, None)
+                    log.warning("Finkit re-login failed for chat_id=%s login=%s", cred.chat_id, cred.login)
+                    _finkit_parsers.pop(pkey, None)
                     continue
 
             if not entries:
@@ -387,31 +392,32 @@ async def poll_zaimis(bot: Bot) -> None:
         all_entries: list[BorrowEntry] = []
         seen_entry_ids: set[str] = set()
         for cred in creds_list:
-            parser = _zaimis_parsers.get(cred.chat_id)
+            pkey = (cred.chat_id, cred.login)
+            parser = _zaimis_parsers.get(pkey)
             if parser is None:
                 parser = ZaimisParser(chat_id=cred.chat_id)
                 restored = await parser.try_restore_session()
                 if not restored:
                     ok = await parser.login(cred.login, cred.password)
                     if not ok:
-                        log.warning("Zaimis login failed for chat_id=%s", cred.chat_id)
+                        log.warning("Zaimis login failed for chat_id=%s login=%s", cred.chat_id, cred.login)
                         continue
-                _zaimis_parsers[cred.chat_id] = parser
+                _zaimis_parsers[pkey] = parser
 
             entries = await parser.fetch_borrows(subscriptions=subs_list)
 
             # Auto re-login on token expiry
             if parser.needs_reauth:
-                log.info("Zaimis token expired for chat_id=%s — re-logging in", cred.chat_id)
+                log.info("Zaimis token expired for chat_id=%s login=%s — re-logging in", cred.chat_id, cred.login)
                 await parser.close()
                 new_parser = ZaimisParser(chat_id=cred.chat_id)
                 ok = await new_parser.login(cred.login, cred.password)
                 if ok:
-                    _zaimis_parsers[cred.chat_id] = new_parser
+                    _zaimis_parsers[pkey] = new_parser
                     entries = await new_parser.fetch_borrows(subscriptions=subs_list)
                 else:
-                    log.warning("Zaimis re-login failed for chat_id=%s", cred.chat_id)
-                    _zaimis_parsers.pop(cred.chat_id, None)
+                    log.warning("Zaimis re-login failed for chat_id=%s login=%s", cred.chat_id, cred.login)
+                    _zaimis_parsers.pop(pkey, None)
                     continue
 
             if entries:
@@ -444,7 +450,19 @@ async def poll_zaimis(bot: Bot) -> None:
 # ====== Midnight cron jobs ======
 
 async def midnight_refresh_investments(bot: Bot) -> None:
-    """Nightly job: refresh investment history → upsert into borrowers table."""
+    """Nightly job: refresh investment history → upsert into borrowers table.
+    Runs only every 3 days to reduce load."""
+    global _last_investment_refresh
+
+    now = datetime.now(timezone.utc)
+    if _last_investment_refresh is not None:
+        elapsed = now - _last_investment_refresh
+        if elapsed < timedelta(days=INVESTMENT_REFRESH_INTERVAL_DAYS):
+            log.info("🌙 Investment refresh skipped (last run %s ago, interval %d days)",
+                     elapsed, INVESTMENT_REFRESH_INTERVAL_DAYS)
+            return
+
+    _last_investment_refresh = now
     log.info("🌙 Midnight job: refreshing investments → borrowers...")
     total_finkit = 0
     total_zaimis = 0
@@ -820,9 +838,16 @@ def get_parser(service: str, chat_id: int | None = None):
     if service == "kapusta":
         return _kapusta
     elif service == "finkit" and chat_id:
-        return _finkit_parsers.get(chat_id)
+        # Find any parser for this chat_id
+        for (cid, _login), p in _finkit_parsers.items():
+            if cid == chat_id:
+                return p
+        return None
     elif service == "zaimis" and chat_id:
-        return _zaimis_parsers.get(chat_id)
+        for (cid, _login), p in _zaimis_parsers.items():
+            if cid == chat_id:
+                return p
+        return None
     elif service == "mongo":
         from bot.parsers.mongo import MongoParser
         return MongoParser()

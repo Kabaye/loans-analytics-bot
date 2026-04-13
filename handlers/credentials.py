@@ -1,4 +1,5 @@
-"""Credentials handler — users input their Finkit/Zaimis login+password."""
+"""Credentials handler — users input their Finkit/Zaimis login+password.
+Supports multiple accounts per service."""
 from __future__ import annotations
 
 import asyncio
@@ -22,8 +23,8 @@ log = logging.getLogger(__name__)
 router = Router(name="credentials")
 
 AUTH_SERVICES = {
-    "finkit": "🏦 Финкит",
-    "zaimis": "💎 Займись",
+    "finkit": "🔵 FinKit",
+    "zaimis": "🟪 ЗАЙМись",
 }
 
 
@@ -38,26 +39,28 @@ async def _show_credentials(target, chat_id: int, edit: bool = False):
     db = await get_db()
     try:
         rows = await db.execute_fetchall(
-            "SELECT service, login FROM credentials WHERE chat_id=?",
+            "SELECT id, service, login, label FROM credentials WHERE chat_id=? ORDER BY service, id",
             (chat_id,),
         )
     finally:
         await db.close()
 
     lines = ["<b>🔑 Ваши учётные данные:</b>\n"]
-    existing = {r["service"]: r["login"] for r in rows}
     for svc, name in AUTH_SERVICES.items():
-        if svc in existing:
-            lines.append(f"✅ {name}: {existing[svc]}")
+        svc_rows = [r for r in rows if r["service"] == svc]
+        if svc_rows:
+            for r in svc_rows:
+                lbl = f" ({r['label']})" if r["label"] else ""
+                lines.append(f"✅ {name}: {r['login']}{lbl}")
         else:
             lines.append(f"❌ {name}: не настроено")
 
     buttons = [
-        [InlineKeyboardButton(text=f"{'✏️' if svc in existing else '➕'} {name}",
+        [InlineKeyboardButton(text=f"➕ {name}",
                               callback_data=f"cred_set_{svc}")]
         for svc, name in AUTH_SERVICES.items()
     ]
-    if existing:
+    if rows:
         buttons.append([
             InlineKeyboardButton(text="🗑 Удалить учётные данные", callback_data="cred_delete_choose")
         ])
@@ -126,8 +129,8 @@ async def cred_set_password(message: Message, state: FSMContext):
             """
             INSERT INTO credentials (chat_id, service, login, password)
             VALUES (?, ?, ?, ?)
-            ON CONFLICT(chat_id, service)
-            DO UPDATE SET login=excluded.login, password=excluded.password
+            ON CONFLICT(chat_id, service, login)
+            DO UPDATE SET password=excluded.password
             """,
             (message.chat.id, data["service"], data["login"], data["password"]),
         )
@@ -329,7 +332,7 @@ async def cred_delete_choose(callback: CallbackQuery):
     db = await get_db()
     try:
         rows = await db.execute_fetchall(
-            "SELECT service, login FROM credentials WHERE chat_id=?",
+            "SELECT id, service, login FROM credentials WHERE chat_id=? ORDER BY service, id",
             (callback.message.chat.id,),
         )
     finally:
@@ -341,7 +344,7 @@ async def cred_delete_choose(callback: CallbackQuery):
         buttons.append([
             InlineKeyboardButton(
                 text=f"🗑 {name} ({row['login']})",
-                callback_data=f"cred_del_{row['service']}",
+                callback_data=f"cred_del_{row['id']}",
             )
         ])
     buttons.append([InlineKeyboardButton(text="↩ Учёт. данные", callback_data="creds_menu")])
@@ -351,20 +354,29 @@ async def cred_delete_choose(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("cred_del_"))
 async def cred_delete(callback: CallbackQuery):
-    service = callback.data.replace("cred_del_", "")
+    cred_id = int(callback.data.replace("cred_del_", ""))
     db = await get_db()
     try:
+        rows = await db.execute_fetchall(
+            "SELECT service, login FROM credentials WHERE id=? AND chat_id=?",
+            (cred_id, callback.message.chat.id),
+        )
+        if not rows:
+            await callback.answer("❌ Не найдено")
+            return
+        svc = rows[0]["service"]
+        login = rows[0]["login"]
         await db.execute(
-            "DELETE FROM credentials WHERE chat_id=? AND service=?",
-            (callback.message.chat.id, service),
+            "DELETE FROM credentials WHERE id=? AND chat_id=?",
+            (cred_id, callback.message.chat.id),
         )
         await db.commit()
     finally:
         await db.close()
 
-    name = AUTH_SERVICES.get(service, service)
+    name = AUTH_SERVICES.get(svc, svc)
     await callback.message.edit_text(
-        f"✅ Учётные данные для {name} удалены.",
+        f"✅ Учётные данные {name} ({login}) удалены.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔑 Учёт. данные", callback_data="creds_menu")],
             [InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")],

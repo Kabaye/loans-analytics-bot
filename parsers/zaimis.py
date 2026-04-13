@@ -13,7 +13,7 @@ import pdfplumber
 
 from bot.models import BorrowEntry, Subscription
 from bot.parsers.base import BaseParser
-from bot.database import save_session_cookies, load_session_cookies
+from bot.parsers.base import BROWSER_UA
 
 log = logging.getLogger(__name__)
 
@@ -38,11 +38,7 @@ HEADERS = {
     "Accept": "application/json;charset=UTF-8",
     "Access-Control-Allow-Origin": "*",
     "Content-Type": "application/json",
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/145.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": BROWSER_UA,
 }
 
 PARALLEL_BATCH = 10  # concurrent page fetches
@@ -57,11 +53,6 @@ def merge_filters(subs: list[Subscription]) -> tuple[dict, dict]:
     filters: dict = {}
     query_params: dict = {}
 
-    def _merge_min(api_field: str, get_min):
-        mins = [get_min(s) for s in subs if get_min(s) is not None]
-        if mins and len(mins) == len(subs):
-            filters.setdefault(api_field, {})["min"] = str(min(mins))
-
     def _merge_range(api_field: str, get_min, get_max):
         mins = [get_min(s) for s in subs if get_min(s) is not None]
         maxs = [get_max(s) for s in subs if get_max(s) is not None]
@@ -70,10 +61,10 @@ def merge_filters(subs: list[Subscription]) -> tuple[dict, dict]:
         if maxs and len(maxs) == len(subs):
             filters.setdefault(api_field, {})["max"] = str(max(maxs))
 
-    _merge_min("amount", lambda s: s.sum_min)
-    _merge_min("score", lambda s: s.rating_min)
+    _merge_range("amount", lambda s: s.sum_min, lambda s: s.sum_max)
+    _merge_range("score", lambda s: s.rating_min, lambda s: s.rating_max)
     _merge_range("loanTerm", lambda s: s.period_min, lambda s: s.period_max)
-    _merge_min("loanRate", lambda s: s.interest_min)
+    _merge_range("loanRate", lambda s: s.interest_min, lambda s: s.interest_max)
 
     if all(s.require_employed for s in subs):
         query_params["isUserEmployed"] = "true"
@@ -86,38 +77,9 @@ def merge_filters(subs: list[Subscription]) -> tuple[dict, dict]:
 class ZaimisParser(BaseParser):
     SERVICE_NAME = "zaimis"
 
-    def __init__(self, chat_id: int | None = None, **kwargs):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._token: str | None = None
-        self._chat_id: int | None = chat_id
-
-    async def try_restore_session(self) -> bool:
-        """Try to restore JWT token from persisted storage."""
-        if not self._chat_id:
-            return False
-        result = await load_session_cookies("zaimis", self._chat_id)
-        if not result:
-            return False
-        cookies, _ = result
-        token = cookies.get("token")
-        if not token:
-            return False
-
-        # Test if token is still valid
-        session = await self._get_session()
-        try:
-            async with session.get(
-                f"{OFFERS_URL}?tab=give&skip=0&take=1",
-                headers={**HEADERS, "Authorization": f"Bearer {token}"},
-            ) as resp:
-                if resp.status == 200:
-                    self._token = token
-                    log.info("Zaimis session restored from DB for chat_id=%s", self._chat_id)
-                    return True
-                log.info("Zaimis saved token expired (status %s), will re-login", resp.status)
-        except Exception as e:
-            log.debug("Zaimis session restore check failed: %s", e)
-        return False
 
     async def login(self, username: str = "", password: str = "") -> bool:
         self._needs_reauth = False
@@ -137,11 +99,6 @@ class ZaimisParser(BaseParser):
                 if not self._token:
                     log.error("Zaimis login: no token in response")
                     return False
-                # Persist token for restart survival
-                if self._chat_id:
-                    await save_session_cookies(
-                        "zaimis", self._chat_id, {"token": self._token},
-                    )
                 log.info("Zaimis login OK")
                 return True
         except Exception as e:

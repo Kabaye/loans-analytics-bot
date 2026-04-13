@@ -38,8 +38,6 @@ class BorrowEntry:
     is_employed: Optional[bool] = None
     has_active_loan: Optional[bool] = None
     has_overdue: Optional[bool] = None
-    has_loan_history: Optional[bool] = None
-    has_repayment_history: Optional[bool] = None
     note: Optional[str] = None
     status: Optional[str] = None
     contract_url: Optional[str] = None
@@ -56,7 +54,6 @@ class BorrowEntry:
     opi_debt_amount: Optional[float] = None
     opi_full_name: Optional[str] = None
     opi_error: Optional[str] = None
-    opi_checked_at: Optional[str] = None  # ISO date string
 
     # Known borrower enrichment (from investment history)
     kb_known: bool = False
@@ -68,7 +65,6 @@ class BorrowEntry:
     kb_avg_rating: Optional[float] = None
     kb_last_rating: Optional[float] = None
     kb_total_invested: Optional[float] = None
-    kb_display_names: Optional[list] = None  # historical nicknames
 
     # Borrower info card (from borrower_info table / Google Sheets import)
     bi_loan_status: Optional[str] = None    # в срок / просрочка / все плохо
@@ -141,9 +137,11 @@ class Subscription:
     sum_min: Optional[float] = None
     sum_max: Optional[float] = None
     rating_min: Optional[float] = None
+    rating_max: Optional[float] = None
     period_min: Optional[int] = None
     period_max: Optional[int] = None
     interest_min: Optional[float] = None
+    interest_max: Optional[float] = None
     require_employed: Optional[bool] = None
     require_income_confirmed: Optional[bool] = None
     is_active: bool = True
@@ -157,11 +155,15 @@ class Subscription:
             return False
         if self.rating_min is not None and entry.credit_score < self.rating_min:
             return False
+        if self.rating_max is not None and entry.credit_score > self.rating_max:
+            return False
         if self.period_min is not None and entry.period_days < self.period_min:
             return False
         if self.period_max is not None and entry.period_days > self.period_max:
             return False
         if self.interest_min is not None and entry.interest_day < self.interest_min:
+            return False
+        if self.interest_max is not None and entry.interest_day > self.interest_max:
             return False
         if self.require_employed and not entry.is_employed:
             return False
@@ -180,3 +182,4 @@ class UserCredentials:
     service: str
     login: str
     password: str
+    id: int = 0

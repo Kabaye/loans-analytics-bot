@@ -13,7 +13,8 @@ import pdfplumber
 
 from bot.models import BorrowEntry
 from bot.parsers.base import BaseParser
-from bot.database import upsert_borrower, lookup_borrower, save_session_cookies, load_session_cookies
+from bot.parsers.base import BROWSER_UA
+from bot.database import upsert_borrower, lookup_borrower
 
 log = logging.getLogger(__name__)
 
@@ -23,7 +24,7 @@ BORROWS_URL = "https://api-p2p.finkit.by/loans-to-invest/"
 LOAN_URL = "https://finkit.by/invest"
 
 NAME_ID_RE = re.compile(
-    r"Я,\s+([А-ЯЁA-Z]+(?:\s+[А-ЯЁA-Z]+){2}),\s+идентификационный\s+номер\s*\n?\s*([0-9A-Z]+)",
+    r"Я,\s+([А-ЯЁA-Z]+(?:\s+[А-ЯЁA-Z]+){2}),\s+идентификационный\s+номер\s*([0-9A-Z]+)",
     re.IGNORECASE | re.UNICODE | re.MULTILINE | re.DOTALL,
 )
 
@@ -34,55 +35,17 @@ BORROWER_WORK_MAP = {
     "student": "Студент",
     "entrepreneur": "ИП",
     "pensioner": "Пенсионер",
-    "unemployed": "",
-    "other": "Другое",
 }
 
 
 class FinkitParser(BaseParser):
     SERVICE_NAME = "finkit"
 
-    def __init__(self, chat_id: int | None = None, **kwargs):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._authenticated = False
         self._csrf_token: str | None = None
         self._session_cookies: dict[str, str] = {}
-        self._chat_id = chat_id
-
-    async def try_restore_session(self) -> bool:
-        """Try to restore session cookies from persisted storage."""
-        if not self._chat_id:
-            return False
-        result = await load_session_cookies("finkit", self._chat_id)
-        if not result:
-            return False
-        cookies, csrf_token = result
-        if not cookies or not cookies.get("sessionid"):
-            return False
-
-        # Test if session is still valid
-        session = await self._get_session()
-        cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
-        try:
-            async with session.get(
-                f"{BORROWS_URL}?page=1&ordering=borrower_score_value",
-                headers={
-                    "Accept": "application/json",
-                    "Referer": "https://finkit.by/",
-                    "User-Agent": "Mozilla/5.0",
-                    "Cookie": cookie_str,
-                },
-            ) as resp:
-                if resp.status == 200:
-                    self._session_cookies = cookies
-                    self._csrf_token = csrf_token
-                    self._authenticated = True
-                    log.info("Finkit session restored from DB for chat_id=%s", self._chat_id)
-                    return True
-                log.info("Finkit saved session expired (status %s), will re-login", resp.status)
-        except Exception as e:
-            log.debug("Finkit session restore check failed: %s", e)
-        return False
 
     async def login(self, username: str = "", password: str = "") -> bool:
         self._needs_reauth = False
@@ -132,12 +95,6 @@ class FinkitParser(BaseParser):
                             self._session_cookies[name] = h.split(f"{name}=")[1].split(";")[0]
                 self._authenticated = True
                 log.info("Finkit login OK")
-                # Persist session cookies
-                if self._chat_id:
-                    await save_session_cookies(
-                        "finkit", self._chat_id,
-                        self._session_cookies, self._csrf_token,
-                    )
                 return True
         except Exception as e:
             log.exception("Finkit login error: %s", e)
@@ -158,7 +115,7 @@ class FinkitParser(BaseParser):
             headers = {
                 "Accept": "application/json",
                 "Referer": "https://finkit.by/",
-                "User-Agent": "Mozilla/5.0",
+                "User-Agent": BROWSER_UA,
                 "Cookie": cookie_str,
             }
             try:
@@ -278,7 +235,7 @@ class FinkitParser(BaseParser):
                     cookie_str = "; ".join(f"{k}={v}" for k, v in self._session_cookies.items())
                     headers = {
                         "Cookie": cookie_str,
-                        "User-Agent": "Mozilla/5.0",
+                        "User-Agent": BROWSER_UA,
                     }
                     async with session.get(entry.contract_url, headers=headers) as resp:
                         if resp.status != 200:

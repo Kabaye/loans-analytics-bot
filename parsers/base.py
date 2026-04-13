@@ -10,13 +10,19 @@ from bot.models import BorrowEntry
 
 log = logging.getLogger(__name__)
 
+BROWSER_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "Version/18.7 Mobile/15E148 Safari/604.1 OPT/6.4.1"
+)
+
 
 class BaseParser(abc.ABC):
     """Abstract parser for a P2P lending site."""
 
     SERVICE_NAME: str = ""
 
-    def __init__(self, session: Optional[aiohttp.ClientSession] = None, **kwargs):
+    def __init__(self, session: Optional[aiohttp.ClientSession] = None):
         self._session = session
         self._owns_session = session is None
         self._needs_reauth = False
@@ -30,6 +36,7 @@ class BaseParser(abc.ABC):
             self._session = aiohttp.ClientSession(
                 connector=aiohttp.TCPConnector(ssl=False),
                 timeout=aiohttp.ClientTimeout(total=60),
+                headers={"User-Agent": BROWSER_UA},
             )
             self._owns_session = True
         return self._session

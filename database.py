@@ -36,7 +36,8 @@ async def init_db() -> None:
             service     TEXT NOT NULL,
             login       TEXT NOT NULL,
             password    TEXT NOT NULL,
-            UNIQUE(chat_id, service),
+            label       TEXT,
+            UNIQUE(chat_id, service, login),
             FOREIGN KEY (chat_id) REFERENCES users(chat_id)
         );
 
@@ -128,6 +129,43 @@ async def init_db() -> None:
             except Exception:
                 pass
 
+        # Migration: add label column to credentials
+        try:
+            await db.execute("ALTER TABLE credentials ADD COLUMN label TEXT")
+        except Exception:
+            pass
+
+        # Migration: change credentials UNIQUE from (chat_id, service) to (chat_id, service, login)
+        try:
+            await db.execute("SELECT sql FROM sqlite_master WHERE name='credentials'")
+            # Recreate table with new constraint if old one exists
+            rows = await db.execute_fetchall(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='credentials'"
+            )
+            if rows and "UNIQUE(chat_id, service)" in (rows[0]["sql"] or "") \
+               and "UNIQUE(chat_id, service, login)" not in (rows[0]["sql"] or ""):
+                await db.execute("""
+                    CREATE TABLE IF NOT EXISTS credentials_new (
+                        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                        chat_id     INTEGER NOT NULL,
+                        service     TEXT NOT NULL,
+                        login       TEXT NOT NULL,
+                        password    TEXT NOT NULL,
+                        label       TEXT,
+                        UNIQUE(chat_id, service, login),
+                        FOREIGN KEY (chat_id) REFERENCES users(chat_id)
+                    )
+                """)
+                await db.execute("""
+                    INSERT OR IGNORE INTO credentials_new (id, chat_id, service, login, password)
+                    SELECT id, chat_id, service, login, password FROM credentials
+                """)
+                await db.execute("DROP TABLE credentials")
+                await db.execute("ALTER TABLE credentials_new RENAME TO credentials")
+                log.info("Migrated credentials: UNIQUE(chat_id, service) → UNIQUE(chat_id, service, login)")
+        except Exception:
+            pass
+
         # Migration: old borrower_identities → borrowers (already ran)
         for tbl in ("borrower_identities", "known_borrowers", "investment_history",
                      "notified_loans", "last_check"):
@@ -216,16 +254,6 @@ async def init_db() -> None:
                 (svc, enabled, interval, h_start, h_end),
             )
 
-        # seen_entries — persists seen loan IDs across restarts for freshness detection
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS seen_entries (
-            service     TEXT NOT NULL,
-            entry_id    TEXT NOT NULL,
-            first_seen  TEXT NOT NULL DEFAULT (datetime('now')),
-            PRIMARY KEY (service, entry_id)
-        );
-        """)
-
         await db.commit()
         log.info("Database initialized at %s", DB_PATH)
     finally:
@@ -237,41 +265,20 @@ async def upsert_borrower(
     borrower_user_id: str,
     full_name: str | None = None,
     document_id: str | None = None,
-    display_name: str | None = None,
 ) -> None:
     """Insert or update a borrower mapping record."""
-    import json as _json
     db = await get_db()
     try:
-        # Handle display_names array (append unique nicknames)
-        display_names_json = None
-        if display_name:
-            rows = await db.execute_fetchall(
-                "SELECT display_names FROM borrowers WHERE service = ? AND borrower_user_id = ?",
-                (service, borrower_user_id),
-            )
-            if rows and rows[0]["display_names"]:
-                try:
-                    names = _json.loads(rows[0]["display_names"])
-                except Exception:
-                    names = []
-                if display_name not in names:
-                    names.append(display_name)
-                display_names_json = _json.dumps(names, ensure_ascii=False)
-            else:
-                display_names_json = _json.dumps([display_name], ensure_ascii=False)
-
         await db.execute(
             """
-            INSERT INTO borrowers (service, borrower_user_id, full_name, document_id, display_names)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO borrowers (service, borrower_user_id, full_name, document_id)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(service, borrower_user_id) DO UPDATE SET
                 full_name = COALESCE(excluded.full_name, borrowers.full_name),
                 document_id = COALESCE(excluded.document_id, borrowers.document_id),
-                display_names = COALESCE(excluded.display_names, borrowers.display_names),
                 last_seen = datetime('now')
             """,
-            (service, borrower_user_id, full_name, document_id, display_names_json),
+            (service, borrower_user_id, full_name, document_id),
         )
         # Auto-create borrower_info if we have a document_id
         if document_id and len(document_id) == 14:
@@ -296,7 +303,7 @@ async def lookup_borrower(service: str, borrower_user_id: str) -> dict | None:
         rows = await db.execute_fetchall(
             """SELECT b.service, b.borrower_user_id, b.document_id, b.full_name,
                       b.total_loans, b.settled_loans, b.overdue_loans,
-                      b.avg_rating, b.total_invested, b.display_names,
+                      b.avg_rating, b.total_invested,
                       bi.loan_status, bi.sum_category, bi.rating AS bi_rating,
                       bi.notes, bi.last_loan_date, bi.loan_count,
                       bi.opi_has_debt, bi.opi_debt_amount, bi.opi_checked_at, bi.opi_full_name
@@ -344,27 +351,6 @@ async def search_borrower_info(query: str, limit: int = 10) -> list[dict]:
     finally:
         await db.close()
 
-
-
-
-async def search_borrowers(query: str, limit: int = 10) -> list[dict]:
-    """Search borrowers table by full_name or document_id (partial match, cross-service)."""
-    db = await get_db()
-    try:
-        rows = await db.execute_fetchall(
-            """SELECT b.service, b.borrower_user_id, b.document_id, b.full_name,
-                      b.total_loans, b.settled_loans, b.overdue_loans,
-                      b.avg_rating, b.total_invested, b.display_names, b.first_seen, b.last_seen
-               FROM borrowers b
-               WHERE b.full_name LIKE ? COLLATE NOCASE
-                  OR b.document_id LIKE ?
-               ORDER BY b.last_seen DESC
-               LIMIT ?""",
-            (f"%{query}%", f"%{query}%", limit),
-        )
-        return [dict(r) for r in rows]
-    finally:
-        await db.close()
 
 async def upsert_borrower_info(
     document_id: str,
@@ -597,40 +583,3 @@ async def get_borrowers_stats() -> dict:
         return result
     finally:
         await db.close()
-
-async def save_session_cookies(service: str, chat_id: int, cookies: dict, csrf_token: str | None = None) -> None:
-    """Persist session cookies for a parser to survive restarts."""
-    import json as _json
-    db = await get_db()
-    try:
-        await db.execute(
-            """INSERT INTO session_cookies (service, chat_id, cookies, csrf_token, updated_at)
-               VALUES (?, ?, ?, ?, datetime('now'))
-               ON CONFLICT(service, chat_id) DO UPDATE SET
-                   cookies = excluded.cookies,
-                   csrf_token = COALESCE(excluded.csrf_token, session_cookies.csrf_token),
-                   updated_at = datetime('now')
-            """,
-            (service, chat_id, _json.dumps(cookies, ensure_ascii=False), csrf_token),
-        )
-        await db.commit()
-    finally:
-        await db.close()
-
-
-async def load_session_cookies(service: str, chat_id: int) -> tuple[dict, str | None] | None:
-    """Load persisted session cookies. Returns (cookies_dict, csrf_token) or None."""
-    import json as _json
-    db = await get_db()
-    try:
-        rows = await db.execute_fetchall(
-            "SELECT cookies, csrf_token FROM session_cookies WHERE service = ? AND chat_id = ?",
-            (service, chat_id),
-        )
-        if not rows:
-            return None
-        cookies = _json.loads(rows[0]["cookies"])
-        return cookies, rows[0]["csrf_token"]
-    finally:
-        await db.close()
-

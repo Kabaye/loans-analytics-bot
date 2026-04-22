@@ -25,7 +25,7 @@ from bot.database import (
     save_opi_result, upsert_borrower,
     get_saved_credential_session, save_credential_session, delete_credential_session,
     get_json_schema_state, save_json_schema_state,
-    deactivate_missing_overdue_cases, lookup_borrower, upsert_overdue_case,
+    deactivate_missing_overdue_cases, lookup_borrower, upsert_overdue_case, update_overdue_case_contacts,
 )
 
 _NAME_ID_RE = re.compile(
@@ -798,12 +798,22 @@ async def _sync_finkit_overdue_cases() -> tuple[int, list[str]]:
                 cached = await lookup_borrower("finkit", borrower_user_id) if borrower_user_id else None
 
                 principal = _safe_float(_coalesce(detail.get("principal_outstanding"), item.get("principal_outstanding"), item.get("amount")))
-                accrued = _safe_float(_coalesce(detail.get("accrued_percent"), item.get("accrued_percent")))
+                accrued = _safe_float(_coalesce(detail.get("accrued_percent"), item.get("accrued_percent"), detail.get("expected_return")))
                 fine = _safe_float(_coalesce(detail.get("fine_outstanding"), item.get("fine_outstanding")))
-                due_at = _coalesce(detail.get("due_at"), detail.get("due_date"), item.get("due_at"), item.get("due_date"))
-                days_overdue = _safe_int(_coalesce(detail.get("overdue_days"), item.get("overdue_days"))) or _days_overdue_from_due(due_at)
+                due_at = _coalesce(detail.get("maturity_date"), detail.get("payment_date"), detail.get("due_at"), detail.get("due_date"), item.get("payment_date"), item.get("due_at"), item.get("due_date"))
+                schedule_days = None
+                schedules = detail.get("schedules") or []
+                if schedules:
+                    schedule_days = _safe_int(schedules[0].get("days_delayed"))
+                days_overdue = _safe_int(_coalesce(detail.get("overdue_days"), item.get("overdue_days"), schedule_days)) or _days_overdue_from_due(due_at)
+                address = None
+                zip_code = None
+                msi = detail.get("msi_registration_address") or {}
+                if isinstance(msi, dict):
+                    address = _coalesce(msi.get("formatted_address"))
+                    zip_code = _coalesce(msi.get("postal_code"))
 
-                await upsert_overdue_case(
+                case_id = await upsert_overdue_case(
                     chat_id=cred.chat_id,
                     credential_id=cred.id,
                     service="finkit",
@@ -817,7 +827,7 @@ async def _sync_finkit_overdue_cases() -> tuple[int, list[str]]:
                     display_name=_coalesce(detail.get("borrower_short_name"), item.get("borrower_short_name")),
                     issued_at=_coalesce(detail.get("created"), item.get("created")),
                     due_at=due_at,
-                    overdue_started_at=_coalesce(detail.get("overdue_started_at"), item.get("overdue_started_at")),
+                    overdue_started_at=_coalesce(detail.get("overdue_started_at"), due_at, item.get("overdue_started_at")),
                     days_overdue=days_overdue,
                     amount=_safe_float(_coalesce(detail.get("amount"), item.get("amount"))),
                     principal_outstanding=principal,
@@ -829,6 +839,15 @@ async def _sync_finkit_overdue_cases() -> tuple[int, list[str]]:
                     loan_url=None,
                     raw_data={"list": item, "detail": detail},
                 )
+                if address or zip_code or detail.get("borrower_phone_number") or detail.get("borrower_email"):
+                    await update_overdue_case_contacts(
+                        case_id,
+                        cred.chat_id,
+                        borrower_address=address,
+                        borrower_zip=zip_code,
+                        borrower_phone=detail.get("borrower_phone_number"),
+                        borrower_email=detail.get("borrower_email"),
+                    )
                 synced += 1
                 await asyncio.sleep(0.05)
             await deactivate_missing_overdue_cases(
@@ -876,14 +895,23 @@ async def _sync_zaimis_overdue_cases() -> tuple[int, list[str]]:
                 detail = await parser.fetch_order_detail(external_id) or {}
                 cp = detail.get("counterparty", {}) or order.get("counterparty", {}) or {}
                 offer = detail.get("offer", {}) or order.get("offer", {}) or {}
+                model = detail.get("modelData", {}) or order.get("modelData", {}) or {}
                 borrower_user_id = str(cp.get("id", "")).strip()
                 cached = await lookup_borrower("zaimis", borrower_user_id) if borrower_user_id else None
 
-                principal = _safe_float(_coalesce(detail.get("principalOutstanding"), order.get("principalOutstanding"), order.get("amount"), offer.get("amount")))
-                accrued = _safe_float(_coalesce(detail.get("interestOutstanding"), order.get("interestOutstanding")))
-                fine = _safe_float(_coalesce(detail.get("penaltyOutstanding"), order.get("penaltyOutstanding")))
-                due_at = _coalesce(detail.get("deadline"), order.get("deadline"), detail.get("dueAt"), order.get("dueAt"))
-                days_overdue = _safe_int(_coalesce(detail.get("daysOverdue"), order.get("daysOverdue"))) or _days_overdue_from_due(due_at)
+                principal = _safe_float(_coalesce(detail.get("principalOutstanding"), order.get("principalOutstanding"), detail.get("amount"), order.get("amount"), offer.get("amount")))
+                accrued = _safe_float(_coalesce(detail.get("interestOutstanding"), order.get("interestOutstanding"), model.get("profit"), model.get("interestWithOverdue")))
+                fine = _safe_float(_coalesce(detail.get("penaltyOutstanding"), order.get("penaltyOutstanding"), model.get("penaltyAmount")))
+                due_at = _coalesce(detail.get("returnDate"), order.get("returnDate"), detail.get("deadline"), order.get("deadline"), detail.get("dueAt"), order.get("dueAt"))
+                overdue_started_at = _coalesce(detail.get("expiredDate"), order.get("expiredDate"), detail.get("overdueStartedAt"), order.get("overdueStartedAt"))
+                actual_duration = _safe_int(_coalesce(detail.get("actualDuration"), order.get("actualDuration")))
+                loan_term = _safe_int(_coalesce(detail.get("loanTerm"), order.get("loanTerm")))
+                explicit_days = _safe_int(_coalesce(detail.get("daysOverdue"), order.get("daysOverdue")))
+                duration_days = actual_duration - loan_term if actual_duration is not None and loan_term is not None else None
+                if duration_days is not None and duration_days < 0:
+                    duration_days = 0
+                days_overdue = explicit_days or duration_days or _days_overdue_from_due(overdue_started_at or due_at)
+                total_due = _safe_float(_coalesce(detail.get("totalOutstanding"), order.get("totalOutstanding"), model.get("closeSend"), order.get("returnAmount")))
 
                 await upsert_overdue_case(
                     chat_id=cred.chat_id,
@@ -899,13 +927,13 @@ async def _sync_zaimis_overdue_cases() -> tuple[int, list[str]]:
                     display_name=cp.get("displayName"),
                     issued_at=_coalesce(detail.get("createdAt"), order.get("createdAt"), offer.get("createdAt")),
                     due_at=due_at,
-                    overdue_started_at=_coalesce(detail.get("overdueStartedAt"), order.get("overdueStartedAt")),
+                    overdue_started_at=overdue_started_at,
                     days_overdue=days_overdue,
                     amount=_safe_float(_coalesce(order.get("amount"), detail.get("amount"), offer.get("amount"))),
                     principal_outstanding=principal,
                     accrued_percent=accrued,
                     fine_outstanding=fine,
-                    total_due=_total_due(principal, accrued, fine, _coalesce(detail.get("totalOutstanding"), order.get("totalOutstanding"), order.get("amount"))),
+                    total_due=total_due if total_due is not None else _total_due(principal, accrued, fine, _coalesce(order.get("amount"), detail.get("amount"))),
                     status=str(_coalesce(detail.get("state"), order.get("state")) or "") or None,
                     contract_url=None,
                     loan_url=None,

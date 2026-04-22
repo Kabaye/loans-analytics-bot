@@ -231,6 +231,7 @@ async def cb_overdue_profile(callback: CallbackQuery):
             f"<b>Адрес:</b> {_display(profile.get('address'))}",
             f"<b>Телефон:</b> {_display(profile.get('phone'))}",
             f"<b>Email:</b> {_display(profile.get('email'))}",
+            f"<b>Реквизиты:</b> {_display(profile.get('payment_details'))}",
             f"<b>SMS-отправитель:</b> {_display(profile.get('sms_sender'))}",
         ])
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -247,17 +248,19 @@ async def cb_overdue_profile_edit(callback: CallbackQuery, state: FSMContext):
     await state.set_state(OverdueStates.waiting_creditor_profile)
     await callback.message.edit_text(
         "👤 <b>Профиль кредитора</b>\n\n"
-        "Отправьте 5 строк:\n"
+        "Отправьте 6 строк:\n"
         "1. ФИО / название\n"
         "2. Адрес\n"
         "3. Телефон\n"
         "4. Email\n"
-        "5. Имя отправителя для SMS (или '-' чтобы использовать ФИО)\n\n"
+        "5. Реквизиты для оплаты (или '-')\n"
+        "6. Имя отправителя для SMS (или '-' чтобы использовать ФИО)\n\n"
         "Пример:\n"
         "Кулич Святослав Петрович\n"
         "г. Минск, ул. Связистов, д. 8, кв. 36\n"
         "+375447465358\n"
         "svkulich@tut.by\n"
+        "BY00UNBS30120000000000000000, BIC UNBSBY2X\n"
         "Святослав Кулич",
         reply_markup=_back_main_kb(),
         parse_mode="HTML",
@@ -273,13 +276,15 @@ async def msg_overdue_profile(message: Message, state: FSMContext):
         await message.answer("Нужно минимум 4 строки: ФИО/название, адрес, телефон, email.")
         return
     full_name, address, phone, email = parts[:4]
-    sms_sender = parts[4] if len(parts) >= 5 and parts[4] != "-" else full_name
+    payment_details = parts[4] if len(parts) >= 5 and parts[4] != "-" else None
+    sms_sender = parts[5] if len(parts) >= 6 and parts[5] != "-" else full_name
     await upsert_creditor_profile(
         message.chat.id,
         full_name=full_name,
         address=address,
         phone=phone,
         email=email,
+        payment_details=payment_details,
         sms_sender=sms_sender,
     )
     await state.clear()

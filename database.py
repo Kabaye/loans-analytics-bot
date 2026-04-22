@@ -1093,11 +1093,11 @@ async def update_overdue_case_contacts(
         await db.execute(
             """
             UPDATE overdue_cases
-            SET borrower_address = ?,
-                borrower_zip = ?,
-                borrower_phone = ?,
-                borrower_email = ?,
-                voluntary_term_days = ?,
+            SET borrower_address = COALESCE(?, borrower_address),
+                borrower_zip = COALESCE(?, borrower_zip),
+                borrower_phone = COALESCE(?, borrower_phone),
+                borrower_email = COALESCE(?, borrower_email),
+                voluntary_term_days = COALESCE(?, voluntary_term_days),
                 updated_at = datetime('now')
             WHERE id = ? AND chat_id = ?
             """,

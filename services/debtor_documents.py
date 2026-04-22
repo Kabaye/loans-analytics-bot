@@ -108,6 +108,10 @@ def collect_claim_missing_fields(case: dict, creditor: dict | None, signature: d
     return list(dict.fromkeys(missing))
 
 
+def _join_non_empty(parts: list[str | None]) -> str:
+    return ", ".join(part for part in parts if part)
+
+
 def build_sms_text(case: dict, creditor: dict) -> str:
     debt_breakdown = []
     if case.get("principal_outstanding") is not None:
@@ -135,13 +139,27 @@ def build_sms_text(case: dict, creditor: dict) -> str:
 
 def build_claim_text(case: dict, creditor: dict) -> str:
     service_url = _service_url(case)
-    return "\n\n".join([
+    payment_details = (creditor.get("payment_details") or "").strip()
+    debtor_line = _join_non_empty([
+        case.get("full_name"),
+        f"ИН {case.get('document_id')}" if case.get("document_id") else None,
+        case.get("borrower_address"),
+    ])
+    debt_calc = (
+        f"Основной долг: {_money(case.get('principal_outstanding'))}\n"
+        f"Проценты: {_money(case.get('accrued_percent'))}\n"
+        f"Пеня: {_money(case.get('fine_outstanding'))}\n"
+        f"Итого к оплате: {_money(case.get('total_due'))} на дату отправки документа."
+    )
+    sections = [
         "ПРЕДЛОЖЕНИЕ\nо добровольном урегулировании задолженности",
         (
-            f"Направляю настоящее письмо-предложение по договору займа {_loan_ref(case)} "
+            f"Я, {creditor.get('full_name')}, направляю настоящее письмо-предложение в адрес {debtor_line or 'заемщика'} "
+            f"по договору займа {_loan_ref(case)} "
             f"от {_date(case.get('issued_at'))} через сервис онлайн-заимствования {service_url}, "
             "с целью урегулирования задолженности в добровольном досудебном порядке."
         ),
+        debt_calc,
         (
             f"Убедительно прошу Вас погасить задолженность в полном объеме в течение "
             f"{_voluntary_term(case)} дней с даты получения настоящего документа."
@@ -150,17 +168,13 @@ def build_claim_text(case: dict, creditor: dict) -> str:
             "Обращаю Ваше внимание на то, что при передаче дела в суд размер требований "
             "будет увеличен за счет дальнейшего начисления процентов, пени и судебных расходов."
         ),
-        (
-            f"Сумма займа: {_money(case.get('amount'))} | "
-            f"Проценты: {_money(case.get('accrued_percent'))} | "
-            f"Пени: {_money(case.get('fine_outstanding'))}\n"
-            f"ИТОГО к оплате: {_money(case.get('total_due'))} на дату отправки документа."
-        ),
+        (f"Платежные реквизиты для добровольного погашения: {payment_details}." if payment_details else ""),
         (
             f"Для связи и добровольного урегулирования: {creditor.get('full_name')}, "
             f"{creditor.get('phone') or '—'}, {creditor.get('email') or '—'}."
         ),
-    ])
+    ]
+    return "\n\n".join(part for part in sections if part).strip()
 
 
 def _set_default_style(doc: Document) -> None:
@@ -213,6 +227,8 @@ def render_claim_docx(case: dict, creditor: dict, signature_path: str) -> tuple[
         creditor.get("phone"),
         creditor.get("email"),
     )
+    if creditor.get("payment_details"):
+        creditor_lines.append(f"Реквизиты: {creditor.get('payment_details')}")
 
     _add_block(doc, "Кому:", debtor_lines)
     doc.add_paragraph()

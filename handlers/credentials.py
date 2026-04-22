@@ -16,7 +16,7 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
-from bot.database import get_db, upsert_borrower_from_investment
+from bot.database import get_db, upsert_borrower_from_investment, save_credential_session
 from bot.handlers.start import is_allowed
 
 log = logging.getLogger(__name__)
@@ -134,7 +134,12 @@ async def cred_set_password(message: Message, state: FSMContext):
             """,
             (message.chat.id, data["service"], data["login"], data["password"]),
         )
+        row = await db.execute_fetchall(
+            "SELECT id FROM credentials WHERE chat_id = ? AND service = ? AND login = ?",
+            (message.chat.id, data["service"], data["login"]),
+        )
         await db.commit()
+        credential_id = row[0]["id"]
     finally:
         await db.close()
 
@@ -151,19 +156,19 @@ async def cred_set_password(message: Message, state: FSMContext):
 
     # Auto-load investment archive in background
     asyncio.create_task(_autoload_investments(
-        data["service"], data["login"], data["password"], msg
+        credential_id, data["service"], data["login"], data["password"], msg
     ))
 
 
-async def _autoload_investments(service: str, login: str, password: str, status_msg: Message):
+async def _autoload_investments(credential_id: int, service: str, login: str, password: str, status_msg: Message):
     """Load investment archive after credential save."""
     try:
         log.info("Auto-load investments starting for %s", service)
         count = 0
         if service == "zaimis":
-            count = await _load_zaimis_investments(login, password)
+            count = await _load_zaimis_investments(credential_id, login, password)
         elif service == "finkit":
-            count = await _load_finkit_investments(login, password)
+            count = await _load_finkit_investments(credential_id, login, password)
 
         log.info("Auto-load investments done for %s: %d entries", service, count)
         name = AUTH_SERVICES.get(service, service)
@@ -194,7 +199,7 @@ async def _autoload_investments(service: str, login: str, password: str, status_
             pass
 
 
-async def _load_zaimis_investments(login: str, password: str) -> int:
+async def _load_zaimis_investments(credential_id: int, login: str, password: str) -> int:
     """Fetch Zaimis investments and upsert into borrowers table."""
     from bot.parsers.zaimis import ZaimisParser
     zp = ZaimisParser()
@@ -202,6 +207,8 @@ async def _load_zaimis_investments(login: str, password: str) -> int:
         ok = await zp.login(login, password)
         if not ok:
             raise RuntimeError("Login failed")
+        if export := zp.export_session():
+            await save_credential_session(credential_id, "zaimis", export)
 
         orders = await zp.fetch_investments()
         # Aggregate per borrower
@@ -250,7 +257,7 @@ async def _load_zaimis_investments(login: str, password: str) -> int:
         await zp.close()
 
 
-async def _load_finkit_investments(login: str, password: str) -> int:
+async def _load_finkit_investments(credential_id: int, login: str, password: str) -> int:
     """Fetch Finkit investments and upsert into borrowers table."""
     from bot.parsers.finkit import FinkitParser
     fp = FinkitParser()
@@ -258,6 +265,8 @@ async def _load_finkit_investments(login: str, password: str) -> int:
         ok = await fp.login(login, password)
         if not ok:
             raise RuntimeError("Login failed")
+        if export := fp.export_session():
+            await save_credential_session(credential_id, "finkit", export)
 
         session = await fp._get_session()
         cookie_str = "; ".join(f"{k}={v}" for k, v in fp._session_cookies.items())

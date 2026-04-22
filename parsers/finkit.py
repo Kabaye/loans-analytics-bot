@@ -102,6 +102,26 @@ class FinkitParser(BaseParser):
             log.exception("Finkit login error: %s", e)
             return False
 
+    def export_session(self) -> dict | None:
+        if not self._authenticated or not self._session_cookies:
+            return None
+        return {
+            "csrf_token": self._csrf_token,
+            "session_cookies": self._session_cookies,
+        }
+
+    def restore_session(self, session_data: dict | None) -> bool:
+        if not session_data:
+            return False
+        cookies = session_data.get("session_cookies") or {}
+        if not cookies:
+            return False
+        self._csrf_token = session_data.get("csrf_token")
+        self._session_cookies = dict(cookies)
+        self._authenticated = True
+        self._needs_reauth = False
+        return True
+
     async def fetch_borrows(self) -> list[BorrowEntry]:
         if not self._authenticated:
             log.error("Finkit: not logged in")

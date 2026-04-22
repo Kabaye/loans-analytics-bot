@@ -105,6 +105,19 @@ class ZaimisParser(BaseParser):
             log.exception("Zaimis login error: %s", e)
             return False
 
+    def export_session(self) -> dict | None:
+        if not self._token:
+            return None
+        return {"token": self._token}
+
+    def restore_session(self, session_data: dict | None) -> bool:
+        token = (session_data or {}).get("token")
+        if not token:
+            return False
+        self._token = token
+        self._needs_reauth = False
+        return True
+
     async def _fetch_page(self, page: int, filters_json: str,
                           query_params: dict) -> dict:
         """Fetch a single page of offers."""

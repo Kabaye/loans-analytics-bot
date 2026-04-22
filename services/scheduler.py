@@ -21,6 +21,7 @@ from bot.database import (
     get_db, get_site_settings,
     upsert_borrower_from_investment, get_stale_opi_documents,
     save_opi_result, upsert_borrower,
+    get_saved_credential_session, save_credential_session, delete_credential_session,
 )
 
 _NAME_ID_RE = re.compile(
@@ -49,9 +50,10 @@ log = logging.getLogger(__name__)
 _kapusta: Optional[KapustaParser] = None
 _opi_checker: Optional[OPIChecker] = None
 
-# Per-user parser instances for authenticated services (keyed by (chat_id, login))
-_finkit_parsers: dict[tuple[int, str], FinkitParser] = {}
-_zaimis_parsers: dict[tuple[int, str], ZaimisParser] = {}
+# Per-credential parser instances for authenticated services
+_finkit_parsers: dict[int, FinkitParser] = {}
+_zaimis_parsers: dict[int, ZaimisParser] = {}
+_poll_rotation_index: dict[str, int] = {"finkit": 0, "zaimis": 0}
 
 # Exposed scheduler instance for dynamic reconfiguration
 _scheduler: Optional[AsyncIOScheduler] = None
@@ -222,24 +224,139 @@ async def _should_poll(service: str) -> bool:
     return True
 
 
-async def _get_user_credentials(service: str) -> list[UserCredentials]:
+async def _get_user_credentials(service: str, chat_id: int | None = None) -> list[UserCredentials]:
     db = await get_db()
     try:
-        rows = await db.execute_fetchall(
-            """
+        query = """
             SELECT c.id, c.chat_id, c.login, c.password
             FROM credentials c
             JOIN users u ON c.chat_id = u.chat_id
             WHERE c.service = ? AND u.is_allowed = 1
-            """,
-            (service,),
-        )
+        """
+        params: list = [service]
+        if chat_id is not None:
+            query += " AND c.chat_id = ?"
+            params.append(chat_id)
+        query += " ORDER BY c.id"
+        rows = await db.execute_fetchall(query, tuple(params))
         return [
             UserCredentials(id=r["id"], chat_id=r["chat_id"], service=service, login=r["login"], password=r["password"])
             for r in rows
         ]
     finally:
         await db.close()
+
+
+def _pick_round_robin_credential(service: str, creds_list: list[UserCredentials]) -> UserCredentials | None:
+    if not creds_list:
+        return None
+    idx = _poll_rotation_index.get(service, 0) % len(creds_list)
+    _poll_rotation_index[service] = (idx + 1) % len(creds_list)
+    return creds_list[idx]
+
+
+def _remember_parser_owner(parser, cred: UserCredentials) -> None:
+    setattr(parser, "_owner_chat_id", cred.chat_id)
+    setattr(parser, "_owner_credential_id", cred.id)
+
+
+async def _login_and_persist(service: str, parser, cred: UserCredentials) -> bool:
+    ok = await parser.login(cred.login, cred.password)
+    if not ok:
+        await delete_credential_session(cred.id)
+        return False
+    export = getattr(parser, "export_session", None)
+    if callable(export):
+        session_data = export()
+        if session_data:
+            await save_credential_session(cred.id, service, session_data)
+    return True
+
+
+async def _ensure_finkit_parser(cred: UserCredentials, force_login: bool = False) -> FinkitParser | None:
+    parser = _finkit_parsers.get(cred.id)
+    if parser is None or force_login:
+        if parser is not None:
+            try:
+                await parser.close()
+            except Exception:
+                pass
+        parser = FinkitParser()
+        _remember_parser_owner(parser, cred)
+        _finkit_parsers[cred.id] = parser
+
+    if not force_login:
+        export = getattr(parser, "export_session", None)
+        if callable(export) and export():
+            return parser
+        saved = await get_saved_credential_session(cred.id)
+        restore = getattr(parser, "restore_session", None)
+        if callable(restore) and restore(saved):
+            return parser
+
+    ok = await _login_and_persist("finkit", parser, cred)
+    if ok:
+        return parser
+    _finkit_parsers.pop(cred.id, None)
+    return None
+
+
+async def _ensure_zaimis_parser(cred: UserCredentials, force_login: bool = False) -> ZaimisParser | None:
+    parser = _zaimis_parsers.get(cred.id)
+    if parser is None or force_login:
+        if parser is not None:
+            try:
+                await parser.close()
+            except Exception:
+                pass
+        parser = ZaimisParser()
+        _remember_parser_owner(parser, cred)
+        _zaimis_parsers[cred.id] = parser
+
+    if not force_login:
+        export = getattr(parser, "export_session", None)
+        if callable(export) and export():
+            return parser
+        saved = await get_saved_credential_session(cred.id)
+        restore = getattr(parser, "restore_session", None)
+        if callable(restore) and restore(saved):
+            return parser
+
+    ok = await _login_and_persist("zaimis", parser, cred)
+    if ok:
+        return parser
+    _zaimis_parsers.pop(cred.id, None)
+    return None
+
+
+async def get_export_parsers(service: str, chat_id: int) -> list:
+    """Return reusable parsers for export without creating extra logins when a saved session exists."""
+    if service == "kapusta":
+        global _kapusta
+        if _kapusta is None:
+            _kapusta = KapustaParser()
+            ok = await _kapusta.login()
+            if not ok:
+                await _kapusta.close()
+                _kapusta = None
+                return []
+        return [_kapusta]
+
+    if service == "finkit":
+        cred = _pick_round_robin_credential(service, await _get_user_credentials(service, chat_id=chat_id))
+        if not cred:
+            return []
+        parser = await _ensure_finkit_parser(cred)
+        return [parser] if parser else []
+
+    if service == "zaimis":
+        cred = _pick_round_robin_credential(service, await _get_user_credentials(service, chat_id=chat_id))
+        if not cred:
+            return []
+        parser = await _ensure_zaimis_parser(cred)
+        return [parser] if parser else []
+
+    return []
 
 
 async def poll_kapusta(bot: Bot) -> None:
@@ -287,47 +404,26 @@ async def poll_finkit(bot: Bot) -> None:
         if not creds_list:
             return
 
-        # ── Stage 1: FETCH entries from all credentials ──
-        all_entries: list[BorrowEntry] = []
-        seen_entry_ids: set[str] = set()
-        parser_entries: list[tuple] = []  # (parser, entries) for PDF enrichment later
+        cred = _pick_round_robin_credential("finkit", creds_list)
+        if cred is None:
+            return
 
-        for cred in creds_list:
-            pkey = (cred.chat_id, cred.login)
-            parser = _finkit_parsers.get(pkey)
+        parser = await _ensure_finkit_parser(cred)
+        if parser is None:
+            log.warning("Finkit login failed for chat_id=%s login=%s", cred.chat_id, cred.login)
+            return
+
+        entries = await parser.fetch_borrows()
+        if parser.needs_reauth:
+            log.info("Finkit session expired for chat_id=%s login=%s — re-logging in", cred.chat_id, cred.login)
+            parser = await _ensure_finkit_parser(cred, force_login=True)
             if parser is None:
-                parser = FinkitParser()
-                ok = await parser.login(cred.login, cred.password)
-                if not ok:
-                    log.warning("Finkit login failed for chat_id=%s login=%s", cred.chat_id, cred.login)
-                    continue
-                _finkit_parsers[pkey] = parser
-
+                log.warning("Finkit re-login failed for chat_id=%s login=%s", cred.chat_id, cred.login)
+                return
             entries = await parser.fetch_borrows()
 
-            # Auto re-login on session expiry
-            if parser.needs_reauth:
-                log.info("Finkit session expired for chat_id=%s login=%s — re-logging in", cred.chat_id, cred.login)
-                await parser.close()
-                new_parser = FinkitParser()
-                ok = await new_parser.login(cred.login, cred.password)
-                if ok:
-                    _finkit_parsers[pkey] = new_parser
-                    parser = new_parser
-                    entries = await new_parser.fetch_borrows()
-                else:
-                    log.warning("Finkit re-login failed for chat_id=%s login=%s", cred.chat_id, cred.login)
-                    _finkit_parsers.pop(pkey, None)
-                    continue
-
-            if not entries:
-                continue
-
-            parser_entries.append((parser, entries))
-            for entry in entries:
-                if entry.id not in seen_entry_ids:
-                    seen_entry_ids.add(entry.id)
-                    all_entries.append(entry)
+        all_entries: list[BorrowEntry] = list(entries)
+        parser_entries: list[tuple[FinkitParser, list[BorrowEntry]]] = [(parser, entries)] if entries else []
 
         # ── Stage 2: Compute fresh + DB cache enrichment (fast) + SEND ──
         fresh_entries = await _compute_fresh(all_entries, "finkit")
@@ -422,40 +518,24 @@ async def poll_zaimis(bot: Bot) -> None:
         subs = await get_active_subscriptions("zaimis")
         subs_list = [sub for _, sub in subs] if subs else None
 
-        all_entries: list[BorrowEntry] = []
-        seen_entry_ids: set[str] = set()
-        for cred in creds_list:
-            pkey = (cred.chat_id, cred.login)
-            parser = _zaimis_parsers.get(pkey)
+        cred = _pick_round_robin_credential("zaimis", creds_list)
+        if cred is None:
+            return
+
+        parser = await _ensure_zaimis_parser(cred)
+        if parser is None:
+            log.warning("Zaimis login failed for chat_id=%s login=%s", cred.chat_id, cred.login)
+            return
+
+        all_entries = await parser.fetch_borrows(subscriptions=subs_list)
+
+        if parser.needs_reauth:
+            log.info("Zaimis token expired for chat_id=%s login=%s — re-logging in", cred.chat_id, cred.login)
+            parser = await _ensure_zaimis_parser(cred, force_login=True)
             if parser is None:
-                parser = ZaimisParser()
-                ok = await parser.login(cred.login, cred.password)
-                if not ok:
-                    log.warning("Zaimis login failed for chat_id=%s login=%s", cred.chat_id, cred.login)
-                    continue
-                _zaimis_parsers[pkey] = parser
-
-            entries = await parser.fetch_borrows(subscriptions=subs_list)
-
-            # Auto re-login on token expiry
-            if parser.needs_reauth:
-                log.info("Zaimis token expired for chat_id=%s login=%s — re-logging in", cred.chat_id, cred.login)
-                await parser.close()
-                new_parser = ZaimisParser()
-                ok = await new_parser.login(cred.login, cred.password)
-                if ok:
-                    _zaimis_parsers[pkey] = new_parser
-                    entries = await new_parser.fetch_borrows(subscriptions=subs_list)
-                else:
-                    log.warning("Zaimis re-login failed for chat_id=%s login=%s", cred.chat_id, cred.login)
-                    _zaimis_parsers.pop(pkey, None)
-                    continue
-
-            if entries:
-                for entry in entries:
-                    if entry.id not in seen_entry_ids:
-                        seen_entry_ids.add(entry.id)
-                        all_entries.append(entry)
+                log.warning("Zaimis re-login failed for chat_id=%s login=%s", cred.chat_id, cred.login)
+                return
+            all_entries = await parser.fetch_borrows(subscriptions=subs_list)
 
         # Save all Zaimis borrowers we see (track nicknames)
         for entry in all_entries:
@@ -525,21 +605,14 @@ async def midnight_refresh_investments(bot: Bot) -> None:
 
     # --- Finkit investments ---
     try:
-        db = await get_db()
-        try:
-            creds = await db.execute_fetchall(
-                "SELECT chat_id, login, password FROM credentials WHERE service='finkit'"
-            )
-        finally:
-            await db.close()
+        creds = await _get_user_credentials("finkit")
 
         for cred in creds:
             try:
-                chat_id = cred["chat_id"] if "chat_id" in cred.keys() else None
-                fp = FinkitParser()
-                ok = await fp.login(cred["login"], cred["password"])
-                if not ok:
-                    errors.append(f"Finkit login failed: {cred['login']}")
+                chat_id = cred.chat_id
+                fp = await _ensure_finkit_parser(cred)
+                if fp is None:
+                    errors.append(f"Finkit login failed: {cred.login}")
                     continue
 
                 session = await fp._get_session()
@@ -549,9 +622,20 @@ async def midnight_refresh_investments(bot: Bot) -> None:
                 # Step 1: collect all investments from list endpoint
                 all_investments: list[dict] = []
                 page = 1
+                relogged = False
                 while True:
                     url = f"https://api-p2p.finkit.by/user/investments/?page={page}"
                     async with session.get(url, headers=headers) as resp:
+                        if resp.status in (401, 403) and not relogged:
+                            fp = await _ensure_finkit_parser(cred, force_login=True)
+                            if fp is None:
+                                errors.append(f"Finkit re-login failed: {cred.login}")
+                                break
+                            session = await fp._get_session()
+                            cookie_str = "; ".join(f"{k}={v}" for k, v in fp._session_cookies.items())
+                            headers = {"Accept": "application/json", "Referer": "https://finkit.by/", "Cookie": cookie_str}
+                            relogged = True
+                            continue
                         if resp.status != 200:
                             break
                         data = await resp.json()
@@ -561,7 +645,7 @@ async def midnight_refresh_investments(bot: Bot) -> None:
                     page += 1
 
                 log.info("Finkit %s: fetched %d investments from list",
-                         cred["login"], len(all_investments))
+                         cred.login, len(all_investments))
 
                 # Step 2: aggregate stats per borrower_full_name
                 name_stats: dict[str, dict] = {}
@@ -672,32 +756,30 @@ async def midnight_refresh_investments(bot: Bot) -> None:
                 if pdf_enriched:
                     log.info("Finkit midnight: enriched %d new borrowers with ИН from PDF", pdf_enriched)
 
-                await fp.close()
             except Exception as ex:
-                errors.append(f"Finkit {cred['login']}: {ex}")
+                errors.append(f"Finkit {cred.login}: {ex}")
     except Exception as ex:
         errors.append(f"Finkit global: {ex}")
 
     # --- Zaimis investments → borrowers table ---
     try:
-        db = await get_db()
-        try:
-            creds = await db.execute_fetchall(
-                "SELECT chat_id, login, password FROM credentials WHERE service='zaimis'"
-            )
-        finally:
-            await db.close()
+        creds = await _get_user_credentials("zaimis")
 
         for cred in creds:
             try:
-                chat_id = cred["chat_id"] if "chat_id" in cred.keys() else None
-                zp = ZaimisParser()
-                ok = await zp.login(cred["login"], cred["password"])
-                if not ok:
-                    errors.append(f"Zaimis login failed: {cred['login']}")
+                chat_id = cred.chat_id
+                zp = await _ensure_zaimis_parser(cred)
+                if zp is None:
+                    errors.append(f"Zaimis login failed: {cred.login}")
                     continue
 
                 orders = await zp.fetch_investments()
+                if zp.needs_reauth:
+                    zp = await _ensure_zaimis_parser(cred, force_login=True)
+                    if zp is None:
+                        errors.append(f"Zaimis re-login failed: {cred.login}")
+                        continue
+                    orders = await zp.fetch_investments()
                 # Aggregate per borrower (counterparty is the actual borrower)
                 zaimis_stats: dict[str, dict] = {}
                 for order in orders:
@@ -760,9 +842,8 @@ async def midnight_refresh_investments(bot: Bot) -> None:
                 except Exception as ex:
                     errors.append(f"Zaimis PDF enrichment: {ex}")
 
-                await zp.close()
             except Exception as ex:
-                errors.append(f"Zaimis {cred['login']}: {ex}")
+                errors.append(f"Zaimis {cred.login}: {ex}")
     except Exception as ex:
         errors.append(f"Zaimis global: {ex}")
 
@@ -889,21 +970,17 @@ async def shutdown_parsers():
 
 
 def get_parser(service: str, chat_id: int | None = None):
-    """Get an active parser instance for on-demand use (e.g., export)."""
+    """Get an already active parser instance, without creating new logins."""
     if service == "kapusta":
         return _kapusta
     elif service == "finkit" and chat_id:
-        # Find any parser for this chat_id
-        for (cid, _login), p in _finkit_parsers.items():
-            if cid == chat_id:
+        for p in _finkit_parsers.values():
+            if getattr(p, "_owner_chat_id", None) == chat_id:
                 return p
         return None
     elif service == "zaimis" and chat_id:
-        for (cid, _login), p in _zaimis_parsers.items():
-            if cid == chat_id:
+        for p in _zaimis_parsers.values():
+            if getattr(p, "_owner_chat_id", None) == chat_id:
                 return p
         return None
-    elif service == "mongo":
-        from bot.parsers.mongo import MongoParser
-        return MongoParser()
     return None

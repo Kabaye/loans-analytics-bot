@@ -18,9 +18,9 @@ from aiogram.types import (
 
 from bot.handlers.start import is_allowed
 from bot.models import BorrowEntry
-from bot.services.scheduler import get_parser
+from bot.services.scheduler import get_export_parsers as get_live_export_parsers
 from bot.services.opi_checker import OPIChecker
-from bot.database import lookup_borrower, get_db
+from bot.database import lookup_borrower
 from bot.services.notifier import enrich_entry_from_borrowers
 
 log = logging.getLogger(__name__)
@@ -207,64 +207,16 @@ def _extend_unique_entries(target: list[BorrowEntry], entries: list[BorrowEntry]
 
 
 async def _get_export_parsers(service: str, chat_id: int):
-    """Return (parsers, owned_parsers) for export; creates on-demand parsers if scheduler has none."""
-    owned = []
-    if service == "kapusta":
-        existing = get_parser(service, chat_id)
-        if existing:
-            return [existing], owned
-        from bot.parsers.kapusta import KapustaParser
-
-        parser = KapustaParser()
-        if await parser.login():
-            owned.append(parser)
-            return [parser], owned
-        await parser.close()
-        return [], []
-
+    """Return (parsers, owned_parsers) for export."""
     if service == "mongo":
         from bot.parsers.mongo import MongoParser
 
         parser = MongoParser()
         await parser.login()
-        owned.append(parser)
-        return [parser], owned
+        return [parser], [parser]
 
-    if service not in ("finkit", "zaimis"):
-        return [], []
-
-    db = await get_db()
-    try:
-        rows = await db.execute_fetchall(
-            "SELECT login, password FROM credentials WHERE chat_id = ? AND service = ? ORDER BY id",
-            (chat_id, service),
-        )
-    finally:
-        await db.close()
-
-    parsers = []
-    for row in rows:
-        try:
-            if service == "finkit":
-                from bot.parsers.finkit import FinkitParser
-
-                parser = FinkitParser()
-            else:
-                from bot.parsers.zaimis import ZaimisParser
-
-                parser = ZaimisParser()
-            ok = await parser.login(row["login"], row["password"])
-            if ok:
-                parsers.append(parser)
-                owned.append(parser)
-            else:
-                await parser.close()
-        except Exception:
-            try:
-                await parser.close()
-            except Exception:
-                pass
-    return parsers, owned
+    parsers = await get_live_export_parsers(service, chat_id)
+    return parsers, []
 
 
 def _entries_to_csv(entries: list[dict]) -> bytes:

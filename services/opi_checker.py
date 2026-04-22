@@ -185,7 +185,7 @@ class OPIChecker:
 
         # Has debts
         pay_record = data.get("pay_record", {})
-        debt_amount = float(pay_record.get("total_amount", pay_record.get("summa", 0)))
+        debt_amount = float(pay_record.get("summa", pay_record.get("total_amount", 0)))
 
         full_name_parts = []
         for attr in pay_record.get("attr_records", []):

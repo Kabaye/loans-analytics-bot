@@ -116,6 +116,14 @@ async def init_db() -> None:
 
         CREATE INDEX IF NOT EXISTS idx_seen_entries_service_first_seen
             ON seen_entries(service, first_seen);
+
+        CREATE TABLE IF NOT EXISTS credential_sessions (
+            credential_id       INTEGER PRIMARY KEY,
+            service             TEXT NOT NULL,
+            session_data        TEXT NOT NULL,
+            updated_at          TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (credential_id) REFERENCES credentials(id) ON DELETE CASCADE
+        );
         """)
 
         # Migration: add first_name/last_name to users
@@ -460,6 +468,51 @@ async def get_site_settings(service: str) -> dict:
             "active_hour_start": 0,
             "active_hour_end": 24,
         }
+    finally:
+        await db.close()
+
+
+async def get_saved_credential_session(credential_id: int) -> dict | None:
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            "SELECT session_data FROM credential_sessions WHERE credential_id = ?",
+            (credential_id,),
+        )
+        if not rows:
+            return None
+        return json.loads(rows[0]["session_data"])
+    finally:
+        await db.close()
+
+
+async def save_credential_session(credential_id: int, service: str, session_data: dict) -> None:
+    db = await get_db()
+    try:
+        await db.execute(
+            """
+            INSERT INTO credential_sessions (credential_id, service, session_data, updated_at)
+            VALUES (?, ?, ?, datetime('now'))
+            ON CONFLICT(credential_id) DO UPDATE SET
+                service = excluded.service,
+                session_data = excluded.session_data,
+                updated_at = datetime('now')
+            """,
+            (credential_id, service, json.dumps(session_data, ensure_ascii=False)),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def delete_credential_session(credential_id: int) -> None:
+    db = await get_db()
+    try:
+        await db.execute(
+            "DELETE FROM credential_sessions WHERE credential_id = ?",
+            (credential_id,),
+        )
+        await db.commit()
     finally:
         await db.close()
 

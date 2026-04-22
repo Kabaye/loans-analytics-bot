@@ -71,6 +71,10 @@ class KapustaParser(BaseParser):
             log.exception("Kapusta step1 error: %s", e)
             return False
 
+        if r.status_code == 200 and body.lstrip().startswith("{"):
+            log.info("Kapusta direct API access OK without HTML challenge")
+            return True
+
         if not self._hg_security:
             log.warning("Kapusta: could not extract hg-security from challenge page")
             return False

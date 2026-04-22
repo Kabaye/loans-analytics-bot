@@ -451,6 +451,7 @@ async def poll_finkit(bot: Bot) -> None:
                             borrower_user_id=entry.borrower_user_id,
                             full_name=entry.full_name,
                             document_id=entry.document_id,
+                            source="finkit_borrow",
                         )
 
                 # Edit messages for entries that got new data from PDF
@@ -498,6 +499,7 @@ async def poll_finkit(bot: Bot) -> None:
                     borrower_user_id=entry.borrower_user_id,
                     full_name=entry.full_name,
                     document_id=entry.document_id,
+                    source="finkit_borrow",
                 )
 
         _clear_error("finkit")
@@ -732,6 +734,7 @@ async def midnight_refresh_investments(bot: Bot) -> None:
                                                             borrower_user_id=buid,
                                                             full_name=bname,
                                                             document_id=doc_id,
+                                                            source=f"finkit_archive_{cred.login}",
                                                         )
                                                         pdf_enriched += 1
                                                         log.info("Finkit midnight PDF: %s → ИН %s", bname, doc_id)
@@ -836,6 +839,7 @@ async def midnight_refresh_investments(bot: Bot) -> None:
                             borrower_user_id=cp_id,
                             full_name=full_name,
                             document_id=doc_id,
+                            source=f"zaimis_archive_{cred.login}",
                         )
                     if pdf_results:
                         log.info("Zaimis PDF: saved %d borrowers with ИН", len(pdf_results))

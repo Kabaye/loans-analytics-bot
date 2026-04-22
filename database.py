@@ -9,6 +9,25 @@ from bot.config import DB_PATH
 
 log = logging.getLogger(__name__)
 
+_BORROWER_INFO_FULL_NAME_SQL = """
+CASE
+    WHEN excluded.full_name IS NULL OR excluded.full_name = '' THEN borrower_info.full_name
+    WHEN borrower_info.full_name IS NULL OR borrower_info.full_name = '' THEN excluded.full_name
+    WHEN instr(excluded.full_name, '*') > 0 AND instr(COALESCE(borrower_info.full_name, ''), '*') = 0
+        THEN borrower_info.full_name
+    ELSE excluded.full_name
+END
+"""
+
+_BORROWER_INFO_SOURCE_SQL = """
+CASE
+    WHEN excluded.source IS NULL OR excluded.source = '' THEN borrower_info.source
+    WHEN excluded.source = 'opi' AND borrower_info.source IS NOT NULL AND borrower_info.source != ''
+        THEN borrower_info.source
+    ELSE excluded.source
+END
+"""
+
 
 async def get_db() -> aiosqlite.Connection:
     db = await aiosqlite.connect(DB_PATH)
@@ -189,6 +208,9 @@ async def init_db() -> None:
                      "notified_loans", "last_check", "session_cookies"):
             await db.execute(f"DROP TABLE IF EXISTS {tbl}")
 
+        # Migration: rename old manual source to added
+        await db.execute("UPDATE borrower_info SET source = 'added' WHERE source = 'manual'")
+
         # Migration: move OPI data from old borrowers → borrower_info
         # Old borrowers had: opi_has_debt, opi_debt_amount, opi_checked_at, opi_full_name, source
         # New: these live in borrower_info, borrowers keeps investment stats
@@ -285,6 +307,7 @@ async def upsert_borrower(
     borrower_user_id: str,
     full_name: str | None = None,
     document_id: str | None = None,
+    source: str | None = None,
 ) -> None:
     """Insert or update a borrower mapping record."""
     if full_name:
@@ -305,13 +328,14 @@ async def upsert_borrower(
         # Auto-create borrower_info if we have a document_id
         if document_id and len(document_id) == 14:
             await db.execute(
-                """INSERT INTO borrower_info (document_id, full_name, source)
-                   VALUES (?, ?, 'auto')
-                   ON CONFLICT(document_id) DO UPDATE SET
-                       full_name = COALESCE(excluded.full_name, borrower_info.full_name),
-                       updated_at = datetime('now')
+                f"""INSERT INTO borrower_info (document_id, full_name, source)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(document_id) DO UPDATE SET
+                        full_name = {_BORROWER_INFO_FULL_NAME_SQL},
+                        source = {_BORROWER_INFO_SOURCE_SQL},
+                        updated_at = datetime('now')
                 """,
-                (document_id, full_name),
+                (document_id, full_name, source or f"{service}_borrow"),
             )
         await db.commit()
     finally:
@@ -421,7 +445,7 @@ async def upsert_borrower_info(
     last_loan_date: str | None = None,
     loan_count: int | None = None,
     total_invested: float | None = None,
-    source: str = "auto",
+    source: str = "added",
 ) -> None:
     """Insert or update a borrower_info record."""
     if full_name:
@@ -429,24 +453,24 @@ async def upsert_borrower_info(
     db = await get_db()
     try:
         await db.execute(
-            """INSERT INTO borrower_info
-                   (document_id, full_name, loan_status, sum_category, rating,
-                    notes, last_loan_date, loan_count, total_invested, source)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(document_id) DO UPDATE SET
-                   full_name = COALESCE(excluded.full_name, borrower_info.full_name),
-                   loan_status = COALESCE(excluded.loan_status, borrower_info.loan_status),
-                   sum_category = COALESCE(excluded.sum_category, borrower_info.sum_category),
-                   rating = COALESCE(excluded.rating, borrower_info.rating),
-                   notes = COALESCE(excluded.notes, borrower_info.notes),
-                   last_loan_date = COALESCE(excluded.last_loan_date, borrower_info.last_loan_date),
-                   loan_count = CASE WHEN excluded.loan_count IS NOT NULL
-                                     THEN excluded.loan_count
-                                     ELSE borrower_info.loan_count END,
-                   total_invested = COALESCE(excluded.total_invested, borrower_info.total_invested),
-                   source = excluded.source,
-                   updated_at = datetime('now')
-            """,
+            f"""INSERT INTO borrower_info
+                    (document_id, full_name, loan_status, sum_category, rating,
+                     notes, last_loan_date, loan_count, total_invested, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(document_id) DO UPDATE SET
+                    full_name = {_BORROWER_INFO_FULL_NAME_SQL},
+                    loan_status = COALESCE(excluded.loan_status, borrower_info.loan_status),
+                    sum_category = COALESCE(excluded.sum_category, borrower_info.sum_category),
+                    rating = COALESCE(excluded.rating, borrower_info.rating),
+                    notes = COALESCE(excluded.notes, borrower_info.notes),
+                    last_loan_date = COALESCE(excluded.last_loan_date, borrower_info.last_loan_date),
+                    loan_count = CASE WHEN excluded.loan_count IS NOT NULL
+                                      THEN excluded.loan_count
+                                      ELSE borrower_info.loan_count END,
+                    total_invested = COALESCE(excluded.total_invested, borrower_info.total_invested),
+                    source = {_BORROWER_INFO_SOURCE_SQL},
+                    updated_at = datetime('now')
+             """,
             (document_id, full_name, loan_status, sum_category, rating,
              notes, last_loan_date, loan_count, total_invested, source),
         )
@@ -585,11 +609,14 @@ async def save_opi_result(
     now = datetime.now(timezone.utc).isoformat()
     db = await get_db()
     try:
-        # Ensure borrower_info record exists
         await db.execute(
-            """INSERT INTO borrower_info (document_id, full_name, source)
-               VALUES (?, ?, 'opi')
-               ON CONFLICT(document_id) DO NOTHING""",
+            f"""INSERT INTO borrower_info (document_id, full_name, source)
+                VALUES (?, ?, 'opi')
+                ON CONFLICT(document_id) DO UPDATE SET
+                    full_name = {_BORROWER_INFO_FULL_NAME_SQL},
+                    source = {_BORROWER_INFO_SOURCE_SQL},
+                    updated_at = datetime('now')
+            """,
             (document_id, full_name),
         )
         await db.execute(

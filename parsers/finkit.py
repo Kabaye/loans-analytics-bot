@@ -288,6 +288,7 @@ class FinkitParser(BaseParser):
                                 borrower_user_id=entry.borrower_user_id,
                                 full_name=entry.full_name,
                                 document_id=entry.document_id,
+                                source="finkit_borrow",
                             )
                     else:
                         log.warning("Finkit PDF: no name/ID found for %s", entry.id)

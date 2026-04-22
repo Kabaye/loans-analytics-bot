@@ -428,7 +428,7 @@ async def cb_add_sum(callback: CallbackQuery, state: FSMContext):
         full_name=full_name,
         loan_status=loan_status,
         sum_category=sum_cat,
-        source="manual",
+        source="added",
     )
 
     await callback.message.edit_text("⏳ Сохраняю и проверяю ОПИ...", parse_mode="HTML")

@@ -337,7 +337,7 @@ async def _save_signature_message(message: Message) -> str | None:
         return None
 
     out_path = SIGNATURES_DIR / f"{message.chat.id}{ext}"
-    await tg_file.download(destination=str(out_path), bot=bot)
+    await bot.download_file(tg_file.file_path, destination=str(out_path))
     await save_user_signature_asset(
         message.chat.id,
         file_path=str(out_path),

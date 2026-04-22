@@ -186,7 +186,7 @@ async def init_db() -> None:
 
         # Migration: old borrower_identities → borrowers (already ran)
         for tbl in ("borrower_identities", "known_borrowers", "investment_history",
-                     "notified_loans", "last_check"):
+                     "notified_loans", "last_check", "session_cookies"):
             await db.execute(f"DROP TABLE IF EXISTS {tbl}")
 
         # Migration: move OPI data from old borrowers → borrower_info
@@ -270,6 +270,9 @@ async def init_db() -> None:
                    VALUES (?, ?, ?, ?, ?)""",
                 (svc, enabled, interval, h_start, h_end),
             )
+
+        # Mongo is export-only and must not appear in polling settings.
+        await db.execute("DELETE FROM site_settings WHERE service = 'mongo'")
 
         await db.commit()
         log.info("Database initialized at %s", DB_PATH)
@@ -522,7 +525,11 @@ async def get_all_site_settings() -> list[dict]:
     db = await get_db()
     try:
         rows = await db.execute_fetchall(
-            "SELECT * FROM site_settings ORDER BY service"
+            """
+            SELECT * FROM site_settings
+            WHERE service IN ('kapusta', 'finkit', 'zaimis')
+            ORDER BY service
+            """
         )
         return [dict(r) for r in rows]
     finally:

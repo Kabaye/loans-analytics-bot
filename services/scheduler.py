@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import traceback
 from datetime import datetime, timezone, timedelta
+from html import escape
 from typing import Optional
 
 from aiogram import Bot
@@ -22,6 +24,7 @@ from bot.database import (
     upsert_borrower_from_investment, get_stale_opi_documents,
     save_opi_result, upsert_borrower,
     get_saved_credential_session, save_credential_session, delete_credential_session,
+    get_json_schema_state, save_json_schema_state,
 )
 
 _NAME_ID_RE = re.compile(
@@ -200,6 +203,103 @@ def _clear_error(service: str) -> None:
     _error_notified[service] = False
 
 
+def _telegram_user_tag(cred: UserCredentials) -> str:
+    username = (cred.username or "").strip().lstrip("@")
+    return username or f"chat_{cred.chat_id}"
+
+
+def _json_type_name(value) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    if isinstance(value, str):
+        return "str"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    return type(value).__name__
+
+
+def _collect_schema_types(value, path: str, acc: dict[str, set[str]]) -> None:
+    acc.setdefault(path, set()).add(_json_type_name(value))
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            _collect_schema_types(nested, child_path, acc)
+    elif isinstance(value, list):
+        item_path = f"{path}[]" if path else "[]"
+        if not value:
+            acc.setdefault(item_path, set()).add("empty")
+        for item in value:
+            _collect_schema_types(item, item_path, acc)
+
+
+def _build_entries_schema(entries: list[BorrowEntry]) -> dict[str, list[str]]:
+    acc: dict[str, set[str]] = {}
+    for entry in entries:
+        if entry.raw_data is not None:
+            _collect_schema_types(entry.raw_data, "", acc)
+    return {k: sorted(v) for k, v in sorted(acc.items()) if k}
+
+
+def _schema_diff(prev: dict[str, list[str]] | None, current: dict[str, list[str]]) -> tuple[list[str], list[str]]:
+    prev = prev or {}
+    added_paths: list[str] = []
+    changed_types: list[str] = []
+    for path, types in current.items():
+        if path not in prev:
+            added_paths.append(f"{path} ({', '.join(types)})")
+            continue
+        prev_types = prev[path]
+        if prev_types != types:
+            changed_types.append(f"{path}: {', '.join(prev_types)} -> {', '.join(types)}")
+    return added_paths, changed_types
+
+
+async def _notify_json_schema_change(bot: Bot, service: str, entries: list[BorrowEntry]) -> None:
+    current = _build_entries_schema(entries)
+    if not current:
+        return
+
+    prev = await get_json_schema_state(service)
+    if prev is None:
+        await save_json_schema_state(service, current)
+        return
+
+    added_paths, changed_types = _schema_diff(prev, current)
+    if not added_paths and not changed_types:
+        return
+
+    await save_json_schema_state(service, current)
+    svc_names = {"kapusta": "🥬 Kapusta", "finkit": "🔵 FinKit", "zaimis": "🟪 ЗАЙМись"}
+    lines = [f"⚠️ <b>Изменилась JSON-структура {svc_names.get(service, service)}</b>"]
+    if added_paths:
+        lines.append("")
+        lines.append("<b>Новые поля:</b>")
+        lines.extend(f"  • {escape(item)}" for item in added_paths[:20])
+    if changed_types:
+        lines.append("")
+        lines.append("<b>Изменились типы:</b>")
+        lines.extend(f"  • {escape(item)}" for item in changed_types[:20])
+    sample = next((e.raw_data for e in entries if e.raw_data), None)
+    if sample:
+        sample_text = escape(json.dumps(sample, ensure_ascii=False, default=str)[:1200])
+        lines.append("")
+        lines.append(f"<pre>{sample_text}</pre>")
+    try:
+        if config.ADMIN_CHAT_ID:
+            await bot.send_message(config.ADMIN_CHAT_ID, "\n".join(lines), parse_mode="HTML")
+            log.info("JSON schema change notification sent for %s", service)
+    except Exception as e:
+        log.warning("Failed to send JSON schema notification: %s", e)
+
+
 async def _should_poll(service: str) -> bool:
     """Check site_settings: enabled, custom interval, active subscriptions."""
     # Skip polling if no users have active subscriptions for this service
@@ -228,7 +328,7 @@ async def _get_user_credentials(service: str, chat_id: int | None = None) -> lis
     db = await get_db()
     try:
         query = """
-            SELECT c.id, c.chat_id, c.login, c.password
+            SELECT c.id, c.chat_id, c.login, c.password, u.username
             FROM credentials c
             JOIN users u ON c.chat_id = u.chat_id
             WHERE c.service = ? AND u.is_allowed = 1
@@ -240,7 +340,14 @@ async def _get_user_credentials(service: str, chat_id: int | None = None) -> lis
         query += " ORDER BY c.id"
         rows = await db.execute_fetchall(query, tuple(params))
         return [
-            UserCredentials(id=r["id"], chat_id=r["chat_id"], service=service, login=r["login"], password=r["password"])
+            UserCredentials(
+                id=r["id"],
+                chat_id=r["chat_id"],
+                service=service,
+                login=r["login"],
+                password=r["password"],
+                username=r["username"],
+            )
             for r in rows
         ]
     finally:
@@ -378,6 +485,7 @@ async def poll_kapusta(bot: Bot) -> None:
         _clear_error("kapusta")
         _kapusta_backoff_until = None
         if entries:
+            await _notify_json_schema_change(bot, "kapusta", entries)
             fresh = await _compute_fresh(entries, "kapusta")
             if fresh:
                 refs = await notify_users(bot, fresh, "kapusta")
@@ -422,6 +530,8 @@ async def poll_finkit(bot: Bot) -> None:
                 return
             entries = await parser.fetch_borrows()
 
+        if entries:
+            await _notify_json_schema_change(bot, "finkit", entries)
         all_entries: list[BorrowEntry] = list(entries)
         parser_entries: list[tuple[FinkitParser, list[BorrowEntry]]] = [(parser, entries)] if entries else []
 
@@ -539,6 +649,8 @@ async def poll_zaimis(bot: Bot) -> None:
                 return
             all_entries = await parser.fetch_borrows(subscriptions=subs_list)
 
+        if all_entries:
+            await _notify_json_schema_change(bot, "zaimis", all_entries)
         # Save all Zaimis borrowers we see (track nicknames)
         for entry in all_entries:
             if entry.borrower_user_id:
@@ -604,6 +716,8 @@ async def midnight_refresh_investments(bot: Bot) -> None:
     total_finkit = 0
     total_zaimis = 0
     errors: list[str] = []
+    finkit_by_user: dict[str, int] = {}
+    zaimis_by_user: dict[str, int] = {}
 
     # --- Finkit investments ---
     try:
@@ -612,6 +726,7 @@ async def midnight_refresh_investments(bot: Bot) -> None:
         for cred in creds:
             try:
                 chat_id = cred.chat_id
+                user_tag = _telegram_user_tag(cred)
                 fp = await _ensure_finkit_parser(cred)
                 if fp is None:
                     errors.append(f"Finkit login failed: {cred.login}")
@@ -680,6 +795,7 @@ async def midnight_refresh_investments(bot: Bot) -> None:
                     except (ValueError, TypeError):
                         pass
                     total_finkit += 1
+                    finkit_by_user[user_tag] = finkit_by_user.get(user_tag, 0) + 1
                     inv_id = inv.get("id")
                     if inv_id:
                         name_to_inv_ids[bname].append(inv_id)
@@ -734,7 +850,7 @@ async def midnight_refresh_investments(bot: Bot) -> None:
                                                             borrower_user_id=buid,
                                                             full_name=bname,
                                                             document_id=doc_id,
-                                                            source=f"finkit_archive_{cred.login}",
+                                                            source=f"finkit_archive_{user_tag}",
                                                         )
                                                         pdf_enriched += 1
                                                         log.info("Finkit midnight PDF: %s → ИН %s", bname, doc_id)
@@ -771,6 +887,7 @@ async def midnight_refresh_investments(bot: Bot) -> None:
         for cred in creds:
             try:
                 chat_id = cred.chat_id
+                user_tag = _telegram_user_tag(cred)
                 zp = await _ensure_zaimis_parser(cred)
                 if zp is None:
                     errors.append(f"Zaimis login failed: {cred.login}")
@@ -815,6 +932,7 @@ async def midnight_refresh_investments(bot: Bot) -> None:
                         except (ValueError, TypeError):
                             pass
                     total_zaimis += 1
+                    zaimis_by_user[user_tag] = zaimis_by_user.get(user_tag, 0) + 1
 
                 # Upsert into borrowers table
                 for buid, s in zaimis_stats.items():
@@ -839,7 +957,7 @@ async def midnight_refresh_investments(bot: Bot) -> None:
                             borrower_user_id=cp_id,
                             full_name=full_name,
                             document_id=doc_id,
-                            source=f"zaimis_archive_{cred.login}",
+                            source=f"zaimis_archive_{user_tag}",
                         )
                     if pdf_results:
                         log.info("Zaimis PDF: saved %d borrowers with ИН", len(pdf_results))
@@ -864,6 +982,18 @@ async def midnight_refresh_investments(bot: Bot) -> None:
             f"  Zaimis: {total_zaimis} записей",
             f"  Borrowers в БД: {b_count}",
         ]
+        if finkit_by_user:
+            lines.append("")
+            lines.append("<b>FinKit по Telegram-пользователям:</b>")
+            for user_tag, count in sorted(finkit_by_user.items(), key=lambda item: (-item[1], item[0])):
+                label = f"@{user_tag}" if not user_tag.startswith("chat_") else user_tag
+                lines.append(f"  {escape(label)}: {count}")
+        if zaimis_by_user:
+            lines.append("")
+            lines.append("<b>ЗАЙМись по Telegram-пользователям:</b>")
+            for user_tag, count in sorted(zaimis_by_user.items(), key=lambda item: (-item[1], item[0])):
+                label = f"@{user_tag}" if not user_tag.startswith("chat_") else user_tag
+                lines.append(f"  {escape(label)}: {count}")
         if errors:
             lines.append(f"\n⚠️ Ошибки ({len(errors)}):")
             for e in errors[:5]:

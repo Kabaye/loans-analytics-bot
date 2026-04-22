@@ -143,6 +143,12 @@ async def init_db() -> None:
             updated_at          TEXT DEFAULT (datetime('now')),
             FOREIGN KEY (credential_id) REFERENCES credentials(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS json_schema_state (
+            service             TEXT PRIMARY KEY,
+            schema_json         TEXT NOT NULL,
+            updated_at          TEXT DEFAULT (datetime('now'))
+        );
         """)
 
         # Migration: add first_name/last_name to users
@@ -210,6 +216,32 @@ async def init_db() -> None:
 
         # Migration: rename old manual source to added
         await db.execute("UPDATE borrower_info SET source = 'added' WHERE source = 'manual'")
+
+        # Migration: reclassify part of legacy auto borrower_info rows where service is unambiguous.
+        await db.execute("""
+            UPDATE borrower_info
+            SET source = 'finkit_borrow'
+            WHERE source = 'auto'
+              AND document_id IN (
+                    SELECT document_id
+                    FROM borrowers
+                    WHERE document_id IS NOT NULL AND document_id != ''
+                    GROUP BY document_id
+                    HAVING COUNT(DISTINCT service) = 1 AND MAX(service) = 'finkit'
+              )
+        """)
+        await db.execute("""
+            UPDATE borrower_info
+            SET source = 'zaimis_borrow'
+            WHERE source = 'auto'
+              AND document_id IN (
+                    SELECT document_id
+                    FROM borrowers
+                    WHERE document_id IS NOT NULL AND document_id != ''
+                    GROUP BY document_id
+                    HAVING COUNT(DISTINCT service) = 1 AND MAX(service) = 'zaimis'
+              )
+        """)
 
         # Migration: move OPI data from old borrowers → borrower_info
         # Old borrowers had: opi_has_debt, opi_debt_amount, opi_checked_at, opi_full_name, source
@@ -538,6 +570,38 @@ async def delete_credential_session(credential_id: int) -> None:
         await db.execute(
             "DELETE FROM credential_sessions WHERE credential_id = ?",
             (credential_id,),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def get_json_schema_state(service: str) -> dict[str, list[str]] | None:
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            "SELECT schema_json FROM json_schema_state WHERE service = ?",
+            (service,),
+        )
+        if not rows:
+            return None
+        return json.loads(rows[0]["schema_json"])
+    finally:
+        await db.close()
+
+
+async def save_json_schema_state(service: str, schema: dict[str, list[str]]) -> None:
+    db = await get_db()
+    try:
+        await db.execute(
+            """
+            INSERT INTO json_schema_state (service, schema_json, updated_at)
+            VALUES (?, ?, datetime('now'))
+            ON CONFLICT(service) DO UPDATE SET
+                schema_json = excluded.schema_json,
+                updated_at = datetime('now')
+            """,
+            (service, json.dumps(schema, ensure_ascii=False, sort_keys=True)),
         )
         await db.commit()
     finally:

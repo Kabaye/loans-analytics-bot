@@ -190,3 +190,4 @@ class UserCredentials:
     login: str
     password: str
     id: int = 0
+    username: Optional[str] = None

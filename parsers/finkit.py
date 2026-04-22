@@ -122,6 +122,72 @@ class FinkitParser(BaseParser):
         self._needs_reauth = False
         return True
 
+    def _api_headers(self) -> dict[str, str]:
+        cookie_str = "; ".join(f"{k}={v}" for k, v in self._session_cookies.items())
+        return {
+            "Accept": "application/json",
+            "Referer": "https://finkit.by/",
+            "User-Agent": BROWSER_UA,
+            "Cookie": cookie_str,
+        }
+
+    async def fetch_investments(self, page: int = 1) -> list[dict]:
+        if not self._authenticated:
+            log.error("Finkit: not logged in, cannot fetch investments")
+            return []
+
+        session = await self._get_session()
+        all_items: list[dict] = []
+        current_page = page
+
+        while True:
+            url = f"https://api-p2p.finkit.by/user/investments/?page={current_page}"
+            try:
+                async with session.get(url, headers=self._api_headers()) as resp:
+                    if resp.status in (401, 403):
+                        self._authenticated = False
+                        self._needs_reauth = True
+                        break
+                    if resp.status != 200:
+                        log.error("Finkit investments page %d: HTTP %s", current_page, resp.status)
+                        break
+                    data = await resp.json()
+            except Exception as e:
+                log.exception("Finkit investments page %d error: %s", current_page, e)
+                break
+
+            items = data.get("results", [])
+            if not items:
+                break
+            all_items.extend(items)
+            if not data.get("next"):
+                break
+            current_page += 1
+
+        log.info("Finkit: fetched %d investment items", len(all_items))
+        return all_items
+
+    async def fetch_investment_detail(self, investment_id: str) -> dict | None:
+        if not self._authenticated:
+            return None
+
+        session = await self._get_session()
+        try:
+            async with session.get(
+                f"https://api-p2p.finkit.by/user/investments/{investment_id}/",
+                headers=self._api_headers(),
+            ) as resp:
+                if resp.status in (401, 403):
+                    self._authenticated = False
+                    self._needs_reauth = True
+                    return None
+                if resp.status != 200:
+                    return None
+                return await resp.json()
+        except Exception as e:
+            log.warning("Finkit investment detail error %s: %s", investment_id, e)
+            return None
+
     async def fetch_borrows(self) -> list[BorrowEntry]:
         if not self._authenticated:
             log.error("Finkit: not logged in")
@@ -131,17 +197,9 @@ class FinkitParser(BaseParser):
         all_entries: list[BorrowEntry] = []
         url: str | None = f"{BORROWS_URL}?page=1&ordering=borrower_score_value"
 
-        cookie_str = "; ".join(f"{k}={v}" for k, v in self._session_cookies.items())
-
         while url:
-            headers = {
-                "Accept": "application/json",
-                "Referer": "https://finkit.by/",
-                "User-Agent": BROWSER_UA,
-                "Cookie": cookie_str,
-            }
             try:
-                async with session.get(url, headers=headers) as resp:
+                async with session.get(url, headers=self._api_headers()) as resp:
                     if resp.status in (401, 403):
                         log.warning("Finkit auth expired (status %s)", resp.status)
                         self._authenticated = False

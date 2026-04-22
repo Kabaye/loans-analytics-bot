@@ -74,6 +74,7 @@ def get_main_menu_kb(admin: bool = False) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="🔍 Поиск заёмщика", callback_data="search_borrower"),
+            InlineKeyboardButton(text="⚖️ Просрочки", callback_data="overdue_menu"),
         ],
         [
             InlineKeyboardButton(text="ℹ️ Статус", callback_data="show_status"),
@@ -154,7 +155,8 @@ async def cb_help(callback: CallbackQuery):
         "<b>Как начать:</b>\n"
         "1. 🔑 Учёт. данные — введите логин/пароль для FinKit/ЗАЙМись\n"
         "2. 🔔 Подписки — создайте подписки с фильтрами\n"
-        "3. Готово! Уведомления будут приходить автоматически.\n\n"
+        "3. ⚖️ Просрочки — просматривайте просроченные кейсы и формируйте документы\n"
+        "4. Готово! Уведомления будут приходить автоматически.\n\n"
         "<b>ОПИ проверка:</b>\n"
         "Для заявок на FinKit автоматически проверяется наличие исполнительных "
         "производств через ЕРИП (доступно благодаря PDF контрактам).",

@@ -25,6 +25,7 @@ from bot.database import (
     save_opi_result, upsert_borrower,
     get_saved_credential_session, save_credential_session, delete_credential_session,
     get_json_schema_state, save_json_schema_state,
+    deactivate_missing_overdue_cases, lookup_borrower, upsert_overdue_case,
 )
 
 _NAME_ID_RE = re.compile(
@@ -206,6 +207,51 @@ def _clear_error(service: str) -> None:
 def _telegram_user_tag(cred: UserCredentials) -> str:
     username = (cred.username or "").strip().lstrip("@")
     return username or f"chat_{cred.chat_id}"
+
+
+def _safe_float(value) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(value) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _coalesce(*values):
+    for value in values:
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _total_due(principal: float | None, accrued: float | None, fine: float | None, fallback) -> float | None:
+    parts = [part for part in (principal, accrued, fine) if part is not None]
+    if parts:
+        return sum(parts)
+    return _safe_float(fallback)
+
+
+def _days_overdue_from_due(due_at: str | None) -> int | None:
+    if not due_at:
+        return None
+    try:
+        parsed = datetime.fromisoformat(due_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    delta = datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)
+    return max(int(delta.total_seconds() // 86400), 0)
 
 
 def _json_type_name(value) -> str:
@@ -718,6 +764,196 @@ async def poll_zaimis(bot: Bot) -> None:
         await _notify_error(bot, "zaimis", e)
 
 
+async def _sync_finkit_overdue_cases() -> tuple[int, list[str]]:
+    synced = 0
+    errors: list[str] = []
+    creds = await _get_user_credentials("finkit")
+
+    for cred in creds:
+        try:
+            parser = await _ensure_finkit_parser(cred)
+            if parser is None:
+                errors.append(f"Finkit login failed: {cred.login}")
+                continue
+
+            items = await parser.fetch_investments()
+            if parser.needs_reauth:
+                parser = await _ensure_finkit_parser(cred, force_login=True)
+                if parser is None:
+                    errors.append(f"Finkit re-login failed: {cred.login}")
+                    continue
+                items = await parser.fetch_investments()
+
+            credential_seen: set[str] = set()
+            for item in items:
+                if not item.get("is_overdue"):
+                    continue
+                external_id = str(item.get("id", "")).strip()
+                if not external_id:
+                    continue
+                credential_seen.add(external_id)
+
+                detail = await parser.fetch_investment_detail(external_id) or {}
+                borrower_user_id = str(_coalesce(detail.get("loan"), item.get("user"), item.get("loan")) or "")
+                cached = await lookup_borrower("finkit", borrower_user_id) if borrower_user_id else None
+
+                principal = _safe_float(_coalesce(detail.get("principal_outstanding"), item.get("principal_outstanding"), item.get("amount")))
+                accrued = _safe_float(_coalesce(detail.get("accrued_percent"), item.get("accrued_percent")))
+                fine = _safe_float(_coalesce(detail.get("fine_outstanding"), item.get("fine_outstanding")))
+                due_at = _coalesce(detail.get("due_at"), detail.get("due_date"), item.get("due_at"), item.get("due_date"))
+                days_overdue = _safe_int(_coalesce(detail.get("overdue_days"), item.get("overdue_days"))) or _days_overdue_from_due(due_at)
+
+                await upsert_overdue_case(
+                    chat_id=cred.chat_id,
+                    credential_id=cred.id,
+                    service="finkit",
+                    external_id=external_id,
+                    loan_id=str(_coalesce(detail.get("loan"), item.get("loan")) or "") or None,
+                    loan_number=str(_coalesce(detail.get("loan_number"), item.get("loan_number")) or "") or None,
+                    account_label=cred.login,
+                    borrower_user_id=borrower_user_id or None,
+                    document_id=(cached or {}).get("document_id"),
+                    full_name=(cached or {}).get("full_name") or _coalesce(detail.get("borrower_full_name"), item.get("borrower_full_name")),
+                    display_name=_coalesce(detail.get("borrower_short_name"), item.get("borrower_short_name")),
+                    issued_at=_coalesce(detail.get("created"), item.get("created")),
+                    due_at=due_at,
+                    overdue_started_at=_coalesce(detail.get("overdue_started_at"), item.get("overdue_started_at")),
+                    days_overdue=days_overdue,
+                    amount=_safe_float(_coalesce(detail.get("amount"), item.get("amount"))),
+                    principal_outstanding=principal,
+                    accrued_percent=accrued,
+                    fine_outstanding=fine,
+                    total_due=_total_due(principal, accrued, fine, _coalesce(detail.get("total_due"), item.get("total_due"), item.get("amount"))),
+                    status=str(_coalesce(detail.get("status"), item.get("status")) or "") or None,
+                    contract_url=_coalesce(detail.get("latest_contract_url"), item.get("latest_contract_url")),
+                    loan_url=None,
+                    raw_data={"list": item, "detail": detail},
+                )
+                synced += 1
+                await asyncio.sleep(0.05)
+            await deactivate_missing_overdue_cases(
+                cred.chat_id,
+                "finkit",
+                sorted(credential_seen),
+                credential_id=cred.id,
+            )
+        except Exception as ex:
+            errors.append(f"Finkit overdue {cred.login}: {ex}")
+
+    return synced, errors
+
+
+async def _sync_zaimis_overdue_cases() -> tuple[int, list[str]]:
+    synced = 0
+    errors: list[str] = []
+    creds = await _get_user_credentials("zaimis")
+
+    for cred in creds:
+        try:
+            parser = await _ensure_zaimis_parser(cred)
+            if parser is None:
+                errors.append(f"Zaimis login failed: {cred.login}")
+                continue
+
+            orders = await parser.fetch_investments()
+            if parser.needs_reauth:
+                parser = await _ensure_zaimis_parser(cred, force_login=True)
+                if parser is None:
+                    errors.append(f"Zaimis re-login failed: {cred.login}")
+                    continue
+                orders = await parser.fetch_investments()
+
+            credential_seen: set[str] = set()
+            for order in orders:
+                state = order.get("state")
+                if state not in (4, "4", "overdue") and not order.get("isOverdue"):
+                    continue
+                external_id = str(order.get("id", "")).strip()
+                if not external_id:
+                    continue
+                credential_seen.add(external_id)
+
+                detail = await parser.fetch_order_detail(external_id) or {}
+                cp = detail.get("counterparty", {}) or order.get("counterparty", {}) or {}
+                offer = detail.get("offer", {}) or order.get("offer", {}) or {}
+                borrower_user_id = str(cp.get("id", "")).strip()
+                cached = await lookup_borrower("zaimis", borrower_user_id) if borrower_user_id else None
+
+                principal = _safe_float(_coalesce(detail.get("principalOutstanding"), order.get("principalOutstanding"), order.get("amount"), offer.get("amount")))
+                accrued = _safe_float(_coalesce(detail.get("interestOutstanding"), order.get("interestOutstanding")))
+                fine = _safe_float(_coalesce(detail.get("penaltyOutstanding"), order.get("penaltyOutstanding")))
+                due_at = _coalesce(detail.get("deadline"), order.get("deadline"), detail.get("dueAt"), order.get("dueAt"))
+                days_overdue = _safe_int(_coalesce(detail.get("daysOverdue"), order.get("daysOverdue"))) or _days_overdue_from_due(due_at)
+
+                await upsert_overdue_case(
+                    chat_id=cred.chat_id,
+                    credential_id=cred.id,
+                    service="zaimis",
+                    external_id=external_id,
+                    loan_id=str(_coalesce(detail.get("id"), offer.get("id"), order.get("offerId")) or "") or None,
+                    loan_number=str(_coalesce(detail.get("number"), offer.get("id"), external_id) or "") or None,
+                    account_label=cred.login,
+                    borrower_user_id=borrower_user_id or None,
+                    document_id=(cached or {}).get("document_id"),
+                    full_name=(cached or {}).get("full_name") or cp.get("fullName") or cp.get("displayName"),
+                    display_name=cp.get("displayName"),
+                    issued_at=_coalesce(detail.get("createdAt"), order.get("createdAt"), offer.get("createdAt")),
+                    due_at=due_at,
+                    overdue_started_at=_coalesce(detail.get("overdueStartedAt"), order.get("overdueStartedAt")),
+                    days_overdue=days_overdue,
+                    amount=_safe_float(_coalesce(order.get("amount"), detail.get("amount"), offer.get("amount"))),
+                    principal_outstanding=principal,
+                    accrued_percent=accrued,
+                    fine_outstanding=fine,
+                    total_due=_total_due(principal, accrued, fine, _coalesce(detail.get("totalOutstanding"), order.get("totalOutstanding"), order.get("amount"))),
+                    status=str(_coalesce(detail.get("state"), order.get("state")) or "") or None,
+                    contract_url=None,
+                    loan_url=None,
+                    raw_data={"order": order, "detail": detail},
+                )
+                synced += 1
+                await asyncio.sleep(0.05)
+            await deactivate_missing_overdue_cases(
+                cred.chat_id,
+                "zaimis",
+                sorted(credential_seen),
+                credential_id=cred.id,
+            )
+        except Exception as ex:
+            errors.append(f"Zaimis overdue {cred.login}: {ex}")
+
+    return synced, errors
+
+
+async def refresh_overdue_cases(bot: Bot) -> None:
+    del bot
+    log.info("🌙 Overdue sync: refreshing overdue cases from archive endpoints...")
+    finkit_synced = 0
+    zaimis_synced = 0
+    errors: list[str] = []
+
+    try:
+        finkit_synced, finkit_errors = await _sync_finkit_overdue_cases()
+        errors.extend(finkit_errors)
+    except Exception as ex:
+        errors.append(f"Finkit overdue global: {ex}")
+
+    try:
+        zaimis_synced, zaimis_errors = await _sync_zaimis_overdue_cases()
+        errors.extend(zaimis_errors)
+    except Exception as ex:
+        errors.append(f"Zaimis overdue global: {ex}")
+
+    log.info(
+        "🌙 Overdue sync done: finkit=%d, zaimis=%d, errors=%d",
+        finkit_synced,
+        zaimis_synced,
+        len(errors),
+    )
+    for err in errors[:10]:
+        log.warning("Overdue sync error: %s", err)
+
+
 # ====== Midnight cron jobs ======
 
 async def midnight_refresh_investments(bot: Bot) -> None:
@@ -1096,6 +1332,14 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
     )
 
     _scheduler.add_job(
+        refresh_overdue_cases,
+        CronTrigger(hour=21, minute=15, timezone="UTC"),  # 00:15 Minsk
+        args=[bot], id="midnight_overdue_cases",
+        name="Midnight overdue refresh",
+        misfire_grace_time=3600,
+    )
+
+    _scheduler.add_job(
         midnight_refresh_opi,
         CronTrigger(hour=21, minute=30, timezone="UTC"),  # 00:30 Minsk
         args=[bot], id="midnight_opi",
@@ -1103,7 +1347,7 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
         misfire_grace_time=3600,
     )
 
-    log.info("Scheduler configured (base=%ds, actual intervals from DB, midnight cron at 00:00+00:30 Minsk)", BASE)
+    log.info("Scheduler configured (base=%ds, midnight cron at 00:00/00:15/00:30 Minsk)", BASE)
     return _scheduler
 
 

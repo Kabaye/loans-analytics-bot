@@ -248,17 +248,36 @@ def _build_entries_schema(entries: list[BorrowEntry]) -> dict[str, list[str]]:
     return {k: sorted(v) for k, v in sorted(acc.items()) if k}
 
 
+def _non_null_schema_types(types: list[str] | None) -> set[str]:
+    return {t for t in (types or []) if t not in {"null", "empty"}}
+
+
+def _merge_schema(prev: dict[str, list[str]] | None, current: dict[str, list[str]]) -> dict[str, list[str]]:
+    merged: dict[str, set[str]] = {}
+    for source in (prev or {}, current):
+        for path, types in source.items():
+            merged.setdefault(path, set()).update(types)
+    return {path: sorted(types) for path, types in sorted(merged.items())}
+
+
 def _schema_diff(prev: dict[str, list[str]] | None, current: dict[str, list[str]]) -> tuple[list[str], list[str]]:
     prev = prev or {}
     added_paths: list[str] = []
     changed_types: list[str] = []
     for path, types in current.items():
         if path not in prev:
-            added_paths.append(f"{path} ({', '.join(types)})")
+            non_null_types = sorted(_non_null_schema_types(types))
+            if non_null_types:
+                added_paths.append(f"{path} ({', '.join(non_null_types)})")
             continue
-        prev_types = prev[path]
-        if prev_types != types:
-            changed_types.append(f"{path}: {', '.join(prev_types)} -> {', '.join(types)}")
+        prev_types = sorted(_non_null_schema_types(prev[path]))
+        current_types = sorted(_non_null_schema_types(types))
+        if not prev_types:
+            continue
+        new_types = [t for t in current_types if t not in prev_types]
+        if new_types:
+            before = ", ".join(prev_types) if prev_types else "no-non-null-types"
+            changed_types.append(f"{path}: {before} -> {', '.join(current_types)}")
     return added_paths, changed_types
 
 
@@ -273,10 +292,13 @@ async def _notify_json_schema_change(bot: Bot, service: str, entries: list[Borro
         return
 
     added_paths, changed_types = _schema_diff(prev, current)
+    merged = _merge_schema(prev, current)
     if not added_paths and not changed_types:
+        if merged != prev:
+            await save_json_schema_state(service, merged)
         return
 
-    await save_json_schema_state(service, current)
+    await save_json_schema_state(service, merged)
     svc_names = {"kapusta": "🥬 Kapusta", "finkit": "🔵 FinKit", "zaimis": "🟪 ЗАЙМись"}
     lines = [f"⚠️ <b>Изменилась JSON-структура {svc_names.get(service, service)}</b>"]
     if added_paths:

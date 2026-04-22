@@ -21,6 +21,7 @@ from bot.database import (
     get_borrowers_stats, get_borrowers_count, get_missing_opi_candidates,
 )
 from bot.config import ADMIN_CHAT_ID
+from bot.services.scheduler import get_export_parsers
 
 log = logging.getLogger(__name__)
 router = Router(name="admin")
@@ -59,6 +60,26 @@ async def is_admin(chat_id: int) -> bool:
         return len(rows) > 0
     finally:
         await db.close()
+
+
+async def _get_test_parser(service: str, requester_chat_id: int):
+    """Reuse the same parser/session acquisition path as export."""
+    target_chat_id = requester_chat_id
+    if service in ("finkit", "zaimis"):
+        db = await get_db()
+        try:
+            rows = await db.execute_fetchall(
+                "SELECT chat_id FROM credentials WHERE service = ? ORDER BY id LIMIT 1",
+                (service,),
+            )
+        finally:
+            await db.close()
+        if not rows:
+            return None
+        target_chat_id = rows[0]["chat_id"]
+
+    parsers = await get_export_parsers(service, target_chat_id)
+    return parsers[0] if parsers else None
 
 
 class AdminAddUser(StatesGroup):
@@ -439,26 +460,19 @@ async def adm_test_app(callback: CallbackQuery):
 
     await callback.message.edit_text("🔄 Запускаю полный тест приложения... Подождите 30-90 секунд.")
 
-    from bot.parsers.kapusta import KapustaParser
-    from bot.parsers.finkit import FinkitParser
-    from bot.parsers.zaimis import ZaimisParser
     from bot.services.opi_checker import OPIChecker
 
     results: list[str] = []
 
     # --- Kapusta ---
     try:
-        kp = KapustaParser()
-        try:
-            ok = await asyncio.wait_for(kp.login(), timeout=15)
-            if ok:
-                entries_k = await asyncio.wait_for(kp.fetch_borrows(), timeout=30)
-                results.append(f"🥬 <b>Kapusta</b>: {len(entries_k)} заявок")
-            else:
-                entries_k = []
-                results.append("🥬 <b>Kapusta</b>: ❌ anti-bot failed")
-        finally:
-            await kp.close()
+        kp = await _get_test_parser("kapusta", callback.message.chat.id)
+        if kp is None:
+            entries_k = []
+            results.append("🥬 <b>Kapusta</b>: ❌ parser unavailable")
+        else:
+            entries_k = await asyncio.wait_for(kp.fetch_borrows(), timeout=30)
+            results.append(f"🥬 <b>Kapusta</b>: {len(entries_k)} заявок")
         if entries_k:
             e = entries_k[0] if hasattr(entries_k[0], "amount") else type("E", (), entries_k[0])()
             amt = e.amount if hasattr(e, "amount") else e.get("amount", 0) if isinstance(e, dict) else 0
@@ -468,89 +482,61 @@ async def adm_test_app(callback: CallbackQuery):
 
     # --- FinKit ---
     try:
-        db = await get_db()
-        try:
-            creds_f = await db.execute_fetchall(
-                "SELECT login, password FROM credentials WHERE service='finkit' LIMIT 1"
-            )
-        finally:
-            await db.close()
-        if not creds_f:
+        fp = await _get_test_parser("finkit", callback.message.chat.id)
+        if fp is None:
             results.append("🔵 <b>FinKit</b>: ⚠️ Нет credentials")
         else:
-            fp = FinkitParser()
-            try:
-                ok = await fp.login(creds_f[0]["login"], creds_f[0]["password"])
-                if not ok:
-                    results.append("🔵 <b>FinKit</b>: ❌ Ошибка логина")
-                else:
-                    entries_f = await fp.fetch_borrows()
-                    results.append(f"🔵 <b>FinKit</b>: {len(entries_f)} заявок")
-                    if entries_f:
-                        e = entries_f[0]
-                        results.append(
-                            f"  └ #{e.id}: {e.amount:.0f} BYN, {e.period_days}д, "
-                            f"рейт {e.credit_score:.0f}, {e.interest_day:.2f}%/д"
-                        )
-                        # PDF + OPI enrichment on first with contract
-                        to_enrich = [ee for ee in entries_f if ee.contract_url][:1]
-                        if to_enrich:
-                            await fp.enrich_with_pdf(to_enrich)
-                            ee = to_enrich[0]
-                            results.append(
-                                f"  └ PDF: ФИО={ee.full_name or '—'}, ИН={ee.document_id or '—'}"
-                            )
-                            if ee.document_id:
-                                opi = OPIChecker()
-                                try:
-                                    res = await opi.check(ee.document_id, use_cache=False)
-                                    if res.error:
-                                        results.append(f"  └ ОПИ: ⚠️ {res.error}")
-                                    elif res.has_debt:
-                                        results.append(
-                                            f"  └ ОПИ: 🔴 ДОЛГ {res.debt_amount:.2f} BYN ({res.full_name or '—'})"
-                                        )
-                                    else:
-                                        results.append("  └ ОПИ: 🟢 Нет задолженности")
-                                finally:
-                                    await opi.close()
+            entries_f = await fp.fetch_borrows()
+            results.append(f"🔵 <b>FinKit</b>: {len(entries_f)} заявок")
+            if entries_f:
+                e = entries_f[0]
+                results.append(
+                    f"  └ #{e.id}: {e.amount:.0f} BYN, {e.period_days}д, "
+                    f"рейт {e.credit_score:.0f}, {e.interest_day:.2f}%/д"
+                )
+                # PDF + OPI enrichment on first with contract
+                to_enrich = [ee for ee in entries_f if ee.contract_url][:1]
+                if to_enrich:
+                    await fp.enrich_with_pdf(to_enrich)
+                    ee = to_enrich[0]
+                    results.append(
+                        f"  └ PDF: ФИО={ee.full_name or '—'}, ИН={ee.document_id or '—'}"
+                    )
+                    if ee.document_id:
+                        opi = OPIChecker()
+                        try:
+                            res = await opi.check(ee.document_id, use_cache=False)
+                            if res.error:
+                                results.append(f"  └ ОПИ: ⚠️ {res.error}")
+                            elif res.has_debt:
+                                results.append(
+                                    f"  └ ОПИ: 🔴 ДОЛГ {res.debt_amount:.2f} BYN ({res.full_name or '—'})"
+                                )
                             else:
-                                results.append("  └ ОПИ: ⏭ нет ИН")
-                        else:
-                            results.append("  └ PDF: нет contract_url")
-            finally:
-                await fp.close()
+                                results.append("  └ ОПИ: 🟢 Нет задолженности")
+                        finally:
+                            await opi.close()
+                    else:
+                        results.append("  └ ОПИ: ⏭ нет ИН")
+                else:
+                    results.append("  └ PDF: нет contract_url")
     except Exception as ex:
         results.append(f"🔵 <b>FinKit</b>: ❌ {ex}")
 
     # --- ЗАЙМись ---
     try:
-        db = await get_db()
-        try:
-            creds_z = await db.execute_fetchall(
-                "SELECT login, password FROM credentials WHERE service='zaimis' LIMIT 1"
-            )
-        finally:
-            await db.close()
-        if not creds_z:
+        zp = await _get_test_parser("zaimis", callback.message.chat.id)
+        if zp is None:
             results.append("🟪 <b>ЗАЙМись</b>: ⚠️ Нет credentials")
         else:
-            zp = ZaimisParser()
-            try:
-                ok = await zp.login(creds_z[0]["login"], creds_z[0]["password"])
-                if not ok:
-                    results.append("🟪 <b>ЗАЙМись</b>: ❌ Ошибка логина")
-                else:
-                    entries_z = await zp.fetch_borrows()
-                    results.append(f"🟪 <b>ЗАЙМись</b>: {len(entries_z)} заявок")
-                    if entries_z:
-                        e = entries_z[0]
-                        results.append(
-                            f"  └ #{e.id[:8]}…: {e.amount:.0f} BYN, {e.period_days}д, "
-                            f"рейт {e.credit_score:.0f}, {e.interest_day:.2f}%/д"
-                        )
-            finally:
-                await zp.close()
+            entries_z = await zp.fetch_borrows()
+            results.append(f"🟪 <b>ЗАЙМись</b>: {len(entries_z)} заявок")
+            if entries_z:
+                e = entries_z[0]
+                results.append(
+                    f"  └ #{e.id[:8]}…: {e.amount:.0f} BYN, {e.period_days}д, "
+                    f"рейт {e.credit_score:.0f}, {e.interest_day:.2f}%/д"
+                )
     except Exception as ex:
         results.append(f"🟪 <b>ЗАЙМись</b>: ❌ {ex}")
 
@@ -648,9 +634,6 @@ async def adm_test_notif_menu(callback: CallbackQuery):
 
 async def _send_test_notification(callback: CallbackQuery, services: list[str]):
     """Fetch one real entry from each service and send formatted notification."""
-    from bot.parsers.kapusta import KapustaParser
-    from bot.parsers.finkit import FinkitParser
-    from bot.parsers.zaimis import ZaimisParser
     from bot.services.notifier import format_notification
 
     chat_id = callback.message.chat.id
@@ -663,53 +646,25 @@ async def _send_test_notification(callback: CallbackQuery, services: list[str]):
         try:
             entry = None
             if svc == "kapusta":
-                kp = KapustaParser()
-                try:
-                    ok = await kp.login()
-                    if ok:
-                        entries = await kp.fetch_borrows()
-                        if entries:
-                            entry = entries[0]
-                finally:
-                    await kp.close()
+                kp = await _get_test_parser("kapusta", chat_id)
+                if kp:
+                    entries = await kp.fetch_borrows()
+                    if entries:
+                        entry = entries[0]
 
             elif svc == "finkit":
-                db = await get_db()
-                try:
-                    creds = await db.execute_fetchall(
-                        "SELECT login, password FROM credentials WHERE service='finkit' LIMIT 1"
-                    )
-                finally:
-                    await db.close()
-                if creds:
-                    fp = FinkitParser()
-                    try:
-                        ok = await fp.login(creds[0]["login"], creds[0]["password"])
-                        if ok:
-                            entries = await fp.fetch_borrows()
-                            if entries:
-                                entry = entries[0]
-                    finally:
-                        await fp.close()
+                fp = await _get_test_parser("finkit", chat_id)
+                if fp:
+                    entries = await fp.fetch_borrows()
+                    if entries:
+                        entry = entries[0]
 
             elif svc == "zaimis":
-                db = await get_db()
-                try:
-                    creds = await db.execute_fetchall(
-                        "SELECT login, password FROM credentials WHERE service='zaimis' LIMIT 1"
-                    )
-                finally:
-                    await db.close()
-                if creds:
-                    zp = ZaimisParser()
-                    try:
-                        ok = await zp.login(creds[0]["login"], creds[0]["password"])
-                        if ok:
-                            entries = await zp.fetch_borrows()
-                            if entries:
-                                entry = entries[0]
-                    finally:
-                        await zp.close()
+                zp = await _get_test_parser("zaimis", chat_id)
+                if zp:
+                    entries = await zp.fetch_borrows()
+                    if entries:
+                        entry = entries[0]
 
             if entry:
                 from bot.models import Subscription

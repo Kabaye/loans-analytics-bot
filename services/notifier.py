@@ -7,6 +7,7 @@ import logging
 import math
 import uuid
 from collections import OrderedDict
+from datetime import datetime, timezone
 from typing import Optional
 
 from aiogram import Bot, Router, F
@@ -87,6 +88,76 @@ COMMISSION_RATES = {
 TAX_RATE = 0.13  # 13% income tax on gross profit
 
 
+def _coerce_utc_datetime(value) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _entry_available_at(entry: BorrowEntry) -> datetime | None:
+    return _coerce_utc_datetime(entry.created_at) or _coerce_utc_datetime(entry.updated_at)
+
+
+def _subscription_is_active_for_entry(sub: Subscription, entry: BorrowEntry) -> bool:
+    entry_dt = _entry_available_at(entry)
+    sub_dt = _coerce_utc_datetime(sub.created_at)
+    if entry_dt and sub_dt and entry_dt < sub_dt:
+        return False
+    return True
+
+
+def _subscription_label(sub: Subscription) -> str:
+    label = (sub.label or "").strip()
+    if not label or any(marker in label for marker in ("�", "Ð", "Ñ", "Ã", "Â")):
+        return f"подписка #{sub.id:02d}"
+    return label
+
+
+def _render_subscription_caption(subs: list[Subscription]) -> str:
+    labels: list[str] = []
+    for sub in subs:
+        label = _subscription_label(sub)
+        if label not in labels:
+            labels.append(label)
+    return " / ".join(labels) if labels else "подписка"
+
+
+def _rating_marker(entry: BorrowEntry) -> str:
+    score = entry.credit_score or 0
+    if entry.service == "finkit":
+        if score < 30:
+            return "❗❗️"
+        if 31 <= score <= 40:
+            return "❗️"
+    if entry.service == "zaimis":
+        if score < 40:
+            return "❗❗️"
+        warn_threshold = 50 if entry.is_employed else 65
+        if score < warn_threshold:
+            return "❗️"
+    return ""
+
+
+def _format_rating_line(entry: BorrowEntry) -> str:
+    marker = _rating_marker(entry)
+    if marker:
+        return f"{marker}<b>{entry.credit_score:.0f}</b> рейтинг"
+    return f"<b>{entry.credit_score:.0f}</b> рейтинг"
+
+
+def _format_opi_date(entry: BorrowEntry) -> str | None:
+    dt = _coerce_utc_datetime(entry.opi_checked_at)
+    return dt.strftime("%d.%m") if dt else None
+
+
 def _calc_commission(amount_return: float, service: str) -> float:
     """Calculate platform commission on the return amount."""
     if service == "finkit":
@@ -142,15 +213,21 @@ def _build_finkit_url(entry: BorrowEntry) -> str:
 
 def _format_opi_line(entry: BorrowEntry) -> str | None:
     """Format OPI line with date and appropriate icon."""
-    if not entry.opi_checked:
+    if entry.opi_error:
+        date_str = _format_opi_date(entry)
+        suffix = f" ({date_str})" if date_str else ""
+        return f"⚠️ ОПИ: ошибка проверки{suffix}"
+    if not entry.opi_checked and not entry.opi_checked_at:
         return None
-    from datetime import datetime, timezone
-    date_str = datetime.now(timezone.utc).strftime("%d.%m")
-    if entry.opi_has_debt:
+    date_str = _format_opi_date(entry)
+    suffix = f" ({date_str})" if date_str else ""
+    if entry.opi_has_debt is True:
         debt = entry.opi_debt_amount or 0
         icon = "❌" if debt >= 1000 else "⚠️"
-        return f"{icon} ОПИ: долг {debt:.0f} ({date_str})"
-    return f"✅ ОПИ: нет задолженности ({date_str})"
+        return f"{icon} ОПИ: долг {debt:.0f}{suffix}"
+    if entry.opi_has_debt is False:
+        return f"✅ ОПИ: нет задолженности{suffix}"
+    return f"⚠️ ОПИ: ответ не получен{suffix}"
 
 
 def _format_finkit_borrower(entry: BorrowEntry) -> list[str]:
@@ -163,9 +240,8 @@ def _format_finkit_borrower(entry: BorrowEntry) -> list[str]:
 
     # Work type with status icon
     if entry.is_employed is not None:
-        work_name = entry.display_name or ("Рабочий / служащий" if entry.is_employed else "безработный")
-        safe_jobs = {"Рабочий / служащий", "По договору подряда / услуг", "ИП"}
-        icon = "✅" if work_name in safe_jobs else "⚠️"
+        work_name = entry.display_name or ("Рабочий / служащий" if entry.is_employed else "Безработный")
+        icon = "✅" if entry.is_employed else "⚠️"
         lines.append(f"{icon} {work_name}")
 
     # Settled loans from API
@@ -282,10 +358,11 @@ def _format_enrichment_section(entry: BorrowEntry) -> list[str]:
     return lines
 
 
-def format_notification(entry: BorrowEntry, sub: Subscription) -> str:
+def format_notification(entry: BorrowEntry, sub: Subscription | list[Subscription]) -> str:
+    subs = sub if isinstance(sub, list) else [sub]
     icon = SERVICE_ICONS.get(entry.service, "📋")
     svc = SERVICE_NAMES.get(entry.service, entry.service)
-    label = sub.label or ""
+    label = _render_subscription_caption(subs)
 
     p = calc_profits(entry)
 
@@ -295,8 +372,8 @@ def format_notification(entry: BorrowEntry, sub: Subscription) -> str:
     # === Block 2: Loan info ===
     lines.append(f"<b>{entry.amount:.0f}</b> сумма")
     lines.append(f"<b>{entry.period_days}</b> д. срок")
-    lines.append(f"<b>{entry.interest_day:.1f}</b> ставка ({entry.interest_year:.1f}%)")
-    lines.append(f"<b>{entry.credit_score:.0f}</b> рейтинг")
+    lines.append(f"<b>{entry.interest_day:.2f}</b> ставка ({entry.interest_year:.1f}%)")
+    lines.append(_format_rating_line(entry))
     lines.append(f"<b>{p['amount_return']:.2f}</b> возврат")
 
     if entry.service == "zaimis" and entry.penalty_interest:
@@ -352,6 +429,7 @@ async def get_active_subscriptions(service: str) -> list[tuple[int, Subscription
             FROM subscriptions s
             JOIN users u ON s.chat_id = u.chat_id
             WHERE s.service = ? AND s.is_active = 1 AND u.is_allowed = 1
+            ORDER BY s.created_at, s.id
             """,
             (service,),
         )
@@ -371,6 +449,7 @@ async def get_active_subscriptions(service: str) -> list[tuple[int, Subscription
                 require_employed=bool(row["require_employed"]) if row["require_employed"] is not None else None,
                 require_income_confirmed=bool(row["require_income_confirmed"]) if row["require_income_confirmed"] is not None else None,
                 min_settled_loans=row["min_settled_loans"] if row["min_settled_loans"] else None,
+                created_at=_coerce_utc_datetime(row["created_at"]),
             )
             result.append((row["chat_id"], sub))
         return result
@@ -413,6 +492,7 @@ async def enrich_entry_from_borrowers(entry: BorrowEntry) -> None:
         entry.opi_has_debt = bool(cached.get("opi_has_debt"))
         entry.opi_debt_amount = cached.get("opi_debt_amount")
         entry.opi_full_name = cached.get("opi_full_name")
+        entry.opi_checked_at = cached.get("opi_checked_at")
     # Investment stats from borrowers table
     if cached.get("total_loans") and cached["total_loans"] > 0:
         entry.kb_known = True
@@ -436,10 +516,10 @@ async def notify_users(
     service: str,
     *,
     skip_enrichment: bool = False,
-) -> list[tuple[str, int, int, Subscription]]:
+) -> list[tuple[str, int, int, list[Subscription]]]:
     """Match entries against subscriptions and send notifications.
 
-    Returns list of (entry_id, chat_id, message_id, sub) for sent messages
+    Returns list of (entry_id, chat_id, message_id, subs) for sent messages
     that can later be edited via update_sent_notifications().
 
     If skip_enrichment=True, skip the enrich_entry_from_borrowers step
@@ -451,7 +531,7 @@ async def notify_users(
     if not subs:
         return []
 
-    sent_refs: list[tuple[str, int, int, Subscription]] = []
+    sent_refs: list[tuple[str, int, int, list[Subscription]]] = []
     for entry in entries:
         # Enrich from borrowers table (unless caller handles it)
         if not skip_enrichment and service != "finkit":
@@ -465,11 +545,16 @@ async def notify_users(
                 [InlineKeyboardButton(text="📋 Исходные данные", callback_data=f"raw_{raw_key}")]
             ])
 
+        matched_by_chat: dict[int, list[Subscription]] = {}
         for chat_id, sub in subs:
+            if not _subscription_is_active_for_entry(sub, entry):
+                continue
             if not sub.matches(entry):
                 continue
+            matched_by_chat.setdefault(chat_id, []).append(sub)
 
-            text = format_notification(entry, sub)
+        for chat_id, matched_subs in matched_by_chat.items():
+            text = format_notification(entry, matched_subs)
 
             # If user is busy creating a subscription, queue the notification
             if is_busy(chat_id):
@@ -480,7 +565,7 @@ async def notify_users(
                 msg = await bot.send_message(chat_id, text, parse_mode="HTML",
                                              disable_web_page_preview=True,
                                              reply_markup=kb)
-                sent_refs.append((entry.id, chat_id, msg.message_id, sub))
+                sent_refs.append((entry.id, chat_id, msg.message_id, matched_subs))
                 await asyncio.sleep(0.1)
             except TelegramRetryAfter as e:
                 log.warning("Flood control for %s: retry after %ds", chat_id, e.retry_after)
@@ -489,7 +574,7 @@ async def notify_users(
                     msg = await bot.send_message(chat_id, text, parse_mode="HTML",
                                                  disable_web_page_preview=True,
                                                  reply_markup=kb)
-                    sent_refs.append((entry.id, chat_id, msg.message_id, sub))
+                    sent_refs.append((entry.id, chat_id, msg.message_id, matched_subs))
                 except Exception:
                     pass
             except Exception as e:
@@ -502,7 +587,7 @@ async def notify_users(
 async def update_sent_notifications(
     bot: Bot,
     entries: list[BorrowEntry],
-    sent_refs: list[tuple[str, int, int, Subscription]],
+    sent_refs: list[tuple[str, int, int, list[Subscription]]],
     service: str,
 ) -> int:
     """Edit previously sent notifications with enriched data.
@@ -515,12 +600,12 @@ async def update_sent_notifications(
 
     entry_map = {e.id: e for e in entries}
     edited = 0
-    for entry_id, chat_id, message_id, sub in sent_refs:
+    for entry_id, chat_id, message_id, matched_subs in sent_refs:
         entry = entry_map.get(entry_id)
         if not entry:
             continue
 
-        new_text = format_notification(entry, sub)
+        new_text = format_notification(entry, matched_subs)
 
         # Rebuild raw_data button
         raw_key = _store_raw_data(entry.raw_data)

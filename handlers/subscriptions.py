@@ -73,7 +73,7 @@ async def _show_subscriptions(target, chat_id: int, edit: bool = False):
     lines = ["<b>📋 Ваши подписки:</b>\n"]
     for row in rows:
         svc = SERVICES.get(row["service"], row["service"])
-        label = row["label"] or f"#{row['id']}"
+        label = _display_subscription_value(row["label"], fallback=f"#{row['id']}")
         if row["night_paused"]:
             status = "🌙"
         elif row["is_active"]:
@@ -223,7 +223,7 @@ async def sub_pick_service(callback: CallbackQuery, state: FSMContext):
 
 @router.message(SubForm.label)
 async def sub_set_label(message: Message, state: FSMContext):
-    label = message.text.strip() if message.text.strip() != "-" else None
+    label = _normalize_subscription_text(message.text)
     await state.update_data(label=label)
     await _show_builder(message, state, edit=False)
 
@@ -260,7 +260,7 @@ async def _show_builder(target, state: FSMContext, edit: bool = True):
     data = await state.get_data()
     service = data.get("service", "?")
     svc_name = SERVICES.get(service, service)
-    label = data.get("label") or "—"
+    label = _display_subscription_value(data.get("label"))
 
     lines = [f"📋 <b>Новая подписка:</b>", f"{svc_name} — {label}", ""]
 
@@ -274,7 +274,7 @@ async def _show_builder(target, state: FSMContext, edit: bool = True):
         if ftype == "bool":
             display = "✅ Да" if val else "—"
         elif val is not None:
-            display = str(val)
+            display = _display_subscription_value(val)
         else:
             display = "—"
 
@@ -286,10 +286,8 @@ async def _show_builder(target, state: FSMContext, edit: bool = True):
             )
         ])
 
-    buttons.append([
-        InlineKeyboardButton(text="✅ Создать", callback_data="sub_confirm_yes"),
-        InlineKeyboardButton(text="❌ Отмена", callback_data="sub_confirm_no"),
-    ])
+    buttons.append([InlineKeyboardButton(text="➡️ Предпросмотр", callback_data="sub_preview")])
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="sub_confirm_no")])
 
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     text_msg = "\n".join(lines)
@@ -298,6 +296,38 @@ async def _show_builder(target, state: FSMContext, edit: bool = True):
         await target.edit_text(text_msg, reply_markup=kb, parse_mode="HTML")
     else:
         await target.answer(text_msg, reply_markup=kb, parse_mode="HTML")
+
+
+async def _show_preview(target, state: FSMContext, edit: bool = True):
+    """Show final subscription preview before save."""
+    data = await state.get_data()
+    service = data.get("service", "?")
+    svc_name = SERVICES.get(service, service)
+
+    lines = ["<b>👀 Проверьте подписку перед созданием</b>", ""]
+    lines.append(f"<b>Сайт:</b> {svc_name}")
+    lines.append(f"<b>Название:</b> {_display_subscription_value(data.get('label'))}")
+
+    for field in _fields_for_service(service):
+        if field == "label":
+            continue
+        name, ftype = BUILDER_FIELDS[field]
+        val = data.get(field)
+        display = "✅ Да" if ftype == "bool" and val else _display_subscription_value(val)
+        if ftype == "bool" and not val:
+            display = "—"
+        lines.append(f"<b>{name}:</b> {display}")
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Подтвердить", callback_data="sub_confirm_yes")],
+        [InlineKeyboardButton(text="✏️ Изменить", callback_data="sub_preview_back")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="sub_confirm_no")],
+    ])
+    await state.set_state(SubForm.confirm)
+    if edit:
+        await target.edit_text("\n".join(lines), reply_markup=kb, parse_mode="HTML")
+    else:
+        await target.answer("\n".join(lines), reply_markup=kb, parse_mode="HTML")
 
 
 @router.callback_query(F.data.startswith("sub_bf_"))
@@ -359,11 +389,20 @@ async def sub_builder_set_value(message: Message, state: FSMContext):
         if val is not None and val <= 0:
             val = None
     else:
-        val = text if text != "0" else None
+        val = _normalize_subscription_text(text)
 
     await state.update_data(**{field: val})
     await _show_builder(message, state, edit=False)
 
+
+@router.callback_query(F.data == "sub_preview")
+async def sub_preview(callback: CallbackQuery, state: FSMContext):
+    await _show_preview(callback.message, state, edit=True)
+
+
+@router.callback_query(F.data == "sub_preview_back")
+async def sub_preview_back(callback: CallbackQuery, state: FSMContext):
+    await _show_builder(callback.message, state, edit=True)
 
 
 @router.callback_query(F.data == "sub_confirm_yes")
@@ -381,7 +420,7 @@ async def sub_confirm_no(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="🔔 Подписки", callback_data="subs_menu")],
         [InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")],
     ])
-    await callback.message.edit_text("❌ Подписка отменена.", reply_markup=kb)
+    await callback.message.edit_text("❌ Подписка не создана.", reply_markup=kb)
     # Flush queued notifications
     if queued:
         for ntf_text, ntf_kb in queued:
@@ -437,7 +476,7 @@ async def _save_subscription(target, state: FSMContext, edit: bool = False):
         [InlineKeyboardButton(text="🔔 Подписки", callback_data="subs_menu")],
         [InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")],
     ])
-    text = f"✅ Подписка создана!\nСайт: {svc}\nНазвание: {data.get('label') or '—'}"
+    text = f"✅ Подписка создана!\nСайт: {svc}\nНазвание: {_display_subscription_value(data.get('label'))}"
     if edit:
         await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
     else:
@@ -488,7 +527,7 @@ async def sub_edit_choose(callback: CallbackQuery):
     buttons = []
     for row in rows:
         svc = SERVICES.get(row["service"], row["service"])
-        label = row["label"] or f"#{row['id']}"
+        label = _display_subscription_value(row["label"], fallback=f"#{row['id']}")
         buttons.append([
             InlineKeyboardButton(
                 text=f"✏️ {svc} — {label}",
@@ -518,7 +557,7 @@ async def sub_edit_show(callback: CallbackQuery):
 
     row = rows[0]
     svc = SERVICES.get(row["service"], row["service"])
-    label = row["label"] or f"#{row['id']}"
+    label = _display_subscription_value(row["label"], fallback=f"#{row['id']}")
 
     lines = [f"✏️ <b>Редактирование: {svc} — {label}</b>\n"]
     buttons = []
@@ -538,11 +577,11 @@ async def sub_edit_show(callback: CallbackQuery):
             val = None
 
         if field in ("require_employed", "require_income_confirmed"):
-            display = "✅ Да" if val else "❌ Нет"
+            display = "✅ Да" if val else "—"
         elif val is None:
             display = "—"
         else:
-            display = str(val)
+            display = _display_subscription_value(val)
 
         lines.append(f"  <b>{name}:</b> {display}")
         buttons.append([
@@ -618,7 +657,7 @@ async def sub_edit_save_value(message: Message, state: FSMContext):
     elif ftype == "int":
         val = _parse_int(text)
     else:
-        val = text
+        val = _normalize_subscription_text(text)
 
     if field == "label" and val is None:
         val = None  # allowed to clear label
@@ -635,7 +674,7 @@ async def sub_edit_save_value(message: Message, state: FSMContext):
 
     await state.clear()
     name = EDITABLE_FIELDS[field][0]
-    display = str(val) if val is not None else "—"
+    display = _display_subscription_value(val)
     await message.answer(
         f"✅ {name} → {display}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -665,7 +704,7 @@ async def sub_delete_choose(callback: CallbackQuery):
     buttons = []
     for row in rows:
         svc = SERVICES.get(row["service"], row["service"])
-        label = row["label"] or f"#{row['id']}"
+        label = _display_subscription_value(row["label"], fallback=f"#{row['id']}")
         buttons.append([
             InlineKeyboardButton(
                 text=f"🗑 {svc} — {label}",
@@ -719,7 +758,7 @@ async def sub_toggle_choose(callback: CallbackQuery):
     buttons = []
     for row in rows:
         svc = SERVICES.get(row["service"], row["service"])
-        label = row["label"] or f"#{row['id']}"
+        label = _display_subscription_value(row["label"], fallback=f"#{row['id']}")
         status = "✅" if row["is_active"] else "⏸"
         buttons.append([
             InlineKeyboardButton(
@@ -833,3 +872,29 @@ def _parse_int(text: str | None) -> int | None:
         return int(text.strip())
     except ValueError:
         return None
+
+
+def _is_garbled_text(text: str | None) -> bool:
+    if not text:
+        return False
+    return any(marker in text for marker in ("�", "Ð", "Ñ", "Ã", "Â"))
+
+
+def _normalize_subscription_text(text: str | None) -> str | None:
+    if not text:
+        return None
+    cleaned = text.strip()
+    if cleaned in ("", "-", "—", "0"):
+        return None
+    if _is_garbled_text(cleaned):
+        return None
+    return cleaned
+
+
+def _display_subscription_value(value, fallback: str = "—") -> str:
+    if value is None:
+        return fallback
+    if isinstance(value, str):
+        cleaned = _normalize_subscription_text(value)
+        return cleaned if cleaned is not None else fallback
+    return str(value)

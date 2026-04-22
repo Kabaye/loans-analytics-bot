@@ -34,7 +34,9 @@ BORROWER_WORK_MAP = {
     "maternity": "Декретный отпуск",
     "student": "Студент",
     "entrepreneur": "ИП",
+    "professional": "Самозанятый",
     "pensioner": "Пенсионер",
+    "unemployed": "Безработный",
 }
 
 
@@ -215,6 +217,7 @@ class FinkitParser(BaseParser):
                     entry.opi_has_debt = bool(cached.get("opi_has_debt"))
                     entry.opi_debt_amount = cached.get("opi_debt_amount")
                     entry.opi_full_name = cached.get("opi_full_name")
+                    entry.opi_checked_at = cached.get("opi_checked_at")
                 if cached.get("total_loans") and cached["total_loans"] > 0:
                     entry.kb_known = True
                     entry.kb_total_loans = cached.get("total_loans")
@@ -277,4 +280,4 @@ class FinkitParser(BaseParser):
 def _parse_work(code: str | None) -> bool | None:
     if code is None:
         return None
-    return code in ("worker", "contract", "entrepreneur")
+    return code in ("worker", "contract", "entrepreneur", "professional")

@@ -53,6 +53,7 @@ class BorrowEntry:
     opi_has_debt: Optional[bool] = None
     opi_debt_amount: Optional[float] = None
     opi_full_name: Optional[str] = None
+    opi_checked_at: Optional[datetime | str] = None
     opi_error: Optional[str] = None
 
     # Known borrower enrichment (from investment history)
@@ -111,6 +112,11 @@ class BorrowEntry:
             "opi_has_debt": self.opi_has_debt,
             "opi_debt_amount": self.opi_debt_amount,
             "opi_full_name": self.opi_full_name,
+            "opi_checked_at": (
+                self.opi_checked_at.isoformat()
+                if isinstance(self.opi_checked_at, datetime)
+                else self.opi_checked_at
+            ),
             "opi_error": self.opi_error,
             "kb_known": self.kb_known,
             "kb_total_loans": self.kb_total_loans,
@@ -147,6 +153,7 @@ class Subscription:
     is_active: bool = True
     night_paused: bool = False
     min_settled_loans: Optional[int] = None
+    created_at: Optional[datetime] = None
 
     def matches(self, entry: BorrowEntry) -> bool:
         if self.sum_min is not None and entry.amount < self.sum_min:

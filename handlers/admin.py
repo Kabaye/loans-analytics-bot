@@ -18,7 +18,7 @@ from aiogram.types import (
 
 from bot.database import (
     get_db, get_all_site_settings, update_site_setting,
-    get_borrowers_stats, get_borrowers_count,
+    get_borrowers_stats, get_borrowers_count, get_missing_opi_candidates,
 )
 from bot.config import ADMIN_CHAT_ID
 
@@ -421,6 +421,7 @@ async def cb_test_menu(callback: CallbackQuery):
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔬 Тест приложения", callback_data="adm_test_app")],
+        [InlineKeyboardButton(text="🆔 Нет OPI 10+ дней", callback_data="adm_missing_opi")],
         [InlineKeyboardButton(text="📨 Тест уведомлений", callback_data="adm_test_notif_menu")],
         [InlineKeyboardButton(text="↩ Админ-панель", callback_data="admin_menu")],
     ])
@@ -556,6 +557,7 @@ async def adm_test_app(callback: CallbackQuery):
     # --- Borrowers + borrower_info stats ---
     try:
         stats = await get_borrowers_stats()
+        missing_opi = await get_missing_opi_candidates(min_age_days=10, limit=500)
         if stats and (stats.get("total") or stats.get("mappings")):
             results.append(
                 f"\n📊 <b>Карточки заёмщиков (borrower_info)</b>:\n"
@@ -564,7 +566,8 @@ async def adm_test_app(callback: CallbackQuery):
                 f"  С долгами: {stats.get('with_debt', 0)}\n"
                 f"  С инвестициями: {stats.get('with_investments', 0)}\n"
                 f"  Маппингов (borrowers): {stats.get('mappings', 0)}\n"
-                f"  С ИН: {stats.get('with_document', 0)}"
+                f"  С ИН: {stats.get('with_document', 0)}\n"
+                f"  Нет OPI 10+ дней: {len(missing_opi)}"
             )
         else:
             results.append("\n📊 <b>Карточки заёмщиков</b>: пусто")
@@ -579,6 +582,44 @@ async def adm_test_app(callback: CallbackQuery):
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Перетестировать", callback_data="adm_test_app")],
+            [InlineKeyboardButton(text="🆔 Отчёт без OPI", callback_data="adm_missing_opi")],
+            [InlineKeyboardButton(text="🧪 Меню тестов", callback_data="adm_test_menu")],
+            [InlineKeyboardButton(text="↩ Админ-панель", callback_data="admin_menu")],
+        ]),
+    )
+
+
+@router.callback_query(F.data == "adm_missing_opi")
+async def adm_missing_opi(callback: CallbackQuery):
+    if not await is_admin(callback.message.chat.id):
+        return
+
+    rows = await get_missing_opi_candidates(min_age_days=10, limit=50)
+    if not rows:
+        text = "✅ Заёмщиков без OPI старше 10 дней не найдено."
+    else:
+        lines = [
+            "<b>🆔 Заёмщики без OPI старше 10 дней</b>",
+            f"Всего найдено: <b>{len(rows)}</b>",
+            "",
+        ]
+        for row in rows[:20]:
+            services = row.get("services") or "—"
+            first_seen = (row.get("first_seen") or "—")[:10]
+            full_name = row.get("full_name") or "—"
+            lines.append(
+                f"• <code>{row['document_id']}</code> — {full_name}\n"
+                f"  {services} / first_seen: {first_seen}"
+            )
+        if len(rows) > 20:
+            lines.append(f"\n…и ещё {len(rows) - 20}")
+        text = "\n".join(lines)
+
+    await callback.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data="adm_missing_opi")],
             [InlineKeyboardButton(text="🧪 Меню тестов", callback_data="adm_test_menu")],
             [InlineKeyboardButton(text="↩ Админ-панель", callback_data="admin_menu")],
         ]),

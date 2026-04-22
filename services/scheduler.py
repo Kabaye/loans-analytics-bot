@@ -366,31 +366,26 @@ async def poll_finkit(bot: Bot) -> None:
             # ── Stage 4: OPI check + EDIT #2 ──
             entries_needing_opi = [e for e in fresh_entries if e.document_id and not e.opi_checked]
             if entries_needing_opi and sent_refs:
-                subs = await get_active_subscriptions("finkit")
-                if subs:
-                    matched_ids = set()
-                    for entry in entries_needing_opi:
-                        for _chat_id, sub in subs:
-                            if sub.matches(entry):
-                                matched_ids.add(entry.id)
-                                break
-                    entries_to_check = [e for e in entries_needing_opi if e.id in matched_ids]
-                    if entries_to_check:
-                        if _opi_checker is None:
-                            _opi_checker = OPIChecker()
-                        log.info("OPI check for %d entries", len(entries_to_check))
-                        for entry in entries_to_check:
-                            result = await _opi_checker.check(entry.document_id)
-                            entry.opi_checked = True
-                            entry.opi_has_debt = result.has_debt
-                            entry.opi_debt_amount = result.debt_amount
-                            entry.opi_full_name = result.full_name
+                sent_ids = {entry_id for entry_id, _chat_id, _msg_id, _subs in sent_refs}
+                entries_to_check = [e for e in entries_needing_opi if e.id in sent_ids]
+                if entries_to_check:
+                    if _opi_checker is None:
+                        _opi_checker = OPIChecker()
+                    log.info("OPI check for %d entries", len(entries_to_check))
+                    for entry in entries_to_check:
+                        result = await _opi_checker.check(entry.document_id)
+                        entry.opi_checked = True
+                        entry.opi_checked_at = datetime.now(timezone.utc)
+                        entry.opi_error = result.error
+                        entry.opi_has_debt = result.has_debt
+                        entry.opi_debt_amount = result.debt_amount
+                        entry.opi_full_name = result.full_name
 
-                        opi_ids = {e.id for e in entries_to_check}
-                        opi_refs = [r for r in sent_refs if r[0] in opi_ids]
-                        if opi_refs:
-                            edited = await update_sent_notifications(bot, fresh_entries, opi_refs, "finkit")
-                            log.info("Edit #2 (OPI): edited %d messages", edited)
+                    opi_ids = {e.id for e in entries_to_check}
+                    opi_refs = [r for r in sent_refs if r[0] in opi_ids]
+                    if opi_refs:
+                        edited = await update_sent_notifications(bot, fresh_entries, opi_refs, "finkit")
+                        log.info("Edit #2 (OPI): edited %d messages", edited)
 
         # Enrich remaining (non-fresh) entries for cache building
         for parser, entries in parser_entries:
@@ -485,13 +480,16 @@ async def poll_zaimis(bot: Bot) -> None:
                     await enrich_entry_from_borrowers(entry)
 
                 # OPI for entries with document_id
-                entries_needing_opi = [e for e in fresh if e.document_id and not e.opi_checked]
+                sent_ids = {entry_id for entry_id, _chat_id, _msg_id, _subs in sent_refs}
+                entries_needing_opi = [e for e in fresh if e.id in sent_ids and e.document_id and not e.opi_checked]
                 if entries_needing_opi:
                     if _opi_checker is None:
                         _opi_checker = OPIChecker()
                     for entry in entries_needing_opi:
                         result = await _opi_checker.check(entry.document_id)
                         entry.opi_checked = True
+                        entry.opi_checked_at = datetime.now(timezone.utc)
+                        entry.opi_error = result.error
                         entry.opi_has_debt = result.has_debt
                         entry.opi_debt_amount = result.debt_amount
                         entry.opi_full_name = result.full_name

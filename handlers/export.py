@@ -20,7 +20,8 @@ from bot.handlers.start import is_allowed
 from bot.models import BorrowEntry
 from bot.services.scheduler import get_parser
 from bot.services.opi_checker import OPIChecker
-from bot.database import lookup_borrower
+from bot.database import lookup_borrower, get_db
+from bot.services.notifier import enrich_entry_from_borrowers
 
 log = logging.getLogger(__name__)
 router = Router(name="export")
@@ -107,28 +108,41 @@ async def _collect_entries(services: list[str], chat_id: int) -> list[dict]:
     all_entries: list[BorrowEntry] = []
 
     for svc in services:
-        parser = get_parser(svc, chat_id)
-        if not parser:
-            log.info("Export: no parser for %s (chat_id=%s)", svc, chat_id)
+        parsers, owned = await _get_export_parsers(svc, chat_id)
+        if not parsers:
+            log.info("Export: no parsers for %s (chat_id=%s)", svc, chat_id)
             continue
 
         try:
-            borrows = await parser.fetch_borrows()
-            if borrows:
-                # PDF enrichment for Finkit
-                if svc == "finkit" and hasattr(parser, "enrich_with_pdf"):
-                    await parser.enrich_with_pdf(borrows)
+            for parser in parsers:
+                try:
+                    borrows = await parser.fetch_borrows()
+                    if borrows:
+                        if svc == "finkit" and hasattr(parser, "enrich_with_pdf"):
+                            await parser.enrich_with_pdf(borrows)
+                        _extend_unique_entries(all_entries, borrows)
+                except Exception as e:
+                    log.warning("Export: failed to fetch borrows for %s: %s", svc, e)
 
-                all_entries.extend(borrows)
-        except Exception as e:
-            log.warning("Export: failed to fetch borrows for %s: %s", svc, e)
+                try:
+                    lend_entries = await parser.fetch_lends()
+                    if lend_entries:
+                        _extend_unique_entries(all_entries, lend_entries)
+                except Exception as e:
+                    log.warning("Export: failed to fetch lends for %s: %s", svc, e)
+        finally:
+            for parser in owned:
+                try:
+                    await parser.close()
+                except Exception:
+                    pass
 
+    # DB enrichment from borrowers + borrower_info
+    for entry in all_entries:
         try:
-            lend_entries = await parser.fetch_lends()
-            if lend_entries:
-                all_entries.extend(lend_entries)
+            await enrich_entry_from_borrowers(entry)
         except Exception as e:
-            log.warning("Export: failed to fetch lends for %s: %s", svc, e)
+            log.warning("Export: borrowers enrichment error for %s: %s", entry.id, e)
 
     # OPI enrichment for entries with document_id
     entries_with_id = [e for e in all_entries if e.document_id]
@@ -141,18 +155,22 @@ async def _collect_entries(services: list[str], chat_id: int) -> list[dict]:
                         opi.check(entry.document_id), timeout=30,
                     )
                     entry.opi_checked = True
+                    entry.opi_checked_at = datetime.now(timezone.utc)
                     if result.error:
                         entry.opi_error = result.error
                         entry.opi_has_debt = None
                     else:
+                        entry.opi_error = None
                         entry.opi_has_debt = result.has_debt
                         entry.opi_debt_amount = result.debt_amount
                         entry.opi_full_name = result.full_name
                 except asyncio.TimeoutError:
                     entry.opi_checked = True
+                    entry.opi_checked_at = datetime.now(timezone.utc)
                     entry.opi_error = "таймаут (30с)"
                 except Exception as ex:
                     entry.opi_checked = True
+                    entry.opi_checked_at = datetime.now(timezone.utc)
                     entry.opi_error = str(ex)
         finally:
             await opi.close()
@@ -176,6 +194,77 @@ async def _collect_entries(services: list[str], chat_id: int) -> list[dict]:
             log.warning("KB enrichment error for %s: %s", entry.id, e)
 
     return [e.to_dict() for e in all_entries]
+
+
+def _extend_unique_entries(target: list[BorrowEntry], entries: list[BorrowEntry]) -> None:
+    seen = {(e.service, e.request_type, e.id) for e in target}
+    for entry in entries:
+        key = (entry.service, entry.request_type, entry.id)
+        if key in seen:
+            continue
+        target.append(entry)
+        seen.add(key)
+
+
+async def _get_export_parsers(service: str, chat_id: int):
+    """Return (parsers, owned_parsers) for export; creates on-demand parsers if scheduler has none."""
+    owned = []
+    if service == "kapusta":
+        existing = get_parser(service, chat_id)
+        if existing:
+            return [existing], owned
+        from bot.parsers.kapusta import KapustaParser
+
+        parser = KapustaParser()
+        if await parser.login():
+            owned.append(parser)
+            return [parser], owned
+        await parser.close()
+        return [], []
+
+    if service == "mongo":
+        from bot.parsers.mongo import MongoParser
+
+        parser = MongoParser()
+        await parser.login()
+        owned.append(parser)
+        return [parser], owned
+
+    if service not in ("finkit", "zaimis"):
+        return [], []
+
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            "SELECT login, password FROM credentials WHERE chat_id = ? AND service = ? ORDER BY id",
+            (chat_id, service),
+        )
+    finally:
+        await db.close()
+
+    parsers = []
+    for row in rows:
+        try:
+            if service == "finkit":
+                from bot.parsers.finkit import FinkitParser
+
+                parser = FinkitParser()
+            else:
+                from bot.parsers.zaimis import ZaimisParser
+
+                parser = ZaimisParser()
+            ok = await parser.login(row["login"], row["password"])
+            if ok:
+                parsers.append(parser)
+                owned.append(parser)
+            else:
+                await parser.close()
+        except Exception:
+            try:
+                await parser.close()
+            except Exception:
+                pass
+    return parsers, owned
 
 
 def _entries_to_csv(entries: list[dict]) -> bytes:

@@ -40,7 +40,7 @@ OPI_CACHE_TTL = timedelta(hours=24)
 
 @dataclass
 class OPIResult:
-    has_debt: bool
+    has_debt: Optional[bool]
     debt_amount: float = 0.0
     full_name: Optional[str] = None
     error: Optional[str] = None
@@ -126,7 +126,7 @@ class OPIChecker:
         # Step 1: get fresh ERIP session (1 API call)
         erip_session_id, terminal_code = await self._get_erip_session()
         if not erip_session_id:
-            return OPIResult(has_debt=False, error="Failed to get ERIP session")
+            return OPIResult(has_debt=None, error="Failed to get ERIP session")
 
         # Step 2: check document_id (1 API call)
         session = await self._get_session()
@@ -157,7 +157,7 @@ class OPIChecker:
                         if attempt < 2:
                             await asyncio.sleep(2)
                             continue
-                        return OPIResult(has_debt=False, error=f"HTTP {resp.status}")
+                        return OPIResult(has_debt=None, error=f"HTTP {resp.status}")
                     data = await resp.json()
                 break
             except (asyncio.CancelledError, asyncio.TimeoutError, aiohttp.ClientError) as e:
@@ -165,10 +165,10 @@ class OPIChecker:
                 if attempt < 2:
                     await asyncio.sleep(2)
                 else:
-                    return OPIResult(has_debt=False, error=str(e))
+                    return OPIResult(has_debt=None, error=str(e))
 
         if data is None:
-            return OPIResult(has_debt=False, error="No response")
+            return OPIResult(has_debt=None, error="No response")
 
         error_code = data.get("error_code")
 
@@ -181,7 +181,7 @@ class OPIChecker:
         if error_code != "0":
             error_text = data.get("error_text", "Unknown error")
             log.warning("OPI check error for %s: %s", document_id, error_text)
-            return OPIResult(has_debt=False, error=error_text)
+            return OPIResult(has_debt=None, error=error_text)
 
         # Has debts
         pay_record = data.get("pay_record", {})

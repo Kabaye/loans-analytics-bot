@@ -1,4 +1,4 @@
-"""Search borrower handler — search by ФИО or ИН + manual add."""
+"""Search borrower handler — search by base or by document ID batch + manual add."""
 from __future__ import annotations
 
 import logging
@@ -26,6 +26,7 @@ router = Router(name="search")
 
 class SearchStates(StatesGroup):
     waiting_query = State()
+    waiting_batch_ids = State()
 
 
 class AddBorrowerStates(StatesGroup):
@@ -43,9 +44,40 @@ BACK_KB = InlineKeyboardMarkup(inline_keyboard=[
 ])
 
 
+def _search_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📚 Поиск по базе", callback_data="search_db")],
+        [InlineKeyboardButton(text="🆔 Поиск по ИН", callback_data="search_opi_batch")],
+        [InlineKeyboardButton(text="➕ Добавить заёмщика", callback_data="add_borrower")],
+        [InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")],
+    ])
+
+
+def _search_nav_kb(include_add: bool = True) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text="📚 Поиск по базе", callback_data="search_db")],
+        [InlineKeyboardButton(text="🆔 Поиск по ИН", callback_data="search_opi_batch")],
+    ]
+    if include_add:
+        buttons.append([InlineKeyboardButton(text="➕ Добавить заёмщика", callback_data="add_borrower")])
+    buttons.append([InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _extract_document_ids(text: str) -> list[str]:
+    ids: list[str] = []
+    seen: set[str] = set()
+    for doc_id in re.findall(r"\b[0-9A-Z]{14}\b", text.upper()):
+        if doc_id in seen:
+            continue
+        seen.add(doc_id)
+        ids.append(doc_id)
+    return ids
+
+
 def _format_card(info: dict) -> str:
     """Format a borrower_info record as a readable card."""
-    lines = [f"<b>📋 Карточка заёмщика</b>"]
+    lines = ["<b>📋 Карточка заёмщика</b>"]
     lines.append(f"\n<b>ИН:</b> <code>{info['document_id']}</code>")
     if info.get("full_name"):
         lines.append(f"<b>ФИО:</b> {info['full_name']}")
@@ -68,18 +100,17 @@ def _format_card(info: dict) -> str:
     if info.get("last_loan_date"):
         lines.append(f"<b>Последний займ:</b> {info['last_loan_date']}")
 
-    # OPI
     if info.get("opi_checked_at"):
         if info.get("opi_has_debt"):
             lines.append(f"\n❌ <b>ОПИ:</b> должен <b>{info.get('opi_debt_amount', 0):.2f}</b> BYN")
             if info.get("opi_full_name"):
                 lines.append(f"  Имя в ОПИ: {info['opi_full_name']}")
         else:
-            lines.append(f"\n✅ <b>ОПИ:</b> нет задолженности")
+            lines.append("\n✅ <b>ОПИ:</b> нет задолженности")
         checked = info["opi_checked_at"][:19].replace("T", " ") if info["opi_checked_at"] else "—"
         lines.append(f"  Проверено: {checked}")
     else:
-        lines.append(f"\n⏳ ОПИ: не проверялось")
+        lines.append("\n⏳ ОПИ: не проверялось")
 
     if info.get("notes"):
         lines.append(f"\n📝 {info['notes']}")
@@ -90,21 +121,55 @@ def _format_card(info: dict) -> str:
     return "\n".join(lines)
 
 
+def _result_card_kb(doc_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Проверить ОПИ", callback_data=f"opi_check:{doc_id}")],
+        [InlineKeyboardButton(text="📚 Поиск по базе", callback_data="search_db")],
+        [InlineKeyboardButton(text="🆔 Поиск по ИН", callback_data="search_opi_batch")],
+        [InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")],
+    ])
+
+
 # --- Search ---
 
 @router.callback_query(F.data == "search_borrower")
 async def cb_search_start(callback: CallbackQuery, state: FSMContext):
     if not await is_allowed(callback.message.chat.id):
         return
-    await state.set_state(SearchStates.waiting_query)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить заёмщика", callback_data="add_borrower")],
-        [InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")],
-    ])
+    await state.clear()
     await callback.message.edit_text(
         "🔍 <b>Поиск заёмщика</b>\n\n"
-        "Введите ФИО или ИН (идентификационный номер):",
-        reply_markup=kb,
+        "Выберите режим поиска:",
+        reply_markup=_search_menu_kb(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "search_db")
+async def cb_search_db(callback: CallbackQuery, state: FSMContext):
+    if not await is_allowed(callback.message.chat.id):
+        return
+    await state.set_state(SearchStates.waiting_query)
+    await callback.message.edit_text(
+        "📚 <b>Поиск по базе</b>\n\n"
+        "Введите ФИО или ИН.\n"
+        "После результата можно сразу вводить следующий запрос — кнопку нажимать не нужно.",
+        reply_markup=_search_nav_kb(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "search_opi_batch")
+async def cb_search_opi_batch(callback: CallbackQuery, state: FSMContext):
+    if not await is_allowed(callback.message.chat.id):
+        return
+    await state.set_state(SearchStates.waiting_batch_ids)
+    await callback.message.edit_text(
+        "🆔 <b>Поиск по ИН</b>\n\n"
+        "Отправьте от 1 до 10 ИН одним сообщением.\n"
+        "Можно в столбик, через пробел или через запятую.\n"
+        "После результата можно сразу отправлять следующую пачку.",
+        reply_markup=_search_nav_kb(include_add=False),
         parse_mode="HTML",
     )
 
@@ -122,52 +187,95 @@ async def msg_search_query(message: Message, state: FSMContext):
     results = await search_borrower_info(query, limit=10)
 
     if not results:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="search_borrower")],
-            [InlineKeyboardButton(text="➕ Добавить заёмщика", callback_data="add_borrower")],
-            [InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")],
-        ])
         await message.answer(
             f"🔍 По запросу «{query}» ничего не найдено.",
-            reply_markup=kb,
+            reply_markup=_search_nav_kb(),
             parse_mode="HTML",
         )
         return
 
     if len(results) == 1:
-        # Show full card
-        await state.clear()
         info = results[0]
-        text = _format_card(info)
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(
-                text="🔄 Проверить ОПИ",
-                callback_data=f"opi_check:{info['document_id']}",
-            )],
-            [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="search_borrower")],
-            [InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")],
-        ])
-        await message.answer(text, reply_markup=kb, parse_mode="HTML")
+        await message.answer(
+            _format_card(info),
+            reply_markup=_result_card_kb(info["document_id"]),
+            parse_mode="HTML",
+        )
         return
 
-    # Multiple results — show list
-    await state.clear()
     lines = [f"🔍 Найдено <b>{len(results)}</b> результатов:\n"]
     buttons = []
-    for i, r in enumerate(results):
-        name = r.get("full_name") or "—"
-        doc = r["document_id"]
-        status = r.get("loan_status") or ""
+    for i, row in enumerate(results):
+        name = row.get("full_name") or "—"
+        doc = row["document_id"]
+        status = row.get("loan_status") or ""
         lines.append(f"{i+1}. {name} / <code>{doc}</code> {status}")
-        buttons.append([InlineKeyboardButton(
-            text=f"{i+1}. {name[:30]}",
-            callback_data=f"bi_view:{doc}",
-        )])
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{i+1}. {name[:30]}",
+                callback_data=f"bi_view:{doc}",
+            )
+        ])
 
-    buttons.append([InlineKeyboardButton(text="🔍 Новый поиск", callback_data="search_borrower")])
+    buttons.append([InlineKeyboardButton(text="📚 Поиск по базе", callback_data="search_db")])
+    buttons.append([InlineKeyboardButton(text="🆔 Поиск по ИН", callback_data="search_opi_batch")])
     buttons.append([InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")])
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await message.answer("\n".join(lines), reply_markup=kb, parse_mode="HTML")
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML",
+    )
+
+
+@router.message(SearchStates.waiting_batch_ids)
+async def msg_search_batch_ids(message: Message, state: FSMContext):
+    if not await is_allowed(message.chat.id):
+        return
+
+    doc_ids = _extract_document_ids(message.text or "")
+    if not doc_ids:
+        await message.answer(
+            "❌ Не нашёл ни одного ИН. Отправьте от 1 до 10 ИН по 14 символов.",
+            reply_markup=_search_nav_kb(include_add=False),
+            parse_mode="HTML",
+        )
+        return
+    if len(doc_ids) > 10:
+        await message.answer(
+            "❌ Слишком много ИН за раз. Отправьте не больше 10.",
+            reply_markup=_search_nav_kb(include_add=False),
+            parse_mode="HTML",
+        )
+        return
+
+    checker = OPIChecker()
+    lines = ["🆔 <b>Проверка по ИН</b>", ""]
+    try:
+        for idx, doc_id in enumerate(doc_ids, start=1):
+            info = await lookup_borrower_info(doc_id)
+            result = await checker.check(doc_id)
+
+            lines.append(f"{idx}. <code>{doc_id}</code>")
+            full_name = (info or {}).get("full_name") or result.full_name
+            if full_name:
+                lines.append(full_name)
+            if info and info.get("loan_status"):
+                lines.append(f"Статус: {info['loan_status']}")
+            if result.error:
+                lines.append("⚠️ ОПИ: ошибка проверки")
+            elif result.has_debt:
+                lines.append(f"❌ ОПИ: долг {result.debt_amount:.2f} BYN")
+            else:
+                lines.append("✅ ОПИ: нет задолженности")
+            lines.append("")
+    finally:
+        await checker.close()
+
+    await message.answer(
+        "\n".join(lines).strip(),
+        reply_markup=_search_nav_kb(include_add=False),
+        parse_mode="HTML",
+    )
 
 
 @router.callback_query(F.data.startswith("bi_view:"))
@@ -180,16 +288,11 @@ async def cb_view_card(callback: CallbackQuery):
         await callback.answer("Карточка не найдена", show_alert=True)
         return
 
-    text = _format_card(info)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="🔄 Проверить ОПИ",
-            callback_data=f"opi_check:{doc_id}",
-        )],
-        [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="search_borrower")],
-        [InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")],
-    ])
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await callback.message.edit_text(
+        _format_card(info),
+        reply_markup=_result_card_kb(doc_id),
+        parse_mode="HTML",
+    )
 
 
 @router.callback_query(F.data.startswith("opi_check:"))
@@ -205,7 +308,6 @@ async def cb_opi_check(callback: CallbackQuery):
     finally:
         await checker.close()
 
-    # Reload card after OPI check
     info = await lookup_borrower_info(doc_id)
     if not info:
         await callback.answer("Ошибка: карточка не найдена", show_alert=True)
@@ -215,15 +317,11 @@ async def cb_opi_check(callback: CallbackQuery):
     if result.error:
         text += f"\n\n⚠️ Ошибка OPI: {result.error}"
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="🔄 Проверить ОПИ",
-            callback_data=f"opi_check:{doc_id}",
-        )],
-        [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="search_borrower")],
-        [InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")],
-    ])
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await callback.message.edit_text(
+        text,
+        reply_markup=_result_card_kb(doc_id),
+        parse_mode="HTML",
+    )
 
 
 # --- Add borrower ---
@@ -253,17 +351,11 @@ async def msg_add_document_id(message: Message, state: FSMContext):
         )
         return
 
-    # Check if already exists
     existing = await lookup_borrower_info(doc_id)
     if existing:
-        text = _format_card(existing)
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="search_borrower")],
-            [InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")],
-        ])
         await message.answer(
-            f"ℹ️ Заёмщик с таким ИН уже есть в базе:\n\n{text}",
-            reply_markup=kb,
+            f"ℹ️ Заёмщик с таким ИН уже есть в базе:\n\n{_format_card(existing)}",
+            reply_markup=_search_nav_kb(include_add=False),
             parse_mode="HTML",
         )
         await state.clear()
@@ -293,11 +385,10 @@ async def msg_add_full_name(message: Message, state: FSMContext):
     buttons = [[InlineKeyboardButton(text=s, callback_data=f"add_status:{s}")] for s in STATUS_OPTIONS]
     buttons.append([InlineKeyboardButton(text="⏩ Пропустить", callback_data="add_status:skip")])
     buttons.append([InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")])
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     await message.answer(
         f"ФИО: <b>{name}</b>\n\nВыберите статус по займам:",
-        reply_markup=kb,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode="HTML",
     )
 
@@ -313,11 +404,10 @@ async def cb_add_status(callback: CallbackQuery, state: FSMContext):
     buttons = [[InlineKeyboardButton(text=s, callback_data=f"add_sum:{s}")] for s in SUM_OPTIONS]
     buttons.append([InlineKeyboardButton(text="⏩ Пропустить", callback_data="add_sum:skip")])
     buttons.append([InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")])
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     await callback.message.edit_text(
         "Выберите категорию сумм:",
-        reply_markup=kb,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode="HTML",
     )
 
@@ -333,7 +423,6 @@ async def cb_add_sum(callback: CallbackQuery, state: FSMContext):
     full_name = data["full_name"]
     loan_status = data.get("loan_status")
 
-    # Save to DB
     await upsert_borrower_info(
         document_id=doc_id,
         full_name=full_name,
@@ -342,7 +431,6 @@ async def cb_add_sum(callback: CallbackQuery, state: FSMContext):
         source="manual",
     )
 
-    # Auto-check OPI
     await callback.message.edit_text("⏳ Сохраняю и проверяю ОПИ...", parse_mode="HTML")
 
     checker = OPIChecker()
@@ -353,12 +441,12 @@ async def cb_add_sum(callback: CallbackQuery, state: FSMContext):
     finally:
         await checker.close()
 
-    # Show result card
     info = await lookup_borrower_info(doc_id)
     text = _format_card(info) if info else f"✅ Заёмщик {doc_id} сохранён"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔍 Поиск", callback_data="search_borrower")],
+        [InlineKeyboardButton(text="📚 Поиск по базе", callback_data="search_db")],
+        [InlineKeyboardButton(text="🆔 Поиск по ИН", callback_data="search_opi_batch")],
         [InlineKeyboardButton(text="➕ Ещё добавить", callback_data="add_borrower")],
         [InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")],
     ])

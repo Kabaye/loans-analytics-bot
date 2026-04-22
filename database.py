@@ -106,6 +106,16 @@ async def init_db() -> None:
             active_hour_start   INTEGER DEFAULT 0,
             active_hour_end     INTEGER DEFAULT 24
         );
+
+        CREATE TABLE IF NOT EXISTS seen_entries (
+            service             TEXT NOT NULL,
+            entry_id            TEXT NOT NULL,
+            first_seen          TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (service, entry_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_seen_entries_service_first_seen
+            ON seen_entries(service, first_seen);
         """)
 
         # Migration: add first_name/last_name to users
@@ -546,6 +556,8 @@ async def upsert_borrower_from_investment(
     total_invested: float | None = None,
 ) -> None:
     """Upsert borrower mapping + investment stats from investment history data."""
+    if full_name:
+        full_name = full_name.upper()
     db = await get_db()
     try:
         await db.execute(
@@ -582,6 +594,39 @@ async def get_stale_opi_documents(max_age_days: int = 3) -> list[dict]:
                       OR opi_checked_at < datetime('now', ?))
                ORDER BY opi_checked_at ASC NULLS FIRST""",
             (f"-{max_age_days} days",),
+        )
+        return [dict(r) for r in rows]
+    finally:
+        await db.close()
+
+
+async def get_missing_opi_candidates(min_age_days: int = 10, limit: int = 200) -> list[dict]:
+    """Return borrowers with a known document_id but no OPI data after enough time has passed."""
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            """
+            SELECT
+                b.document_id,
+                MAX(b.full_name) AS full_name,
+                GROUP_CONCAT(DISTINCT b.service) AS services,
+                MIN(b.first_seen) AS first_seen,
+                MAX(b.last_seen) AS last_seen,
+                SUM(COALESCE(b.total_loans, 0)) AS total_loans,
+                SUM(COALESCE(b.total_invested, 0)) AS total_invested,
+                MAX(bi.loan_status) AS loan_status,
+                MAX(bi.source) AS source
+            FROM borrowers b
+            LEFT JOIN borrower_info bi ON bi.document_id = b.document_id
+            WHERE b.document_id IS NOT NULL
+              AND LENGTH(b.document_id) = 14
+              AND (bi.opi_checked_at IS NULL OR bi.opi_checked_at = '')
+              AND b.first_seen <= datetime('now', ?)
+            GROUP BY b.document_id
+            ORDER BY MIN(b.first_seen) ASC, b.document_id ASC
+            LIMIT ?
+            """,
+            (f"-{min_age_days} days", limit),
         )
         return [dict(r) for r in rows]
     finally:

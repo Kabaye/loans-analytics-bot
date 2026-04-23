@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import html
+import re
 from functools import lru_cache
 from pathlib import Path
 
@@ -32,11 +34,43 @@ def _version_key(value: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
+def _fallback_patch_note() -> str:
+    return f"<b>Обновление {html.escape(config.APP_VERSION)}</b>"
+
+
+def _render_inline_markdown(text: str) -> str:
+    rendered = html.escape(text)
+    rendered = re.sub(r"`([^`]+)`", r"<code>\1</code>", rendered)
+    rendered = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", rendered)
+    return rendered
+
+
+def _render_patch_note_for_telegram(text: str) -> str:
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            lines.append("")
+            continue
+        if line.startswith("## "):
+            lines.append(f"<b>{html.escape(line[3:].strip())}</b>")
+            continue
+        if line.startswith("# "):
+            lines.append(f"<b>{html.escape(line[2:].strip())}</b>")
+            continue
+        if line.startswith("- "):
+            lines.append(f"• {_render_inline_markdown(line[2:].strip())}")
+            continue
+        lines.append(_render_inline_markdown(line))
+    rendered = "\n".join(lines).strip()
+    return rendered or _fallback_patch_note()
+
+
 @lru_cache(maxsize=1)
 def _load_patch_notes_history() -> list[tuple[str, str]]:
     patch_dir = Path(config.PATCH_NOTES_DIR)
     if not patch_dir.exists():
-        return [(config.APP_VERSION, f"Обновление {config.APP_VERSION}")]
+        return [(config.APP_VERSION, _fallback_patch_note())]
 
     items: list[tuple[str, str]] = []
     for path in patch_dir.glob("*.md"):
@@ -46,10 +80,10 @@ def _load_patch_notes_history() -> list[tuple[str, str]]:
         except OSError:
             continue
         if text:
-            items.append((version, text))
+            items.append((version, _render_patch_note_for_telegram(text)))
 
     if not items:
-        return [(config.APP_VERSION, f"Обновление {config.APP_VERSION}")]
+        return [(config.APP_VERSION, _fallback_patch_note())]
 
     items.sort(key=lambda item: _version_key(item[0]))
     return items

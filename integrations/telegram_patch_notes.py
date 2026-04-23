@@ -44,7 +44,12 @@ class PatchNotesMiddleware(BaseMiddleware):
 
         try:
             for note in patch_notes:
-                await bot.send_message(chat_id, note, disable_web_page_preview=True)
+                await bot.send_message(
+                    chat_id,
+                    note,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
             await mark_patch_notes_seen(chat_id)
         except Exception:
             return result

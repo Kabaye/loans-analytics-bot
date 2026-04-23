@@ -150,6 +150,15 @@ async def init_db() -> None:
             updated_at          TEXT DEFAULT (datetime('now'))
         );
 
+        CREATE TABLE IF NOT EXISTS api_change_alerts (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            service             TEXT NOT NULL,
+            title               TEXT NOT NULL,
+            details             TEXT,
+            sample_json         TEXT,
+            created_at          TEXT DEFAULT (datetime('now'))
+        );
+
         CREATE TABLE IF NOT EXISTS overdue_cases (
             id                  INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id             INTEGER NOT NULL,
@@ -206,6 +215,20 @@ async def init_db() -> None:
             FOREIGN KEY (chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS credential_creditor_profiles (
+            chat_id             INTEGER NOT NULL,
+            credential_id       INTEGER NOT NULL,
+            full_name           TEXT,
+            address             TEXT,
+            phone               TEXT,
+            email               TEXT,
+            created_at          TEXT DEFAULT (datetime('now')),
+            updated_at          TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (chat_id, credential_id),
+            FOREIGN KEY (chat_id) REFERENCES users(chat_id) ON DELETE CASCADE,
+            FOREIGN KEY (credential_id) REFERENCES credentials(id) ON DELETE CASCADE
+        );
+
         CREATE TABLE IF NOT EXISTS user_signature_assets (
             chat_id             INTEGER PRIMARY KEY,
             file_path           TEXT NOT NULL,
@@ -258,6 +281,15 @@ async def init_db() -> None:
             await db.execute("ALTER TABLE credentials ADD COLUMN label TEXT")
         except Exception:
             pass
+
+        await db.execute("""
+            INSERT OR IGNORE INTO credential_creditor_profiles (
+                chat_id, credential_id, full_name, address, phone, email, created_at, updated_at
+            )
+            SELECT c.chat_id, c.id, cp.full_name, cp.address, cp.phone, cp.email, datetime('now'), datetime('now')
+            FROM credentials c
+            JOIN creditor_profiles cp ON cp.chat_id = c.chat_id
+        """)
 
         # Migration: change credentials UNIQUE from (chat_id, service) to (chat_id, service, login)
         try:
@@ -657,6 +689,43 @@ async def delete_credential_session(credential_id: int) -> None:
         await db.close()
 
 
+async def list_user_credentials(chat_id: int, services: tuple[str, ...] | None = None) -> list[dict]:
+    db = await get_db()
+    try:
+        params: list[object] = [chat_id]
+        where = "WHERE chat_id = ?"
+        if services:
+            placeholders = ",".join("?" for _ in services)
+            where += f" AND service IN ({placeholders})"
+            params.extend(services)
+        rows = await db.execute_fetchall(
+            f"""
+            SELECT id, chat_id, service, login, password, label
+            FROM credentials
+            {where}
+            ORDER BY service, id
+            """,
+            params,
+        )
+        return [dict(r) for r in rows]
+    finally:
+        await db.close()
+
+
+async def get_credential_by_id(credential_id: int, chat_id: int | None = None) -> dict | None:
+    db = await get_db()
+    try:
+        sql = "SELECT id, chat_id, service, login, password, label FROM credentials WHERE id = ?"
+        params: list[object] = [credential_id]
+        if chat_id is not None:
+            sql += " AND chat_id = ?"
+            params.append(chat_id)
+        rows = await db.execute_fetchall(sql, params)
+        return dict(rows[0]) if rows else None
+    finally:
+        await db.close()
+
+
 async def get_json_schema_state(service: str) -> dict[str, list[str]] | None:
     db = await get_db()
     try:
@@ -684,6 +753,74 @@ async def save_json_schema_state(service: str, schema: dict[str, list[str]]) -> 
             """,
             (service, json.dumps(schema, ensure_ascii=False, sort_keys=True)),
         )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def save_api_change_alert(
+    service: str,
+    title: str,
+    details: str | None = None,
+    sample_json: str | None = None,
+) -> int:
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            """
+            INSERT INTO api_change_alerts (service, title, details, sample_json)
+            VALUES (?, ?, ?, ?)
+            """,
+            (service, title, details, sample_json),
+        )
+        await db.commit()
+        return int(cursor.lastrowid)
+    finally:
+        await db.close()
+
+
+async def list_api_change_alerts(limit: int = 50) -> list[dict]:
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            """
+            SELECT *
+            FROM api_change_alerts
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [dict(r) for r in rows]
+    finally:
+        await db.close()
+
+
+async def get_api_change_alert(alert_id: int) -> dict | None:
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            "SELECT * FROM api_change_alerts WHERE id = ?",
+            (alert_id,),
+        )
+        return dict(rows[0]) if rows else None
+    finally:
+        await db.close()
+
+
+async def delete_api_change_alert(alert_id: int) -> None:
+    db = await get_db()
+    try:
+        await db.execute("DELETE FROM api_change_alerts WHERE id = ?", (alert_id,))
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def clear_api_change_alerts() -> None:
+    db = await get_db()
+    try:
+        await db.execute("DELETE FROM api_change_alerts")
         await db.commit()
     finally:
         await db.close()
@@ -1124,6 +1261,53 @@ async def get_creditor_profile(chat_id: int) -> dict | None:
             (chat_id,),
         )
         return dict(rows[0]) if rows else None
+    finally:
+        await db.close()
+
+
+async def get_credential_creditor_profile(chat_id: int, credential_id: int) -> dict | None:
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            """
+            SELECT ccp.*, c.service, c.login, c.label
+            FROM credential_creditor_profiles ccp
+            JOIN credentials c ON c.id = ccp.credential_id
+            WHERE ccp.chat_id = ? AND ccp.credential_id = ?
+            """,
+            (chat_id, credential_id),
+        )
+        return dict(rows[0]) if rows else None
+    finally:
+        await db.close()
+
+
+async def upsert_credential_creditor_profile(
+    chat_id: int,
+    credential_id: int,
+    *,
+    full_name: str | None,
+    address: str | None,
+    phone: str | None,
+    email: str | None,
+) -> None:
+    db = await get_db()
+    try:
+        await db.execute(
+            """
+            INSERT INTO credential_creditor_profiles (
+                chat_id, credential_id, full_name, address, phone, email, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(chat_id, credential_id) DO UPDATE SET
+                full_name = excluded.full_name,
+                address = excluded.address,
+                phone = excluded.phone,
+                email = excluded.email,
+                updated_at = datetime('now')
+            """,
+            (chat_id, credential_id, full_name, address, phone, email),
+        )
+        await db.commit()
     finally:
         await db.close()
 

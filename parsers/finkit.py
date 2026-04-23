@@ -27,6 +27,17 @@ NAME_ID_RE = re.compile(
     r"Я,\s+([А-ЯЁA-Z]+(?:\s+[А-ЯЁA-Z]+){2}),\s+идентификационный\s+номер\s*([0-9A-Z]+)",
     re.IGNORECASE | re.UNICODE | re.MULTILINE | re.DOTALL,
 )
+NAME_ID_FALLBACK_RE = re.compile(
+    r"([А-ЯЁA-Z]+(?:\s+[А-ЯЁA-Z]+){2}),\s+идентификационный\s+номер\s*([0-9A-Z]+)",
+    re.IGNORECASE | re.UNICODE | re.MULTILINE | re.DOTALL,
+)
+CLAIM_DEBTOR_BLOCK_RE = re.compile(
+    r"Должник:\s*(?P<name>[^\n]+)\s*\n"
+    r"\(заемщик по договору займа\)\s*(?P<address>.+?)\s*\n"
+    r"тел\.:?\s*(?P<phone>[^\n]+)\s*\n"
+    r"(?:эл\.почта|эл\. почта|эл\.почта:|эл\. почта:):?\s*(?P<email>[^\n]+)",
+    re.IGNORECASE | re.UNICODE | re.MULTILINE | re.DOTALL,
+)
 
 BORROWER_WORK_MAP = {
     "worker": "Рабочий / служащий",
@@ -187,6 +198,101 @@ class FinkitParser(BaseParser):
         except Exception as e:
             log.warning("Finkit investment detail error %s: %s", investment_id, e)
             return None
+
+    async def fetch_contract_pdf(self, contract_url: str) -> bytes | None:
+        if not self._authenticated or not contract_url:
+            return None
+
+        session = await self._get_session()
+        try:
+            async with session.get(contract_url, headers=self._api_headers()) as resp:
+                if resp.status in (401, 403):
+                    self._authenticated = False
+                    self._needs_reauth = True
+                    return None
+                if resp.status != 200:
+                    log.warning("Finkit contract PDF fetch failed: %s", resp.status)
+                    return None
+                return await resp.read()
+        except Exception as e:
+            log.warning("Finkit contract PDF error: %s", e)
+            return None
+
+    async def fetch_claims(self, investment_id: str, create_if_missing: bool = False) -> list[dict]:
+        if not self._authenticated or not investment_id:
+            return []
+
+        session = await self._get_session()
+        csrf_token = self._session_cookies.get("csrftoken") or self._csrf_token or ""
+        headers = {
+            **self._api_headers(),
+            "Content-Type": "application/json",
+            "Origin": "https://finkit.by",
+            "Referer": "https://finkit.by/",
+            "x-csrftoken": csrf_token,
+        }
+        method = session.post if create_if_missing else session.get
+        kwargs = {"json": {}} if create_if_missing else {}
+
+        try:
+            async with method(
+                f"https://api-p2p.finkit.by/user/investments/{investment_id}/claims/",
+                headers=headers,
+                **kwargs,
+            ) as resp:
+                if resp.status in (401, 403):
+                    self._authenticated = False
+                    self._needs_reauth = True
+                    log.warning("Finkit claims auth failed: %s", resp.status)
+                    return []
+                if resp.status not in (200, 201):
+                    log.warning("Finkit claims request failed %s: %s", investment_id, resp.status)
+                    return []
+                data = await resp.json()
+                return data if isinstance(data, list) else []
+        except Exception as e:
+            log.warning("Finkit claims request error %s: %s", investment_id, e)
+            return []
+
+    @staticmethod
+    def parse_borrower_from_contract_pdf(pdf_bytes: bytes) -> tuple[str | None, str | None]:
+        try:
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+            matches = list(NAME_ID_RE.finditer(text))
+            if not matches:
+                matches = list(NAME_ID_FALLBACK_RE.finditer(text))
+            if not matches:
+                return None, None
+            borrower_name = matches[0].group(1).strip()
+            borrower_document_id = matches[0].group(2).strip()
+            return borrower_name, borrower_document_id
+        except Exception as e:
+            log.warning("Finkit contract PDF parse error: %s", e)
+            return None, None
+
+    @staticmethod
+    def parse_claim_document_pdf(pdf_bytes: bytes) -> dict[str, str | None]:
+        result = {
+            "debtor_name": None,
+            "debtor_address": None,
+            "debtor_phone": None,
+            "debtor_email": None,
+        }
+        try:
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                text = "\n".join(page.extract_text() or "" for page in pdf.pages[:4])
+            match = CLAIM_DEBTOR_BLOCK_RE.search(text)
+            if not match:
+                return result
+            result["debtor_name"] = " ".join(match.group("name").split()).strip()
+            result["debtor_address"] = " ".join(match.group("address").replace("\n", " ").split()).strip(" ,")
+            result["debtor_phone"] = " ".join(match.group("phone").split()).strip()
+            result["debtor_email"] = " ".join(match.group("email").split()).strip()
+            return result
+        except Exception as e:
+            log.warning("Finkit claim PDF parse error: %s", e)
+            return result
 
     async def fetch_borrows(self) -> list[BorrowEntry]:
         if not self._authenticated:

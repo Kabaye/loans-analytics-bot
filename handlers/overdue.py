@@ -18,16 +18,22 @@ from aiogram.types import (
 
 from bot import config
 from bot.database import (
-    get_creditor_profile,
+    get_credential_by_id,
+    get_credential_creditor_profile,
     get_overdue_case,
     get_user_signature_asset,
     list_overdue_cases,
+    list_user_credentials,
     save_generated_document,
     save_user_signature_asset,
-    upsert_creditor_profile,
+    upsert_credential_creditor_profile,
+    upsert_overdue_case,
     update_overdue_case_contacts,
 )
 from bot.handlers.start import is_allowed
+from bot.models import UserCredentials
+from bot.services.postal_lookup import lookup_belarus_zip
+from bot.services.scheduler import _ensure_finkit_parser
 from bot.services.debtor_documents import (
     build_sms_text,
     collect_claim_missing_fields,
@@ -68,14 +74,9 @@ def _menu_kb(has_cases: bool = True) -> InlineKeyboardMarkup:
 def _case_list_kb(cases: list[dict]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for case in cases[:20]:
-        label = case.get("loan_number") or case.get("external_id") or f"case#{case['id']}"
-        due = case.get("total_due")
-        due_text = f"{float(due):.2f} BYN" if due is not None else "—"
-        days = case.get("days_overdue") or 0
-        icon = {"finkit": "🔵", "zaimis": "🟪", "kapusta": "🥬"}.get(case.get("service"), "📄")
         rows.append([
             InlineKeyboardButton(
-                text=f"{icon} {label} • {days}д • {due_text}",
+                text=_case_button_label(case),
                 callback_data=f"overdue_case_{case['id']}",
             )
         ])
@@ -93,7 +94,7 @@ def _case_actions_kb(case_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📄 Сформировать претензию", callback_data=f"overdue_claim_{case_id}")],
         [InlineKeyboardButton(text="🧾 Данные API", callback_data=f"overdue_raw_{case_id}")],
         [InlineKeyboardButton(text="📝 Данные должника", callback_data=f"overdue_edit_{case_id}")],
-        [InlineKeyboardButton(text="👤 Мой профиль", callback_data="overdue_profile")],
+        [InlineKeyboardButton(text="👤 Профиль займодавца", callback_data=f"overdue_profile_case_{case_id}")],
         [InlineKeyboardButton(text="✍️ Подпись", callback_data="overdue_signature")],
         [InlineKeyboardButton(text="↩ К списку просрочек", callback_data="overdue_cases")],
     ])
@@ -110,14 +111,204 @@ def _display_html(value: object | None) -> str:
     return escape(_display(value))
 
 
+def _money(value: object | None) -> str:
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _short_date(value: object | None) -> str:
+    text = _display(value)
+    if text == "—":
+        return text
+    return text[8:10] + "." + text[5:7] if len(text) >= 10 and text[4] == "-" else text
+
+
+def _borrower_short_label(case: dict) -> str:
+    full_name = (case.get("full_name") or case.get("display_name") or "").strip()
+    if not full_name:
+        return case.get("loan_number") or case.get("external_id") or f"case#{case['id']}"
+    parts = [part for part in full_name.split() if part]
+    if len(parts) == 1:
+        return parts[0]
+    surname = parts[0].title()
+    initials = "".join(f"{part[0]}." for part in parts[1:] if part)
+    return f"{surname} {initials}".strip()
+
+
+def _case_button_label(case: dict) -> str:
+    icon = {"finkit": "🔵", "zaimis": "🟪", "kapusta": "🥬"}.get(case.get("service"), "📄")
+    due_date = _short_date(case.get("due_at"))
+    amount = _money(case.get("amount"))
+    total_due = _money(case.get("total_due"))
+    return f"{icon} {_borrower_short_label(case)} • {due_date} • {amount} → {total_due}"
+
+
+def _parse_raw(case: dict) -> dict:
+    raw = case.get("raw_data")
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def _case_notes(case: dict) -> list[str]:
+    payload = _parse_raw(case)
+    detail = payload.get("detail") or {}
+    order = payload.get("order") or {}
+    notes: list[str] = []
+
+    actual_payments = detail.get("actual_payments") or order.get("actual_payments") or []
+    paid_total = 0.0
+    for payment in actual_payments:
+        try:
+            paid_total += float(payment.get("principal") or 0)
+            paid_total += float(payment.get("percent") or 0)
+            paid_total += float(payment.get("fine") or 0)
+        except (TypeError, ValueError):
+            continue
+    amount = case.get("amount")
+    principal = case.get("principal_outstanding")
+    if paid_total > 0 or (
+        isinstance(amount, (int, float)) and isinstance(principal, (int, float)) and principal < amount
+    ):
+        partial_value = _money(paid_total) if paid_total > 0 else "да"
+        notes.append(f"<b>Частичное погашение:</b> {_display_html(partial_value)}")
+
+    claim_sent_at = (
+        detail.get("latest_claim_sent_at")
+        or next((claim.get("sent_at") for claim in detail.get("claims") or [] if claim.get("sent_at")), None)
+    )
+    if claim_sent_at:
+        notes.append(f"<b>Претензия уже отправлялась:</b> {_display_html(claim_sent_at)}")
+
+    return notes
+
+
+def _service_icon(service: str | None) -> str:
+    return {"finkit": "🔵", "zaimis": "🟪", "kapusta": "🥬"}.get(service or "", "📄")
+
+
+def _credential_label(credential: dict) -> str:
+    service = _service_icon(credential.get("service"))
+    label = credential.get("label")
+    login = credential.get("login") or "—"
+    return f"{service} {login}" + (f" ({label})" if label else "")
+
+
+async def _get_case_creditor_profile(case: dict) -> dict | None:
+    credential_id = case.get("credential_id")
+    if not credential_id:
+        return None
+    return await get_credential_creditor_profile(case["chat_id"], int(credential_id))
+
+
+async def _show_credential_profile_message(callback: CallbackQuery, credential_id: int) -> None:
+    credential = await get_credential_by_id(credential_id, callback.message.chat.id)
+    if not credential:
+        await callback.answer("Логин не найден", show_alert=True)
+        return
+    profile = await get_credential_creditor_profile(callback.message.chat.id, credential_id)
+    lines = [f"👤 <b>Профиль займодавца</b>", "", f"<b>Логин:</b> {_display_html(_credential_label(credential))}", ""]
+    if not profile:
+        lines.append("Пока не заполнен.")
+    else:
+        lines.extend([
+            f"<b>ФИО / название:</b> {_display_html(profile.get('full_name'))}",
+            f"<b>Адрес:</b> {_display_html(profile.get('address'))}",
+            f"<b>Телефон:</b> {_display_html(profile.get('phone'))}",
+            f"<b>Email:</b> {_display_html(profile.get('email'))}",
+        ])
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Заполнить / обновить", callback_data=f"overdue_profile_edit_{credential_id}")],
+        [InlineKeyboardButton(text="↩ К профилям", callback_data="overdue_profile")],
+    ])
+    await callback.message.edit_text("\n".join(lines), reply_markup=kb, parse_mode="HTML")
+
+
+async def _enrich_finkit_case_from_claims(case: dict) -> dict:
+    if case.get("service") != "finkit" or not case.get("credential_id"):
+        return case
+    if case.get("borrower_address") and case.get("borrower_zip") and case.get("document_id"):
+        return case
+
+    credential_row = await get_credential_by_id(int(case["credential_id"]), case["chat_id"])
+    if not credential_row:
+        return case
+    cred = UserCredentials(
+        id=int(credential_row["id"]),
+        chat_id=int(credential_row["chat_id"]),
+        service=str(credential_row["service"]),
+        login=str(credential_row["login"]),
+        password=str(credential_row["password"]),
+    )
+    parser = await _ensure_finkit_parser(cred)
+    if parser is None:
+        return case
+
+    payload = _parse_raw(case)
+    detail = payload.get("detail") or {}
+    claims = detail.get("claims") or []
+    if not claims:
+        claims = await parser.fetch_claims(str(case.get("external_id") or ""), create_if_missing=True)
+        if claims:
+            detail["claims"] = claims
+            payload["detail"] = detail
+            await upsert_overdue_case(
+                chat_id=int(case["chat_id"]),
+                credential_id=int(case["credential_id"]),
+                service="finkit",
+                external_id=str(case["external_id"]),
+                raw_data=payload,
+            )
+
+    claim_document_url = next((claim.get("document_url") for claim in claims if claim.get("document_url")), None)
+    if claim_document_url:
+        claim_pdf_bytes = await parser.fetch_contract_pdf(claim_document_url)
+        if claim_pdf_bytes:
+            claim_data = parser.parse_claim_document_pdf(claim_pdf_bytes)
+            zipcode = case.get("borrower_zip") or await lookup_belarus_zip(claim_data.get("debtor_address"))
+            await update_overdue_case_contacts(
+                int(case["id"]),
+                int(case["chat_id"]),
+                borrower_address=claim_data.get("debtor_address"),
+                borrower_zip=zipcode,
+                borrower_phone=claim_data.get("debtor_phone"),
+                borrower_email=claim_data.get("debtor_email"),
+            )
+
+    if not case.get("document_id") and case.get("contract_url"):
+        contract_pdf = await parser.fetch_contract_pdf(str(case["contract_url"]))
+        if contract_pdf:
+            pdf_full_name, pdf_document_id = parser.parse_borrower_from_contract_pdf(contract_pdf)
+            if pdf_full_name or pdf_document_id:
+                await upsert_overdue_case(
+                    chat_id=int(case["chat_id"]),
+                    credential_id=int(case["credential_id"]),
+                    service="finkit",
+                    external_id=str(case["external_id"]),
+                    full_name=pdf_full_name,
+                    document_id=pdf_document_id,
+                    raw_data=payload,
+                )
+
+    refreshed = await get_overdue_case(int(case["id"]), int(case["chat_id"]))
+    return refreshed or case
+
+
 def _format_case_text(case: dict) -> str:
+    voluntary_days = case.get("voluntary_term_days")
     lines = [
         "⚖️ <b>Просроченный кейс</b>",
         "",
         f"<b>Сервис:</b> {_display_html(case.get('service'))}",
         f"<b>Аккаунт:</b> {_display_html(case.get('account_label') or case.get('credential_label') or case.get('credential_login'))}",
         f"<b>Займ / договор:</b> {_display_html(case.get('loan_number') or case.get('external_id'))}",
-        f"<b>Статус:</b> {_display_html(case.get('status'))}",
         f"<b>Дней просрочки:</b> {_display_html(case.get('days_overdue'))}",
         f"<b>Дата выдачи:</b> {_display_html(case.get('issued_at'))}",
         f"<b>Срок возврата:</b> {_display_html(case.get('due_at'))}",
@@ -129,13 +320,16 @@ def _format_case_text(case: dict) -> str:
         f"<b>Телефон:</b> {_display_html(case.get('borrower_phone'))}",
         f"<b>Email:</b> {_display_html(case.get('borrower_email'))}",
         "",
-        f"<b>Сумма займа:</b> {_display_html(case.get('amount'))}",
-        f"<b>Основной долг:</b> {_display_html(case.get('principal_outstanding'))}",
-        f"<b>Проценты:</b> {_display_html(case.get('accrued_percent'))}",
-        f"<b>Пеня:</b> {_display_html(case.get('fine_outstanding'))}",
-        f"<b>Итого:</b> {_display_html(case.get('total_due'))}",
-        f"<b>Срок добровольного погашения:</b> {_display_html(case.get('voluntary_term_days'))} дн.",
+        f"<b>Сумма займа:</b> {_money(case.get('amount'))}",
+        f"<b>Основной долг:</b> {_money(case.get('principal_outstanding'))}",
+        f"<b>Проценты:</b> {_money(case.get('accrued_percent'))}",
+        f"<b>Пеня:</b> {_money(case.get('fine_outstanding'))}",
+        f"<b>Итого:</b> {_money(case.get('total_due'))}",
+        f"<b>Срок добровольного погашения:</b> {voluntary_days} дн." if voluntary_days else "<b>Срок добровольного погашения:</b> —",
     ]
+    notes = _case_notes(case)
+    if notes:
+        lines.extend(["", *notes])
     return "\n".join(lines)
 
 
@@ -184,7 +378,7 @@ async def cb_overdue_menu(callback: CallbackQuery, state: FSMContext):
     text = (
         "⚖️ <b>Просрочки</b>\n\n"
         f"Активных кейсов: <b>{len(cases)}</b>\n"
-        "Здесь можно открыть список просроченных займов, заполнить профиль кредитора, "
+        "Здесь можно открыть список просроченных займов, заполнить профиль займодавца по логину, "
         "загрузить подпись и вручную сформировать SMS или претензию."
     )
     await callback.message.edit_text(text, reply_markup=_menu_kb(), parse_mode="HTML")
@@ -221,48 +415,83 @@ async def cb_overdue_case(callback: CallbackQuery):
 async def cb_overdue_profile(callback: CallbackQuery):
     if not await is_allowed(callback.message.chat.id):
         return
-    profile = await get_creditor_profile(callback.message.chat.id)
-    lines = ["👤 <b>Профиль кредитора</b>", ""]
-    if not profile:
-        lines.append("Пока не заполнен.")
-    else:
-        lines.extend([
-            f"<b>ФИО / название:</b> {_display(profile.get('full_name'))}",
-            f"<b>Адрес:</b> {_display(profile.get('address'))}",
-            f"<b>Телефон:</b> {_display(profile.get('phone'))}",
-            f"<b>Email:</b> {_display(profile.get('email'))}",
-            f"<b>Реквизиты:</b> {_display(profile.get('payment_details'))}",
-            f"<b>SMS-отправитель:</b> {_display(profile.get('sms_sender'))}",
+    credentials = await list_user_credentials(callback.message.chat.id, services=("finkit", "zaimis"))
+    lines = ["👤 <b>Профили займодавца по логинам</b>", ""]
+    if not credentials:
+        lines.append("Сначала добавьте учётные данные сервиса.")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔑 Учётные данные", callback_data="creds_menu")],
+            [InlineKeyboardButton(text="↩ Просрочки", callback_data="overdue_menu")],
         ])
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ Заполнить / обновить", callback_data="overdue_profile_edit")],
-        [InlineKeyboardButton(text="↩ Просрочки", callback_data="overdue_menu")],
-    ])
-    await callback.message.edit_text("\n".join(lines), reply_markup=kb, parse_mode="HTML")
+        await callback.message.edit_text("\n".join(lines), reply_markup=kb, parse_mode="HTML")
+        return
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    for credential in credentials:
+        profile = await get_credential_creditor_profile(callback.message.chat.id, int(credential["id"]))
+        status = "✅" if profile and profile.get("full_name") and profile.get("address") else "⚠️"
+        lines.append(f"{status} {_credential_label(credential)}")
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{status} {_credential_label(credential)}",
+                callback_data=f"overdue_profile_cred_{credential['id']}",
+            )
+        ])
+    buttons.append([InlineKeyboardButton(text="↩ Просрочки", callback_data="overdue_menu")])
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML",
+    )
 
 
-@router.callback_query(F.data == "overdue_profile_edit")
+@router.callback_query(F.data.startswith("overdue_profile_case_"))
+async def cb_overdue_profile_case(callback: CallbackQuery):
+    if not await is_allowed(callback.message.chat.id):
+        return
+    case_id = int(callback.data.replace("overdue_profile_case_", ""))
+    case = await get_overdue_case(case_id, callback.message.chat.id)
+    if not case or not case.get("credential_id"):
+        await callback.answer("Для кейса не найден логин", show_alert=True)
+        return
+    await _show_credential_profile_message(callback, int(case["credential_id"]))
+
+
+@router.callback_query(F.data.startswith("overdue_profile_cred_"))
+async def cb_overdue_profile_credential(callback: CallbackQuery):
+    if not await is_allowed(callback.message.chat.id):
+        return
+    credential_id = int(callback.data.replace("overdue_profile_cred_", ""))
+    await _show_credential_profile_message(callback, credential_id)
+
+
+@router.callback_query(F.data.startswith("overdue_profile_edit_"))
 async def cb_overdue_profile_edit(callback: CallbackQuery, state: FSMContext):
     if not await is_allowed(callback.message.chat.id):
         return
+    credential_id = int(callback.data.replace("overdue_profile_edit_", ""))
+    credential = await get_credential_by_id(credential_id, callback.message.chat.id)
+    if not credential:
+        await callback.answer("Логин не найден", show_alert=True)
+        return
+    await state.update_data(credential_id=credential_id)
     await state.set_state(OverdueStates.waiting_creditor_profile)
     await callback.message.edit_text(
-        "👤 <b>Профиль кредитора</b>\n\n"
-        "Отправьте 6 строк:\n"
-        "1. ФИО / название\n"
-        "2. Адрес\n"
-        "3. Телефон\n"
-        "4. Email\n"
-        "5. Реквизиты для оплаты (или '-')\n"
-        "6. Имя отправителя для SMS (или '-' чтобы использовать ФИО)\n\n"
+        "👤 <b>Профиль займодавца</b>\n\n"
+        f"Логин: <b>{escape(_credential_label(credential))}</b>\n\n"
+        "Отправьте 4 строки:\n"
+        "1. ФИО / название займодавца\n"
+        "2. Адрес займодавца\n"
+        "3. Телефон (или '-')\n"
+        "4. Email (или '-')\n\n"
         "Пример:\n"
-        "Кулич Святослав Петрович\n"
-        "г. Минск, ул. Связистов, д. 8, кв. 36\n"
-        "+375447465358\n"
-        "svkulich@tut.by\n"
-        "BY00UNBS30120000000000000000, BIC UNBSBY2X\n"
-        "Святослав Кулич",
-        reply_markup=_back_main_kb(),
+        "Иванов Иван Иванович\n"
+        "г. Минск, ул. Лесная, д. 10, кв. 5\n"
+        "+375291112233\n"
+        "ivanov@example.com",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="↩ К профилю", callback_data=f"overdue_profile_cred_{credential_id}")],
+        ]),
         parse_mode="HTML",
     )
 
@@ -271,24 +500,27 @@ async def cb_overdue_profile_edit(callback: CallbackQuery, state: FSMContext):
 async def msg_overdue_profile(message: Message, state: FSMContext):
     if not await is_allowed(message.chat.id):
         return
+    data = await state.get_data()
+    credential_id = data.get("credential_id")
+    if not credential_id:
+        await state.clear()
+        await message.answer("Не удалось определить логин для профиля.")
+        return
     parts = [line.strip() for line in (message.text or "").splitlines() if line.strip()]
     if len(parts) < 4:
-        await message.answer("Нужно минимум 4 строки: ФИО/название, адрес, телефон, email.")
+        await message.answer("Нужно 4 строки: ФИО/название, адрес, телефон, email.")
         return
     full_name, address, phone, email = parts[:4]
-    payment_details = parts[4] if len(parts) >= 5 and parts[4] != "-" else None
-    sms_sender = parts[5] if len(parts) >= 6 and parts[5] != "-" else full_name
-    await upsert_creditor_profile(
+    await upsert_credential_creditor_profile(
         message.chat.id,
+        int(credential_id),
         full_name=full_name,
         address=address,
-        phone=phone,
-        email=email,
-        payment_details=payment_details,
-        sms_sender=sms_sender,
+        phone=None if phone == "-" else phone,
+        email=None if email == "-" else email,
     )
     await state.clear()
-    await message.answer("✅ Профиль кредитора сохранен.", reply_markup=_menu_kb())
+    await message.answer("✅ Профиль займодавца сохранён.", reply_markup=_menu_kb())
 
 
 @router.callback_query(F.data == "overdue_signature")
@@ -389,13 +621,13 @@ async def cb_overdue_edit(callback: CallbackQuery, state: FSMContext):
     ])
     await callback.message.edit_text(
         "📝 <b>Данные должника</b>\n\n"
-        "Отправьте 5 строк:\n"
-        "1. Адрес\n"
-        "2. ZIP-код\n"
+        "Отправьте 5 строк именно по должнику:\n"
+        "1. Адрес должника (не ваш)\n"
+        "2. ZIP-код (или '-' для автопоиска)\n"
         "3. Телефон (или '-')\n"
         "4. Email (или '-')\n"
         "5. Срок добровольного погашения в днях\n\n"
-        "Если ZIP не знаете, можно открыть поиск Белпочты по кнопке ниже.",
+        "Если ZIP не знаете, я попробую найти его автоматически. Кнопка Белпочты оставлена как запасной вариант.",
         reply_markup=kb,
         parse_mode="HTML",
     )
@@ -411,7 +643,7 @@ async def msg_overdue_contacts(message: Message, state: FSMContext):
     if len(parts) < 5:
         await message.answer("Нужно 5 строк: адрес, ZIP, телефон, email, срок в днях.")
         return
-    address, zip_code, phone, email, voluntary_days_raw = parts[:5]
+    address, zip_code_raw, phone, email, voluntary_days_raw = parts[:5]
     try:
         voluntary_days = int(voluntary_days_raw)
     except ValueError:
@@ -420,6 +652,9 @@ async def msg_overdue_contacts(message: Message, state: FSMContext):
     if voluntary_days <= 0:
         await message.answer("Срок добровольного погашения должен быть больше нуля.")
         return
+    zip_code = None if zip_code_raw == "-" else zip_code_raw
+    if not zip_code:
+        zip_code = await lookup_belarus_zip(address)
     await update_overdue_case_contacts(
         case_id,
         message.chat.id,
@@ -430,7 +665,8 @@ async def msg_overdue_contacts(message: Message, state: FSMContext):
         voluntary_term_days=voluntary_days,
     )
     await state.clear()
-    await message.answer("✅ Данные должника сохранены.", reply_markup=_menu_kb())
+    suffix = f" ZIP: {zip_code}." if zip_code else " ZIP не найден автоматически."
+    await message.answer(f"✅ Данные должника сохранены.{suffix}", reply_markup=_menu_kb())
 
 
 @router.callback_query(F.data.startswith("overdue_sms_"))
@@ -439,11 +675,10 @@ async def cb_overdue_sms(callback: CallbackQuery):
         return
     case_id = int(callback.data.replace("overdue_sms_", ""))
     case = await get_overdue_case(case_id, callback.message.chat.id)
-    creditor = await get_creditor_profile(callback.message.chat.id)
     if not case:
         await callback.answer("Кейс не найден", show_alert=True)
         return
-    missing = collect_sms_missing_fields(case, creditor)
+    missing = collect_sms_missing_fields(case, None)
     if missing:
         await callback.message.edit_text(
             "⚠️ <b>Нельзя сформировать SMS</b>\n\n"
@@ -452,13 +687,13 @@ async def cb_overdue_sms(callback: CallbackQuery):
             parse_mode="HTML",
         )
         return
-    sms_text = build_sms_text(case, creditor or {})
+    sms_text = build_sms_text(case, {})
     await save_generated_document(
         case_id,
         callback.message.chat.id,
         doc_type="sms",
         text_content=sms_text,
-        payload=serialize_case_payload(case, creditor),
+        payload=serialize_case_payload(case, None),
     )
     await callback.message.edit_text(
         f"✉️ <b>SMS</b>\n\n<pre>{escape(sms_text)}</pre>",
@@ -473,11 +708,12 @@ async def cb_overdue_claim(callback: CallbackQuery):
         return
     case_id = int(callback.data.replace("overdue_claim_", ""))
     case = await get_overdue_case(case_id, callback.message.chat.id)
-    creditor = await get_creditor_profile(callback.message.chat.id)
     signature = await get_user_signature_asset(callback.message.chat.id)
     if not case:
         await callback.answer("Кейс не найден", show_alert=True)
         return
+    case = await _enrich_finkit_case_from_claims(case)
+    creditor = await _get_case_creditor_profile(case)
     missing = collect_claim_missing_fields(case, creditor, signature)
     if missing:
         await save_generated_document(
@@ -489,7 +725,7 @@ async def cb_overdue_claim(callback: CallbackQuery):
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📝 Данные должника", callback_data=f"overdue_edit_{case_id}")],
-            [InlineKeyboardButton(text="👤 Мой профиль", callback_data="overdue_profile")],
+            [InlineKeyboardButton(text="👤 Профиль займодавца", callback_data=f"overdue_profile_case_{case_id}")],
             [InlineKeyboardButton(text="✍️ Подпись", callback_data="overdue_signature")],
             [InlineKeyboardButton(text="↩ К кейсу", callback_data=f"overdue_case_{case_id}")],
         ])

@@ -25,6 +25,7 @@ from bot.database import (
     save_opi_result, upsert_borrower,
     get_saved_credential_session, save_credential_session, delete_credential_session,
     get_json_schema_state, save_json_schema_state,
+    save_api_change_alert,
     deactivate_missing_overdue_cases, lookup_borrower, upsert_overdue_case, update_overdue_case_contacts,
 )
 
@@ -38,6 +39,7 @@ from bot.parsers.finkit import FinkitParser
 from bot.parsers.zaimis import ZaimisParser
 from bot.services.notifier import notify_users, update_sent_notifications, enrich_entry_from_borrowers, get_active_subscriptions, has_active_subscriptions
 from bot.services.opi_checker import OPIChecker
+from bot.services.postal_lookup import lookup_belarus_zip
 
 
 def _aware(dt: datetime | None) -> datetime | None:
@@ -254,6 +256,38 @@ def _days_overdue_from_due(due_at: str | None) -> int | None:
     return max(int(delta.total_seconds() // 86400), 0)
 
 
+async def _clear_finkit_suspect_address(case_id: int, imported_address: str | None, imported_zip: str | None) -> None:
+    if not imported_address and not imported_zip:
+        return
+    db = await get_db()
+    try:
+        await db.execute(
+            """
+            UPDATE overdue_cases
+            SET borrower_address = CASE
+                    WHEN ? IS NOT NULL AND borrower_address = ? THEN NULL
+                    ELSE borrower_address
+                END,
+                borrower_zip = CASE
+                    WHEN ? IS NOT NULL AND borrower_zip = ? THEN NULL
+                    ELSE borrower_zip
+                END,
+                updated_at = datetime('now')
+            WHERE id = ?
+            """,
+            (
+                imported_address,
+                imported_address,
+                imported_zip,
+                imported_zip,
+                case_id,
+            ),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
 def _json_type_name(value) -> str:
     if value is None:
         return "null"
@@ -328,6 +362,7 @@ def _schema_diff(prev: dict[str, list[str]] | None, current: dict[str, list[str]
 
 
 async def _notify_json_schema_change(bot: Bot, service: str, entries: list[BorrowEntry]) -> None:
+    del bot
     current = _build_entries_schema(entries)
     if not current:
         return
@@ -346,26 +381,27 @@ async def _notify_json_schema_change(bot: Bot, service: str, entries: list[Borro
 
     await save_json_schema_state(service, merged)
     svc_names = {"kapusta": "🥬 Kapusta", "finkit": "🔵 FinKit", "zaimis": "🟪 ЗАЙМись"}
-    lines = [f"⚠️ <b>Изменилась JSON-структура {svc_names.get(service, service)}</b>"]
+    lines = [f"Изменилась JSON-структура {svc_names.get(service, service)}"]
     if added_paths:
         lines.append("")
-        lines.append("<b>Новые поля:</b>")
-        lines.extend(f"  • {escape(item)}" for item in added_paths[:20])
+        lines.append("Новые поля:")
+        lines.extend(f"  • {item}" for item in added_paths[:20])
     if changed_types:
         lines.append("")
-        lines.append("<b>Изменились типы:</b>")
-        lines.extend(f"  • {escape(item)}" for item in changed_types[:20])
+        lines.append("Изменились типы:")
+        lines.extend(f"  • {item}" for item in changed_types[:20])
     sample = next((e.raw_data for e in entries if e.raw_data), None)
-    if sample:
-        sample_text = escape(json.dumps(sample, ensure_ascii=False, default=str)[:1200])
-        lines.append("")
-        lines.append(f"<pre>{sample_text}</pre>")
+    sample_text = json.dumps(sample, ensure_ascii=False, default=str)[:4000] if sample else None
     try:
-        if config.ADMIN_CHAT_ID:
-            await bot.send_message(config.ADMIN_CHAT_ID, "\n".join(lines), parse_mode="HTML")
-            log.info("JSON schema change notification sent for %s", service)
+        await save_api_change_alert(
+            service=service,
+            title=f"JSON change: {svc_names.get(service, service)}",
+            details="\n".join(lines),
+            sample_json=sample_text,
+        )
+        log.info("JSON schema change saved for %s", service)
     except Exception as e:
-        log.warning("Failed to send JSON schema notification: %s", e)
+        log.warning("Failed to save JSON schema alert: %s", e)
 
 
 async def _should_poll(service: str) -> bool:
@@ -812,6 +848,36 @@ async def _sync_finkit_overdue_cases() -> tuple[int, list[str]]:
                 if isinstance(msi, dict):
                     address = _coalesce(msi.get("formatted_address"))
                     zip_code = _coalesce(msi.get("postal_code"))
+                contract_url = _coalesce(detail.get("latest_contract_url"), item.get("latest_contract_url"))
+                pdf_full_name = None
+                pdf_document_id = None
+                if contract_url:
+                    pdf_bytes = await parser.fetch_contract_pdf(contract_url)
+                    if pdf_bytes:
+                        pdf_full_name, pdf_document_id = parser.parse_borrower_from_contract_pdf(pdf_bytes)
+                        if borrower_user_id and (pdf_full_name or pdf_document_id):
+                            await upsert_borrower(
+                                service="finkit",
+                                borrower_user_id=borrower_user_id,
+                                full_name=pdf_full_name,
+                                document_id=pdf_document_id,
+                                source=f"finkit_overdue_pdf_{_telegram_user_tag(cred)}",
+                            )
+                claim_address = None
+                claim_zip = None
+                claim_phone = None
+                claim_email = None
+                claims = detail.get("claims") or []
+                claim_document_url = next((claim.get("document_url") for claim in claims if claim.get("document_url")), None)
+                if claim_document_url:
+                    claim_pdf_bytes = await parser.fetch_contract_pdf(claim_document_url)
+                    if claim_pdf_bytes:
+                        claim_data = parser.parse_claim_document_pdf(claim_pdf_bytes)
+                        claim_address = _coalesce(claim_data.get("debtor_address"))
+                        claim_phone = _coalesce(claim_data.get("debtor_phone"))
+                        claim_email = _coalesce(claim_data.get("debtor_email"))
+                        if claim_address:
+                            claim_zip = await lookup_belarus_zip(claim_address)
 
                 case_id = await upsert_overdue_case(
                     chat_id=cred.chat_id,
@@ -822,8 +888,8 @@ async def _sync_finkit_overdue_cases() -> tuple[int, list[str]]:
                     loan_number=str(_coalesce(detail.get("loan_number"), item.get("loan_number")) or "") or None,
                     account_label=cred.login,
                     borrower_user_id=borrower_user_id or None,
-                    document_id=(cached or {}).get("document_id"),
-                    full_name=(cached or {}).get("full_name") or _coalesce(detail.get("borrower_full_name"), item.get("borrower_full_name")),
+                    document_id=(cached or {}).get("document_id") or pdf_document_id,
+                    full_name=(cached or {}).get("full_name") or pdf_full_name or _coalesce(detail.get("borrower_full_name"), item.get("borrower_full_name")),
                     display_name=_coalesce(detail.get("borrower_short_name"), item.get("borrower_short_name")),
                     issued_at=_coalesce(detail.get("created"), item.get("created")),
                     due_at=due_at,
@@ -835,18 +901,19 @@ async def _sync_finkit_overdue_cases() -> tuple[int, list[str]]:
                     fine_outstanding=fine,
                     total_due=_total_due(principal, accrued, fine, _coalesce(detail.get("total_due"), item.get("total_due"), item.get("amount"))),
                     status=str(_coalesce(detail.get("status"), item.get("status")) or "") or None,
-                    contract_url=_coalesce(detail.get("latest_contract_url"), item.get("latest_contract_url")),
+                    contract_url=contract_url,
                     loan_url=None,
                     raw_data={"list": item, "detail": detail},
                 )
-                if address or zip_code or detail.get("borrower_phone_number") or detail.get("borrower_email"):
+                await _clear_finkit_suspect_address(case_id, address, zip_code)
+                if claim_address or claim_zip or claim_phone or claim_email or detail.get("borrower_phone_number") or detail.get("borrower_email"):
                     await update_overdue_case_contacts(
                         case_id,
                         cred.chat_id,
-                        borrower_address=address,
-                        borrower_zip=zip_code,
-                        borrower_phone=detail.get("borrower_phone_number"),
-                        borrower_email=detail.get("borrower_email"),
+                        borrower_address=claim_address,
+                        borrower_zip=claim_zip,
+                        borrower_phone=claim_phone or detail.get("borrower_phone_number"),
+                        borrower_email=claim_email or detail.get("borrower_email"),
                     )
                 synced += 1
                 await asyncio.sleep(0.05)

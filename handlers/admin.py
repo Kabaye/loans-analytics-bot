@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from html import escape
 
 from aiogram import Router, F
 from aiogram.filters import Command
@@ -19,6 +20,7 @@ from aiogram.types import (
 from bot.database import (
     get_db, get_all_site_settings, update_site_setting,
     get_borrowers_stats, get_borrowers_count, get_missing_opi_candidates,
+    list_api_change_alerts, get_api_change_alert, delete_api_change_alert, clear_api_change_alerts,
 )
 from bot.config import ADMIN_CHAT_ID
 from bot.services.scheduler import get_export_parsers
@@ -31,6 +33,7 @@ SVC_NAMES = {
     "finkit": "🔵 FinKit",
     "zaimis": "🟪 ЗАЙМись",
 }
+MAIN_OWNER_USERNAME = "kabaye"
 
 
 def _display_name(row) -> str:
@@ -60,6 +63,12 @@ async def is_admin(chat_id: int) -> bool:
         return len(rows) > 0
     finally:
         await db.close()
+
+
+def _is_main_owner_row(row) -> bool:
+    username = str(row["username"] or "").strip().lstrip("@").lower() if "username" in row.keys() else ""
+    chat_id = row["chat_id"] if "chat_id" in row.keys() else None
+    return chat_id == ADMIN_CHAT_ID or username == MAIN_OWNER_USERNAME
 
 
 async def _get_test_parser(service: str, requester_chat_id: int):
@@ -103,14 +112,17 @@ async def _show_admin_panel(target, chat_id: int, edit: bool = False):
     for row in rows:
         status = "✅" if row["is_allowed"] else "⛔"
         admin_badge = " 👑" if row["is_admin"] else ""
+        owner_badge = " ⭐" if _is_main_owner_row(row) else ""
         display = _display_name(row)
-        lines.append(f"{status}{admin_badge} <code>{row['chat_id']}</code> — {display}")
+        lines.append(f"{status}{admin_badge}{owner_badge} <code>{row['chat_id']}</code> — {display}")
 
     buttons = [
         [InlineKeyboardButton(text="➕ Добавить пользователя", callback_data="adm_add")],
         [InlineKeyboardButton(text="✅ Разрешить доступ", callback_data="adm_allow_choose")],
         [InlineKeyboardButton(text="⛔ Заблокировать", callback_data="adm_block_choose")],
         [InlineKeyboardButton(text="👑 Назначить админом", callback_data="adm_promote_choose")],
+        [InlineKeyboardButton(text="⬇️ Снять админа", callback_data="adm_demote_choose")],
+        [InlineKeyboardButton(text="🧬 Изменения API", callback_data="adm_api_alerts")],
         [InlineKeyboardButton(text="⚙️ Настройки опроса", callback_data="adm_polling")],
         [InlineKeyboardButton(text="🧪 Тест", callback_data="adm_test_menu")],
         [InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")],
@@ -208,7 +220,8 @@ async def adm_block_choose(callback: CallbackQuery):
         return
     # Exclude self from block list
     await _show_user_list(callback, "adm_block_", is_allowed=1,
-                          exclude_chat_id=callback.message.chat.id)
+                          exclude_chat_id=callback.message.chat.id,
+                          exclude_main_owner=True)
 
 
 @router.callback_query(F.data.startswith("adm_block_"))
@@ -224,11 +237,15 @@ async def adm_block_user(callback: CallbackQuery):
 
     db = await get_db()
     try:
+        row = await db.execute_fetchall(
+            "SELECT chat_id, username, first_name, last_name FROM users WHERE chat_id=?",
+            (chat_id,),
+        )
+        if row and _is_main_owner_row(row[0]):
+            await callback.answer("❌ Нельзя заблокировать главного владельца.", show_alert=True)
+            return
         await db.execute("UPDATE users SET is_allowed=0 WHERE chat_id=?", (chat_id,))
         await db.commit()
-        row = await db.execute_fetchall(
-            "SELECT chat_id, username, first_name, last_name FROM users WHERE chat_id=?", (chat_id,)
-        )
     finally:
         await db.close()
     display = _display_name(row[0]) if row else str(chat_id)
@@ -260,19 +277,67 @@ async def adm_promote_user(callback: CallbackQuery):
     await callback.message.edit_text(f"👑 Пользователь {display} назначен админом.")
 
 
+@router.callback_query(F.data == "adm_demote_choose")
+async def adm_demote_choose(callback: CallbackQuery):
+    if not await is_admin(callback.message.chat.id):
+        return
+    await _show_user_list(
+        callback,
+        "adm_demote_",
+        is_allowed=1,
+        exclude_chat_id=callback.message.chat.id,
+        exclude_main_owner=True,
+        require_admin=1,
+    )
+
+
+@router.callback_query(F.data.startswith("adm_demote_"))
+async def adm_demote_user(callback: CallbackQuery):
+    if not await is_admin(callback.message.chat.id):
+        return
+    chat_id = int(callback.data.replace("adm_demote_", ""))
+    db = await get_db()
+    try:
+        row = await db.execute_fetchall(
+            "SELECT chat_id, username, first_name, last_name FROM users WHERE chat_id=?",
+            (chat_id,),
+        )
+        if row and _is_main_owner_row(row[0]):
+            await callback.answer("❌ Нельзя снять админа с главного владельца.", show_alert=True)
+            return
+        await db.execute("UPDATE users SET is_admin=0 WHERE chat_id=?", (chat_id,))
+        await db.commit()
+    finally:
+        await db.close()
+    display = _display_name(row[0]) if row else str(chat_id)
+    await callback.message.edit_text(f"⬇️ Пользователь {display} больше не админ.")
+
+
 async def _show_user_list(callback: CallbackQuery, prefix: str, is_allowed: int,
-                          exclude_chat_id: int | None = None):
+                          exclude_chat_id: int | None = None,
+                          exclude_main_owner: bool = False,
+                          require_admin: int | None = None):
     db = await get_db()
     try:
         rows = await db.execute_fetchall(
-            "SELECT chat_id, username, first_name, last_name FROM users WHERE is_allowed=?",
+            """
+            SELECT chat_id, username, first_name, last_name, is_admin
+            FROM users
+            WHERE is_allowed=?
+            """,
             (is_allowed,),
         )
     finally:
         await db.close()
 
     # Filter out excluded user (self-protection)
-    filtered = [r for r in rows if r["chat_id"] != exclude_chat_id] if exclude_chat_id else list(rows)
+    filtered = list(rows)
+    if exclude_chat_id is not None:
+        filtered = [r for r in filtered if r["chat_id"] != exclude_chat_id]
+    if exclude_main_owner:
+        filtered = [r for r in filtered if not _is_main_owner_row(r)]
+    if require_admin is not None:
+        filtered = [r for r in filtered if int(r["is_admin"] or 0) == require_admin]
 
     if not filtered:
         await callback.answer("Нет пользователей")
@@ -295,6 +360,97 @@ async def _show_user_list(callback: CallbackQuery, prefix: str, is_allowed: int,
 @router.callback_query(F.data == "adm_back")
 async def adm_back(callback: CallbackQuery):
     await _show_admin_panel(callback.message, callback.message.chat.id, edit=True)
+
+
+# ============== API change alerts ==============
+
+@router.callback_query(F.data == "adm_api_alerts")
+async def adm_api_alerts(callback: CallbackQuery):
+    if not await is_admin(callback.message.chat.id):
+        return
+    alerts = await list_api_change_alerts(limit=30)
+    if not alerts:
+        await callback.message.edit_text(
+            "🧬 <b>Изменения API</b>\n\nПока нет сохранённых изменений.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="↩ Админ-панель", callback_data="admin_menu")],
+            ]),
+        )
+        return
+
+    lines = ["🧬 <b>Изменения API</b>", "", f"Накоплено: <b>{len(alerts)}</b>", ""]
+    buttons: list[list[InlineKeyboardButton]] = []
+    for alert in alerts[:20]:
+        created = (alert.get("created_at") or "")[:16]
+        service = SVC_NAMES.get(alert["service"], alert["service"])
+        lines.append(f"• <code>#{alert['id']}</code> {service} — {escape(alert['title'])}")
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"#{alert['id']} {service} {created}",
+                callback_data=f"adm_api_alert_{alert['id']}",
+            )
+        ])
+
+    buttons.append([InlineKeyboardButton(text="🗑 Очистить всё", callback_data="adm_api_alerts_clear")])
+    buttons.append([InlineKeyboardButton(text="↩ Админ-панель", callback_data="admin_menu")])
+    await callback.message.edit_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@router.callback_query(F.data.startswith("adm_api_alert_"))
+async def adm_api_alert_view(callback: CallbackQuery):
+    if not await is_admin(callback.message.chat.id):
+        return
+    if callback.data == "adm_api_alerts_clear" or callback.data.startswith("adm_api_alert_del_"):
+        return
+    alert_id = int(callback.data.replace("adm_api_alert_", ""))
+    alert = await get_api_change_alert(alert_id)
+    if not alert:
+        await callback.answer("Запись не найдена", show_alert=True)
+        return
+    parts = [
+        "🧬 <b>Изменение API</b>",
+        "",
+        f"<b>ID:</b> {alert['id']}",
+        f"<b>Сервис:</b> {escape(SVC_NAMES.get(alert['service'], alert['service']))}",
+        f"<b>Время:</b> {escape(alert.get('created_at') or '—')}",
+        "",
+        escape(alert.get("details") or alert.get("title") or "—"),
+    ]
+    if alert.get("sample_json"):
+        parts.extend(["", f"<pre>{escape(alert['sample_json'][:2500])}</pre>"])
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"adm_del_api_alert_{alert_id}")],
+        [InlineKeyboardButton(text="↩ К списку", callback_data="adm_api_alerts")],
+    ])
+    await callback.message.edit_text("\n".join(parts), parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("adm_del_api_alert_"))
+async def adm_api_alert_delete(callback: CallbackQuery):
+    if not await is_admin(callback.message.chat.id):
+        return
+    alert_id = int(callback.data.replace("adm_del_api_alert_", ""))
+    await delete_api_change_alert(alert_id)
+    await adm_api_alerts(callback)
+
+
+@router.callback_query(F.data == "adm_api_alerts_clear")
+async def adm_api_alerts_clear(callback: CallbackQuery):
+    if not await is_admin(callback.message.chat.id):
+        return
+    await clear_api_change_alerts()
+    await callback.message.edit_text(
+        "🧬 <b>Изменения API</b>\n\nВсе сохранённые записи удалены.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="↩ Админ-панель", callback_data="admin_menu")],
+        ]),
+    )
 
 
 # ============== Polling settings panel ==============

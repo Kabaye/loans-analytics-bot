@@ -61,6 +61,35 @@ def _voluntary_term(case: dict) -> str:
     return str(days) if days else "—"
 
 
+def _sms_name(full_name: str | None) -> str:
+    parts = [part for part in str(full_name or "").strip().split() if part]
+    if not parts:
+        return "Должник"
+    if len(parts) == 1:
+        return parts[0][:24]
+    surname = parts[0].title()
+    initials = "".join(f"{part[0].upper()}." for part in parts[1:] if part)
+    return f"{surname} {initials}".strip()
+
+
+def _sms_ref(case: dict) -> str:
+    ref = _loan_ref(case)
+    return ref if len(ref) <= 18 else ref[-8:]
+
+
+def _sms_date(case: dict) -> str:
+    dt = _parse_date(case.get("issued_at"))
+    if dt:
+        return dt.strftime("%d.%m.%y")
+    text = case.get("issued_at") or ""
+    return text[:10] if text else "—"
+
+
+def _fit_sms(text: str) -> str:
+    compact = " ".join(text.split())
+    return compact[:140].rstrip()
+
+
 def _build_contacts_block(name: str | None, address: str | None, phone: str | None, email: str | None) -> list[str]:
     lines = [name or "—"]
     if address:
@@ -73,6 +102,7 @@ def _build_contacts_block(name: str | None, address: str | None, phone: str | No
 
 
 def collect_sms_missing_fields(case: dict, creditor: dict | None) -> list[str]:
+    del creditor
     missing: list[str] = []
     if not case.get("full_name"):
         missing.append("ФИО заемщика")
@@ -82,17 +112,13 @@ def collect_sms_missing_fields(case: dict, creditor: dict | None) -> list[str]:
         missing.append("номер договора / займа")
     if not case.get("issued_at"):
         missing.append("дата договора / займа")
-    if not case.get("voluntary_term_days"):
-        missing.append("срок добровольного погашения")
-    if not creditor or not creditor.get("full_name"):
-        missing.append("ФИО / название кредитора")
-    if not creditor or (not creditor.get("phone") and not creditor.get("email")):
-        missing.append("контакты кредитора")
     return list(dict.fromkeys(missing))
 
 
 def collect_claim_missing_fields(case: dict, creditor: dict | None, signature: dict | None) -> list[str]:
     missing = collect_sms_missing_fields(case, creditor)
+    if not creditor or not creditor.get("full_name"):
+        missing.append("ФИО / название кредитора")
     if not case.get("document_id"):
         missing.append("ИН заемщика")
     if not case.get("borrower_address"):
@@ -113,33 +139,17 @@ def _join_non_empty(parts: list[str | None]) -> str:
 
 
 def build_sms_text(case: dict, creditor: dict) -> str:
-    debt_breakdown = []
-    if case.get("principal_outstanding") is not None:
-        debt_breakdown.append(f"осн. долг {_money(case.get('principal_outstanding'))}")
-    if case.get("accrued_percent") is not None:
-        debt_breakdown.append(f"проценты {_money(case.get('accrued_percent'))}")
-    if case.get("fine_outstanding") is not None:
-        debt_breakdown.append(f"пеня {_money(case.get('fine_outstanding'))}")
-
-    breakdown = ", ".join(debt_breakdown) if debt_breakdown else "структура долга уточняется"
-    contacts = ", ".join(part for part in [creditor.get("phone"), creditor.get("email")] if part)
-
-    return (
-        f"Отправитель: {creditor.get('sms_sender') or creditor.get('full_name')}\n"
-        f"Заемщик: {case.get('full_name')}\n"
-        f"Сумма долга: {_money(case.get('total_due'))}\n"
-        f"Договор / займ: {_loan_ref(case)} от {_date(case.get('issued_at'))}\n"
-        f"Срок на добровольное погашение: {_voluntary_term(case)} дн.\n"
-        f"Контакты для связи: {contacts or '—'}\n\n"
-        f"У вас имеется задолженность по договору займа. Просим добровольно погасить долг "
-        f"в течение {_voluntary_term(case)} дней. Текущий расчет: {breakdown}. "
-        f"При непогашении задолженности будем вынуждены перейти к судебному взысканию."
+    del creditor
+    amount = _money(case.get("total_due")).replace(" BYN", "р")
+    text = (
+        f"{_sms_name(case.get('full_name'))}, займ {_sms_ref(case)} {_sms_date(case)}. "
+        f"Долг {amount}. При неоплате - взыскание через суд."
     )
+    return _fit_sms(text)
 
 
 def build_claim_text(case: dict, creditor: dict) -> str:
     service_url = _service_url(case)
-    payment_details = (creditor.get("payment_details") or "").strip()
     debtor_line = _join_non_empty([
         case.get("full_name"),
         f"ИН {case.get('document_id')}" if case.get("document_id") else None,
@@ -168,7 +178,6 @@ def build_claim_text(case: dict, creditor: dict) -> str:
             "Обращаю Ваше внимание на то, что при передаче дела в суд размер требований "
             "будет увеличен за счет дальнейшего начисления процентов, пени и судебных расходов."
         ),
-        (f"Платежные реквизиты для добровольного погашения: {payment_details}." if payment_details else ""),
         (
             f"Для связи и добровольного урегулирования: {creditor.get('full_name')}, "
             f"{creditor.get('phone') or '—'}, {creditor.get('email') or '—'}."
@@ -227,8 +236,6 @@ def render_claim_docx(case: dict, creditor: dict, signature_path: str) -> tuple[
         creditor.get("phone"),
         creditor.get("email"),
     )
-    if creditor.get("payment_details"):
-        creditor_lines.append(f"Реквизиты: {creditor.get('payment_details')}")
 
     _add_block(doc, "Кому:", debtor_lines)
     doc.add_paragraph()

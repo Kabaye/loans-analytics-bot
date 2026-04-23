@@ -20,7 +20,10 @@ from aiogram.types import (
 
 from bot.domain.models import BorrowEntry, Subscription
 from bot.repositories.borrowers import lookup_borrower
-from bot.repositories.db import get_db
+from bot.repositories.subscriptions import (
+    has_active_subscriptions_for_service,
+    list_active_subscriptions_for_service,
+)
 
 log = logging.getLogger(__name__)
 
@@ -421,59 +424,11 @@ def format_notification(entry: BorrowEntry, sub: Subscription | list[Subscriptio
 
 
 async def get_active_subscriptions(service: str) -> list[tuple[int, Subscription]]:
-    """Get all active subscriptions for a service. Returns (chat_id, Subscription) pairs."""
-    db = await get_db()
-    try:
-        rows = await db.execute_fetchall(
-            """
-            SELECT s.*, u.chat_id as user_chat_id
-            FROM subscriptions s
-            JOIN users u ON s.chat_id = u.chat_id
-            WHERE s.service = ? AND s.is_active = 1 AND u.is_allowed = 1
-            ORDER BY s.created_at, s.id
-            """,
-            (service,),
-        )
-        result = []
-        for row in rows:
-            sub = Subscription(
-                id=row["id"],
-                chat_id=row["chat_id"],
-                service=row["service"],
-                label=row["label"],
-                sum_min=row["sum_min"],
-                sum_max=row["sum_max"],
-                rating_min=row["rating_min"],
-                period_min=row["period_min"],
-                period_max=row["period_max"],
-                interest_min=row["interest_min"],
-                require_employed=bool(row["require_employed"]) if row["require_employed"] is not None else None,
-                require_income_confirmed=bool(row["require_income_confirmed"]) if row["require_income_confirmed"] is not None else None,
-                min_settled_loans=row["min_settled_loans"] if row["min_settled_loans"] else None,
-                created_at=_coerce_utc_datetime(row["created_at"]),
-            )
-            result.append((row["chat_id"], sub))
-        return result
-    finally:
-        await db.close()
+    return await list_active_subscriptions_for_service(service)
 
 
 async def has_active_subscriptions(service: str) -> bool:
-    """Check if ANY user has active subscriptions for a service."""
-    db = await get_db()
-    try:
-        rows = await db.execute_fetchall(
-            """
-            SELECT 1 FROM subscriptions s
-            JOIN users u ON s.chat_id = u.chat_id
-            WHERE s.service = ? AND s.is_active = 1 AND u.is_allowed = 1
-            LIMIT 1
-            """,
-            (service,),
-        )
-        return len(rows) > 0
-    finally:
-        await db.close()
+    return await has_active_subscriptions_for_service(service)
 
 
 async def enrich_entry_from_borrowers(entry: BorrowEntry) -> None:

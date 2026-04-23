@@ -1,6 +1,46 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
+from bot.domain.models import Subscription
 from bot.repositories.db import get_db
+
+
+def _coerce_utc_datetime(value) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _to_subscription(row) -> Subscription:
+    return Subscription(
+        id=row["id"],
+        chat_id=row["chat_id"],
+        service=row["service"],
+        label=row["label"],
+        sum_min=row["sum_min"],
+        sum_max=row["sum_max"],
+        rating_min=row["rating_min"],
+        rating_max=row["rating_max"],
+        period_min=row["period_min"],
+        period_max=row["period_max"],
+        interest_min=row["interest_min"],
+        interest_max=row["interest_max"],
+        require_employed=bool(row["require_employed"]) if row["require_employed"] is not None else None,
+        require_income_confirmed=bool(row["require_income_confirmed"]) if row["require_income_confirmed"] is not None else None,
+        is_active=bool(row["is_active"]) if row["is_active"] is not None else True,
+        night_paused=bool(row["night_paused"]) if row["night_paused"] is not None else False,
+        min_settled_loans=row["min_settled_loans"] if row["min_settled_loans"] else None,
+        created_at=_coerce_utc_datetime(row["created_at"]),
+    )
 
 
 async def list_subscriptions(chat_id: int) -> list[dict]:
@@ -166,11 +206,68 @@ async def deactivate_all_subscriptions(chat_id: int) -> None:
         await db.close()
 
 
+async def count_active_subscriptions_by_service(chat_id: int) -> list[dict]:
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            """
+            SELECT service, COUNT(*) as cnt
+            FROM subscriptions
+            WHERE chat_id=? AND is_active=1
+            GROUP BY service
+            ORDER BY service
+            """,
+            (chat_id,),
+        )
+        return [dict(row) for row in rows]
+    finally:
+        await db.close()
+
+
+async def list_active_subscriptions_for_service(service: str) -> list[tuple[int, Subscription]]:
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            """
+            SELECT s.*, u.chat_id as user_chat_id
+            FROM subscriptions s
+            JOIN users u ON s.chat_id = u.chat_id
+            WHERE s.service = ? AND s.is_active = 1 AND u.is_allowed = 1
+            ORDER BY s.created_at, s.id
+            """,
+            (service,),
+        )
+        return [(row["chat_id"], _to_subscription(row)) for row in rows]
+    finally:
+        await db.close()
+
+
+async def has_active_subscriptions_for_service(service: str) -> bool:
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            """
+            SELECT 1
+            FROM subscriptions s
+            JOIN users u ON s.chat_id = u.chat_id
+            WHERE s.service = ? AND s.is_active = 1 AND u.is_allowed = 1
+            LIMIT 1
+            """,
+            (service,),
+        )
+        return len(rows) > 0
+    finally:
+        await db.close()
+
+
 __all__ = [
+    "count_active_subscriptions_by_service",
     "create_subscription",
     "deactivate_all_subscriptions",
     "delete_subscription",
     "get_subscription",
+    "has_active_subscriptions_for_service",
+    "list_active_subscriptions_for_service",
     "list_subscription_briefs",
     "list_subscriptions",
     "pause_active_subscriptions_for_night",

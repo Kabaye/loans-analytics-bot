@@ -14,7 +14,9 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
-from bot.repositories.db import get_db
+from bot.repositories.credentials import list_credential_services
+from bot.repositories.subscriptions import count_active_subscriptions_by_service
+from bot.repositories.users import ensure_user
 from bot.services.base.access import is_admin as _is_admin_service, is_allowed as _is_allowed_service
 from bot.services.fsm_guard import set_free, drain
 
@@ -30,23 +32,6 @@ async def is_allowed(chat_id: int) -> bool:
 
 async def is_admin(chat_id: int) -> bool:
     return await _is_admin_service(chat_id)
-
-
-async def ensure_user(chat_id: int, username: str | None = None,
-                      first_name: str | None = None, last_name: str | None = None) -> None:
-    db = await get_db()
-    try:
-        await db.execute(
-            "INSERT OR IGNORE INTO users (chat_id, username, first_name, last_name) VALUES (?, ?, ?, ?)",
-            (chat_id, username, first_name, last_name),
-        )
-        await db.execute(
-            "UPDATE users SET username=COALESCE(?, username), first_name=COALESCE(?, first_name), last_name=COALESCE(?, last_name) WHERE chat_id=?",
-            (username, first_name, last_name, chat_id),
-        )
-        await db.commit()
-    finally:
-        await db.close()
 
 
 def get_main_menu_kb(admin: bool = False) -> InlineKeyboardMarkup:
@@ -156,24 +141,12 @@ async def cb_status(callback: CallbackQuery):
 
     from bot.repositories.settings import get_all_site_settings
 
-    db = await get_db()
-    try:
-        subs = await db.execute_fetchall(
-            "SELECT service, COUNT(*) as cnt FROM subscriptions WHERE chat_id=? AND is_active=1 GROUP BY service",
-            (callback.message.chat.id,),
-        )
-        creds = await db.execute_fetchall(
-            "SELECT service FROM credentials WHERE chat_id=?",
-            (callback.message.chat.id,),
-        )
-    finally:
-        await db.close()
+    subs = await count_active_subscriptions_by_service(callback.message.chat.id)
+    cred_services = await list_credential_services(callback.message.chat.id)
 
     sub_lines = []
     for row in subs:
         sub_lines.append(f"  {row['service']}: {row['cnt']} подписок")
-
-    cred_services = [r["service"] for r in creds]
 
     # Site settings info
     settings = await get_all_site_settings()

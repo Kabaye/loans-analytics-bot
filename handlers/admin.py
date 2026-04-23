@@ -18,7 +18,7 @@ from aiogram.types import (
 )
 
 from bot.repositories.borrowers import get_borrowers_count, get_borrowers_stats
-from bot.repositories.db import get_db
+from bot.repositories.credentials import get_first_credential_owner_chat_id
 from bot.repositories.opi_cache import get_missing_opi_candidates
 from bot.repositories.settings import (
     clear_api_change_alerts,
@@ -27,6 +27,15 @@ from bot.repositories.settings import (
     get_api_change_alert,
     list_api_change_alerts,
     update_site_setting,
+)
+from bot.repositories.users import (
+    ensure_user,
+    get_user,
+    is_chat_admin,
+    list_users,
+    list_users_by_access,
+    set_user_admin,
+    set_user_allowed,
 )
 from bot.config import ADMIN_CHAT_ID
 from bot.services.base.providers import get_export_parsers
@@ -59,16 +68,7 @@ def _display_name(row) -> str:
 
 
 async def is_admin(chat_id: int) -> bool:
-    if chat_id == ADMIN_CHAT_ID:
-        return True
-    db = await get_db()
-    try:
-        rows = await db.execute_fetchall(
-            "SELECT 1 FROM users WHERE chat_id=? AND is_admin=1", (chat_id,)
-        )
-        return len(rows) > 0
-    finally:
-        await db.close()
+    return await is_chat_admin(chat_id, ADMIN_CHAT_ID)
 
 
 def _is_main_owner_row(row) -> bool:
@@ -81,17 +81,10 @@ async def _get_test_parser(service: str, requester_chat_id: int):
     """Reuse the same parser/session acquisition path as export."""
     target_chat_id = requester_chat_id
     if service in ("finkit", "zaimis"):
-        db = await get_db()
-        try:
-            rows = await db.execute_fetchall(
-                "SELECT chat_id FROM credentials WHERE service = ? ORDER BY id LIMIT 1",
-                (service,),
-            )
-        finally:
-            await db.close()
-        if not rows:
+        owner_chat_id = await get_first_credential_owner_chat_id(service)
+        if owner_chat_id is None:
             return None
-        target_chat_id = rows[0]["chat_id"]
+        target_chat_id = owner_chat_id
 
     parsers = await get_export_parsers(service, target_chat_id)
     return parsers[0] if parsers else None
@@ -106,13 +99,7 @@ async def _show_admin_panel(target, chat_id: int, edit: bool = False):
     if not await is_admin(chat_id):
         return
 
-    db = await get_db()
-    try:
-        rows = await db.execute_fetchall(
-            "SELECT chat_id, username, first_name, last_name, is_allowed, is_admin FROM users ORDER BY created_at"
-        )
-    finally:
-        await db.close()
+    rows = await list_users()
 
     lines = ["<b>👑 Администрирование</b>\n"]
     for row in rows:
@@ -171,19 +158,8 @@ async def adm_add_user(message: Message, state: FSMContext):
         await message.answer("❌ Некорректный chat_id. Введите число.")
         return
 
-    db = await get_db()
-    try:
-        await db.execute(
-            "INSERT OR IGNORE INTO users (chat_id, is_allowed) VALUES (?, 1)",
-            (new_chat_id,),
-        )
-        await db.execute(
-            "UPDATE users SET is_allowed=1 WHERE chat_id=?",
-            (new_chat_id,),
-        )
-        await db.commit()
-    finally:
-        await db.close()
+    await ensure_user(new_chat_id)
+    await set_user_allowed(new_chat_id, True)
 
     await state.clear()
     await message.answer(
@@ -207,16 +183,9 @@ async def adm_allow_user(callback: CallbackQuery):
     if not await is_admin(callback.message.chat.id):
         return
     chat_id = int(callback.data.replace("adm_allow_", ""))
-    db = await get_db()
-    try:
-        await db.execute("UPDATE users SET is_allowed=1 WHERE chat_id=?", (chat_id,))
-        await db.commit()
-        row = await db.execute_fetchall(
-            "SELECT chat_id, username, first_name, last_name FROM users WHERE chat_id=?", (chat_id,)
-        )
-    finally:
-        await db.close()
-    display = _display_name(row[0]) if row else str(chat_id)
+    await set_user_allowed(chat_id, True)
+    row = await get_user(chat_id)
+    display = _display_name(row) if row else str(chat_id)
     await callback.message.edit_text(f"✅ Пользователь {display} разрешён.")
 
 
@@ -241,20 +210,12 @@ async def adm_block_user(callback: CallbackQuery):
         await callback.answer("❌ Нельзя заблокировать самого себя!", show_alert=True)
         return
 
-    db = await get_db()
-    try:
-        row = await db.execute_fetchall(
-            "SELECT chat_id, username, first_name, last_name FROM users WHERE chat_id=?",
-            (chat_id,),
-        )
-        if row and _is_main_owner_row(row[0]):
+    row = await get_user(chat_id)
+    if row and _is_main_owner_row(row):
             await callback.answer("❌ Нельзя заблокировать главного владельца.", show_alert=True)
             return
-        await db.execute("UPDATE users SET is_allowed=0 WHERE chat_id=?", (chat_id,))
-        await db.commit()
-    finally:
-        await db.close()
-    display = _display_name(row[0]) if row else str(chat_id)
+    await set_user_allowed(chat_id, False)
+    display = _display_name(row) if row else str(chat_id)
     await callback.message.edit_text(f"⛔ Пользователь {display} заблокирован.")
 
 
@@ -270,16 +231,9 @@ async def adm_promote_user(callback: CallbackQuery):
     if not await is_admin(callback.message.chat.id):
         return
     chat_id = int(callback.data.replace("adm_prom_", ""))
-    db = await get_db()
-    try:
-        await db.execute("UPDATE users SET is_admin=1 WHERE chat_id=?", (chat_id,))
-        await db.commit()
-        row = await db.execute_fetchall(
-            "SELECT chat_id, username, first_name, last_name FROM users WHERE chat_id=?", (chat_id,)
-        )
-    finally:
-        await db.close()
-    display = _display_name(row[0]) if row else str(chat_id)
+    await set_user_admin(chat_id, True)
+    row = await get_user(chat_id)
+    display = _display_name(row) if row else str(chat_id)
     await callback.message.edit_text(f"👑 Пользователь {display} назначен админом.")
 
 
@@ -302,20 +256,12 @@ async def adm_demote_user(callback: CallbackQuery):
     if not await is_admin(callback.message.chat.id):
         return
     chat_id = int(callback.data.replace("adm_demote_", ""))
-    db = await get_db()
-    try:
-        row = await db.execute_fetchall(
-            "SELECT chat_id, username, first_name, last_name FROM users WHERE chat_id=?",
-            (chat_id,),
-        )
-        if row and _is_main_owner_row(row[0]):
+    row = await get_user(chat_id)
+    if row and _is_main_owner_row(row):
             await callback.answer("❌ Нельзя снять админа с главного владельца.", show_alert=True)
             return
-        await db.execute("UPDATE users SET is_admin=0 WHERE chat_id=?", (chat_id,))
-        await db.commit()
-    finally:
-        await db.close()
-    display = _display_name(row[0]) if row else str(chat_id)
+    await set_user_admin(chat_id, False)
+    display = _display_name(row) if row else str(chat_id)
     await callback.message.edit_text(f"⬇️ Пользователь {display} больше не админ.")
 
 
@@ -323,18 +269,7 @@ async def _show_user_list(callback: CallbackQuery, prefix: str, is_allowed: int,
                           exclude_chat_id: int | None = None,
                           exclude_main_owner: bool = False,
                           require_admin: int | None = None):
-    db = await get_db()
-    try:
-        rows = await db.execute_fetchall(
-            """
-            SELECT chat_id, username, first_name, last_name, is_admin
-            FROM users
-            WHERE is_allowed=?
-            """,
-            (is_allowed,),
-        )
-    finally:
-        await db.close()
+    rows = await list_users_by_access(is_allowed)
 
     # Filter out excluded user (self-protection)
     filtered = list(rows)

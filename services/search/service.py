@@ -3,7 +3,11 @@ from __future__ import annotations
 import re
 
 from bot.integrations.opi_client import OPIChecker
-from bot.repositories.borrowers import lookup_borrower_info, upsert_borrower_info
+from bot.repositories.borrowers import (
+    lookup_borrower_info,
+    search_borrower_info,
+    upsert_borrower_info,
+)
 
 
 def extract_document_ids(text: str) -> list[str]:

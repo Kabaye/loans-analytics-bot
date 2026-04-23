@@ -12,15 +12,15 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from bot import config
-from bot.domain.models import BorrowEntry, UserCredentials
+from bot.domain.models import BorrowEntry
 from bot.integrations.opi_client import OPIChecker
 from bot.integrations.parsers.kapusta import KapustaBlockedError
 from bot.repositories.borrowers import upsert_borrower
 from bot.repositories.opi_cache import get_stale_opi_documents
 from bot.repositories.settings import get_site_settings
+from bot.services.base.cache import set_cached_entries
 from bot.services.base.providers import (
-    _ensure_finkit_parser,
-    _ensure_zaimis_parser,
+    ensure_finkit_parser,
     ensure_kapusta_parser,
     get_export_parsers as _provider_get_export_parsers,
     get_parser as _provider_get_parser,
@@ -28,6 +28,7 @@ from bot.services.base.providers import (
     pick_round_robin_credential,
     reset_kapusta_parser,
     shutdown_parsers as _provider_shutdown_parsers,
+    ensure_zaimis_parser,
 )
 from bot.services.credentials.investment_refresh import refresh_investments
 from bot.services.notifications.fresh_tracker import compute_fresh
@@ -42,9 +43,6 @@ from bot.services.overdue.sync import refresh_overdue_snapshot
 from bot.services.settings.schema_monitor import notify_json_schema_change
 
 log = logging.getLogger(__name__)
-
-cached_loans: dict[str, list[dict]] = {"kapusta": [], "finkit": [], "zaimis": []}
-cached_at: dict[str, str | None] = {"kapusta": None, "finkit": None, "zaimis": None}
 
 _opi_checker: Optional[OPIChecker] = None
 _scheduler: Optional[AsyncIOScheduler] = None
@@ -116,8 +114,7 @@ async def poll_kapusta(bot: Bot) -> None:
             return
 
         entries = await parser.fetch_borrows()
-        cached_loans["kapusta"] = [entry.to_dict() for entry in entries]
-        cached_at["kapusta"] = datetime.now(timezone.utc).isoformat()
+        set_cached_entries("kapusta", [entry.to_dict() for entry in entries])
         _clear_error("kapusta")
         _kapusta_backoff_until = None
         if entries:
@@ -148,7 +145,7 @@ async def poll_finkit(bot: Bot) -> None:
         if cred is None:
             return
 
-        parser = await _ensure_finkit_parser(cred)
+        parser = await ensure_finkit_parser(cred)
         if parser is None:
             log.warning("Finkit login failed for chat_id=%s login=%s", cred.chat_id, cred.login)
             return
@@ -156,14 +153,13 @@ async def poll_finkit(bot: Bot) -> None:
         entries = await parser.fetch_borrows()
         if parser.needs_reauth:
             log.info("Finkit session expired for chat_id=%s login=%s — re-logging in", cred.chat_id, cred.login)
-            parser = await _ensure_finkit_parser(cred, force_login=True)
+            parser = await ensure_finkit_parser(cred, force_login=True)
             if parser is None:
                 log.warning("Finkit re-login failed for chat_id=%s login=%s", cred.chat_id, cred.login)
                 return
             entries = await parser.fetch_borrows()
 
-        cached_loans["finkit"] = [entry.to_dict() for entry in entries]
-        cached_at["finkit"] = datetime.now(timezone.utc).isoformat()
+        set_cached_entries("finkit", [entry.to_dict() for entry in entries])
 
         if entries:
             await notify_json_schema_change("finkit", entries)
@@ -259,7 +255,7 @@ async def poll_zaimis(bot: Bot) -> None:
         if cred is None:
             return
 
-        parser = await _ensure_zaimis_parser(cred)
+        parser = await ensure_zaimis_parser(cred)
         if parser is None:
             log.warning("Zaimis login failed for chat_id=%s login=%s", cred.chat_id, cred.login)
             return
@@ -267,14 +263,13 @@ async def poll_zaimis(bot: Bot) -> None:
         all_entries = await parser.fetch_borrows(subscriptions=subs_list)
         if parser.needs_reauth:
             log.info("Zaimis token expired for chat_id=%s login=%s — re-logging in", cred.chat_id, cred.login)
-            parser = await _ensure_zaimis_parser(cred, force_login=True)
+            parser = await ensure_zaimis_parser(cred, force_login=True)
             if parser is None:
                 log.warning("Zaimis re-login failed for chat_id=%s login=%s", cred.chat_id, cred.login)
                 return
             all_entries = await parser.fetch_borrows(subscriptions=subs_list)
 
-        cached_loans["zaimis"] = [entry.to_dict() for entry in all_entries]
-        cached_at["zaimis"] = datetime.now(timezone.utc).isoformat()
+        set_cached_entries("zaimis", [entry.to_dict() for entry in all_entries])
 
         if all_entries:
             await notify_json_schema_change("zaimis", all_entries)
@@ -424,10 +419,8 @@ def get_parser(service: str, chat_id: int | None = None):
 
 
 __all__ = [
-    "_ensure_finkit_parser",
-    "_ensure_zaimis_parser",
-    "cached_at",
-    "cached_loans",
+    "ensure_finkit_parser",
+    "ensure_zaimis_parser",
     "get_export_parsers",
     "get_parser",
     "midnight_refresh_investments",

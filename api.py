@@ -6,12 +6,9 @@ import logging
 
 from aiohttp import web
 
-from bot import config
-from bot.jobs.scheduler import cached_loans, cached_at
+from bot.services.base.cache import VALID_SERVICES, get_cached_snapshot
 
 log = logging.getLogger(__name__)
-
-VALID_SERVICES = {"kapusta", "finkit", "zaimis"}
 
 
 async def handle_loans(request: web.Request) -> web.Response:
@@ -34,11 +31,7 @@ async def handle_loans(request: web.Request) -> web.Response:
 
     result = {}
     for svc in sorted(requested):
-        result[svc] = {
-            "entries": cached_loans.get(svc, []),
-            "count": len(cached_loans.get(svc, [])),
-            "cached_at": cached_at.get(svc),
-        }
+        result[svc] = get_cached_snapshot(svc)
 
     return web.Response(
         text=json.dumps(result, ensure_ascii=False, indent=2),
@@ -51,10 +44,8 @@ async def handle_health(request: web.Request) -> web.Response:
     """GET /api/health — simple health check."""
     status = {}
     for svc in sorted(VALID_SERVICES):
-        status[svc] = {
-            "count": len(cached_loans.get(svc, [])),
-            "cached_at": cached_at.get(svc),
-        }
+        snapshot = get_cached_snapshot(svc)
+        status[svc] = {"count": snapshot["count"], "cached_at": snapshot["cached_at"]}
     return web.json_response({"status": "ok", "services": status})
 
 

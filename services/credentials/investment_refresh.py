@@ -18,8 +18,8 @@ from bot.repositories.borrowers import (
     upsert_borrower_from_investment,
 )
 from bot.services.base.providers import (
-    _ensure_finkit_parser,
-    _ensure_zaimis_parser,
+    ensure_finkit_parser,
+    ensure_zaimis_parser,
     list_service_credentials,
     telegram_user_tag,
 )
@@ -78,7 +78,7 @@ async def refresh_investments(bot: Bot) -> None:
         for cred in creds:
             try:
                 user_tag = telegram_user_tag(cred)
-                parser = await _ensure_finkit_parser(cred)
+                parser = await ensure_finkit_parser(cred)
                 if parser is None:
                     errors.append(f"Finkit login failed: {cred.login}")
                     continue
@@ -92,7 +92,7 @@ async def refresh_investments(bot: Bot) -> None:
                     url = f"https://api-p2p.finkit.by/user/investments/?page={page}"
                     async with session.get(url, headers=headers) as resp:
                         if resp.status in (401, 403) and not relogged:
-                            parser = await _ensure_finkit_parser(cred, force_login=True)
+                            parser = await ensure_finkit_parser(cred, force_login=True)
                             if parser is None:
                                 errors.append(f"Finkit re-login failed: {cred.login}")
                                 break
@@ -208,14 +208,14 @@ async def refresh_investments(bot: Bot) -> None:
         for cred in creds:
             try:
                 user_tag = telegram_user_tag(cred)
-                parser = await _ensure_zaimis_parser(cred)
+                parser = await ensure_zaimis_parser(cred)
                 if parser is None:
                     errors.append(f"Zaimis login failed: {cred.login}")
                     continue
 
                 orders = await parser.fetch_investments()
                 if parser.needs_reauth:
-                    parser = await _ensure_zaimis_parser(cred, force_login=True)
+                    parser = await ensure_zaimis_parser(cred, force_login=True)
                     if parser is None:
                         errors.append(f"Zaimis re-login failed: {cred.login}")
                         continue

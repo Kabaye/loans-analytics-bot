@@ -13,8 +13,8 @@ from bot.repositories.overdue import (
     upsert_overdue_case,
 )
 from bot.services.base.providers import (
-    _ensure_finkit_parser,
-    _ensure_zaimis_parser,
+    ensure_finkit_parser,
+    ensure_zaimis_parser,
     list_service_credentials,
     telegram_user_tag,
 )
@@ -74,14 +74,14 @@ async def sync_finkit_overdue_cases() -> tuple[int, list[str]]:
 
     for cred in creds:
         try:
-            parser = await _ensure_finkit_parser(cred)
+            parser = await ensure_finkit_parser(cred)
             if parser is None:
                 errors.append(f"Finkit login failed: {cred.login}")
                 continue
 
             items = await parser.fetch_investments()
             if parser.needs_reauth:
-                parser = await _ensure_finkit_parser(cred, force_login=True)
+                parser = await ensure_finkit_parser(cred, force_login=True)
                 if parser is None:
                     errors.append(f"Finkit re-login failed: {cred.login}")
                     continue
@@ -211,14 +211,14 @@ async def sync_zaimis_overdue_cases() -> tuple[int, list[str]]:
 
     for cred in creds:
         try:
-            parser = await _ensure_zaimis_parser(cred)
+            parser = await ensure_zaimis_parser(cred)
             if parser is None:
                 errors.append(f"Zaimis login failed: {cred.login}")
                 continue
 
             orders = await parser.fetch_investments()
             if parser.needs_reauth:
-                parser = await _ensure_zaimis_parser(cred, force_login=True)
+                parser = await ensure_zaimis_parser(cred, force_login=True)
                 if parser is None:
                     errors.append(f"Zaimis re-login failed: {cred.login}")
                     continue

@@ -82,7 +82,7 @@ async def reset_kapusta_parser() -> None:
     _kapusta = None
 
 
-async def _ensure_finkit_parser(cred: UserCredentials, force_login: bool = False) -> FinkitParser | None:
+async def ensure_finkit_parser(cred: UserCredentials, force_login: bool = False) -> FinkitParser | None:
     parser = _finkit_parsers.get(cred.id)
     if parser is None or force_login:
         if parser is not None:
@@ -110,7 +110,7 @@ async def _ensure_finkit_parser(cred: UserCredentials, force_login: bool = False
     return None
 
 
-async def _ensure_zaimis_parser(cred: UserCredentials, force_login: bool = False) -> ZaimisParser | None:
+async def ensure_zaimis_parser(cred: UserCredentials, force_login: bool = False) -> ZaimisParser | None:
     parser = _zaimis_parsers.get(cred.id)
     if parser is None or force_login:
         if parser is not None:
@@ -147,14 +147,14 @@ async def get_export_parsers(service: str, chat_id: int) -> list:
         cred = pick_round_robin_credential(service, await list_service_credentials(service, chat_id=chat_id))
         if not cred:
             return []
-        parser = await _ensure_finkit_parser(cred)
+        parser = await ensure_finkit_parser(cred)
         return [parser] if parser else []
 
     if service == "zaimis":
         cred = pick_round_robin_credential(service, await list_service_credentials(service, chat_id=chat_id))
         if not cred:
             return []
-        parser = await _ensure_zaimis_parser(cred)
+        parser = await ensure_zaimis_parser(cred)
         return [parser] if parser else []
 
     return []
@@ -194,10 +194,16 @@ async def shutdown_parsers():
     _zaimis_parsers.clear()
 
 
+_ensure_finkit_parser = ensure_finkit_parser
+_ensure_zaimis_parser = ensure_zaimis_parser
+
+
 __all__ = [
     "_ensure_finkit_parser",
     "_ensure_zaimis_parser",
+    "ensure_finkit_parser",
     "ensure_kapusta_parser",
+    "ensure_zaimis_parser",
     "get_export_parsers",
     "get_parser",
     "list_service_credentials",

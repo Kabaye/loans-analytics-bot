@@ -35,7 +35,7 @@ from bot.repositories.overdue import (
     upsert_overdue_case,
 )
 from bot.services.base.access import is_allowed
-from bot.services.base.providers import _ensure_finkit_parser
+from bot.services.base.providers import ensure_finkit_parser
 from bot.services.overdue.documents import (
     build_sms_text,
     collect_claim_missing_fields,
@@ -249,7 +249,7 @@ async def _enrich_finkit_case_from_claims(case: dict) -> dict:
         login=str(credential_row["login"]),
         password=str(credential_row["password"]),
     )
-    parser = await _ensure_finkit_parser(cred)
+    parser = await ensure_finkit_parser(cred)
     if parser is None:
         return case
 

@@ -14,7 +14,8 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
-from bot.database import get_db
+from bot.repositories.db import get_db
+from bot.services.base.access import is_admin as _is_admin_service, is_allowed as _is_allowed_service
 from bot.services.fsm_guard import set_free, drain
 
 log = logging.getLogger(__name__)
@@ -24,28 +25,11 @@ MAIN_MENU_TEXT = "🏠 <b>Главное меню</b>\nВыберите дейс
 
 
 async def is_allowed(chat_id: int) -> bool:
-    db = await get_db()
-    try:
-        rows = await db.execute_fetchall(
-            "SELECT 1 FROM users WHERE chat_id=? AND is_allowed=1", (chat_id,)
-        )
-        return len(rows) > 0
-    finally:
-        await db.close()
+    return await _is_allowed_service(chat_id)
 
 
 async def is_admin(chat_id: int) -> bool:
-    from bot.config import ADMIN_CHAT_ID
-    if chat_id == ADMIN_CHAT_ID:
-        return True
-    db = await get_db()
-    try:
-        rows = await db.execute_fetchall(
-            "SELECT 1 FROM users WHERE chat_id=? AND is_admin=1", (chat_id,)
-        )
-        return len(rows) > 0
-    finally:
-        await db.close()
+    return await _is_admin_service(chat_id)
 
 
 async def ensure_user(chat_id: int, username: str | None = None,
@@ -170,7 +154,7 @@ async def cb_status(callback: CallbackQuery):
     if not await is_allowed(callback.message.chat.id):
         return
 
-    from bot.database import get_all_site_settings
+    from bot.repositories.settings import get_all_site_settings
 
     db = await get_db()
     try:

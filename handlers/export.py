@@ -16,12 +16,12 @@ from aiogram.types import (
     BufferedInputFile,
 )
 
-from bot.handlers.start import is_allowed
-from bot.models import BorrowEntry
-from bot.services.scheduler import get_export_parsers as get_live_export_parsers
-from bot.services.opi_checker import OPIChecker
-from bot.database import lookup_borrower
-from bot.services.notifier import enrich_entry_from_borrowers
+from bot.domain.models import BorrowEntry
+from bot.integrations.opi_client import OPIChecker
+from bot.repositories.borrowers import lookup_borrower
+from bot.services.base.access import is_allowed
+from bot.services.base.providers import get_export_parsers as get_live_export_parsers
+from bot.services.notifications.sender import enrich_entry_from_borrowers
 
 log = logging.getLogger(__name__)
 router = Router(name="export")
@@ -209,7 +209,7 @@ def _extend_unique_entries(target: list[BorrowEntry], entries: list[BorrowEntry]
 async def _get_export_parsers(service: str, chat_id: int):
     """Return (parsers, owned_parsers) for export."""
     if service == "mongo":
-        from bot.parsers.mongo import MongoParser
+        from bot.integrations.parsers.mongo import MongoParser
 
         parser = MongoParser()
         await parser.login()

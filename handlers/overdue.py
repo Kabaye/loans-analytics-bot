@@ -17,24 +17,26 @@ from aiogram.types import (
 )
 
 from bot import config
-from bot.database import (
+from bot.domain.models import UserCredentials
+from bot.integrations.geolocation_client import lookup_belarus_zip
+from bot.repositories.credentials import (
     get_credential_by_id,
+    list_user_credentials,
+)
+from bot.repositories.overdue import (
     get_credential_creditor_profile,
     get_overdue_case,
     get_user_signature_asset,
     list_overdue_cases,
-    list_user_credentials,
     save_generated_document,
     save_user_signature_asset,
+    update_overdue_case_contacts,
     upsert_credential_creditor_profile,
     upsert_overdue_case,
-    update_overdue_case_contacts,
 )
-from bot.handlers.start import is_allowed
-from bot.models import UserCredentials
-from bot.services.postal_lookup import lookup_belarus_zip
-from bot.services.scheduler import _ensure_finkit_parser
-from bot.services.debtor_documents import (
+from bot.services.base.access import is_allowed
+from bot.services.base.providers import _ensure_finkit_parser
+from bot.services.overdue.documents import (
     build_sms_text,
     collect_claim_missing_fields,
     collect_sms_missing_fields,

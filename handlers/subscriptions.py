@@ -15,8 +15,8 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
-from bot.database import get_db
-from bot.handlers.start import is_allowed
+from bot.repositories.db import get_db
+from bot.services.base.access import is_allowed
 from bot.services.fsm_guard import set_busy, set_free, drain
 
 log = logging.getLogger(__name__)

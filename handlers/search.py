@@ -14,11 +14,11 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
-from bot.handlers.start import is_allowed
-from bot.database import (
+from bot.repositories.borrowers import (
     search_borrower_info, lookup_borrower_info, upsert_borrower_info,
 )
-from bot.services.opi_checker import OPIChecker
+from bot.integrations.opi_client import OPIChecker
+from bot.services.base.access import is_allowed
 
 log = logging.getLogger(__name__)
 router = Router(name="search")

@@ -16,8 +16,10 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
-from bot.database import get_db, upsert_borrower_from_investment, save_credential_session
-from bot.handlers.start import is_allowed
+from bot.repositories.borrowers import upsert_borrower_from_investment
+from bot.repositories.credentials import save_credential_session
+from bot.repositories.db import get_db
+from bot.services.base.access import is_allowed
 
 log = logging.getLogger(__name__)
 router = Router(name="credentials")
@@ -201,7 +203,7 @@ async def _autoload_investments(credential_id: int, service: str, login: str, pa
 
 async def _load_zaimis_investments(credential_id: int, login: str, password: str) -> int:
     """Fetch Zaimis investments and upsert into borrowers table."""
-    from bot.parsers.zaimis import ZaimisParser
+    from bot.integrations.parsers.zaimis import ZaimisParser
     zp = ZaimisParser()
     try:
         ok = await zp.login(login, password)
@@ -259,7 +261,7 @@ async def _load_zaimis_investments(credential_id: int, login: str, password: str
 
 async def _load_finkit_investments(credential_id: int, login: str, password: str) -> int:
     """Fetch Finkit investments and upsert into borrowers table."""
-    from bot.parsers.finkit import FinkitParser
+    from bot.integrations.parsers.finkit import FinkitParser
     fp = FinkitParser()
     try:
         ok = await fp.login(login, password)

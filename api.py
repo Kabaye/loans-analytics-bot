@@ -7,7 +7,7 @@ import logging
 from aiohttp import web
 
 from bot import config
-from bot.services.scheduler import cached_loans, cached_at
+from bot.jobs.scheduler import cached_loans, cached_at
 
 log = logging.getLogger(__name__)
 

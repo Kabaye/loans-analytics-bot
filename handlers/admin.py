@@ -17,13 +17,19 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
-from bot.database import (
-    get_db, get_all_site_settings, update_site_setting,
-    get_borrowers_stats, get_borrowers_count, get_missing_opi_candidates,
-    list_api_change_alerts, get_api_change_alert, delete_api_change_alert, clear_api_change_alerts,
+from bot.repositories.borrowers import get_borrowers_count, get_borrowers_stats
+from bot.repositories.db import get_db
+from bot.repositories.opi_cache import get_missing_opi_candidates
+from bot.repositories.settings import (
+    clear_api_change_alerts,
+    delete_api_change_alert,
+    get_all_site_settings,
+    get_api_change_alert,
+    list_api_change_alerts,
+    update_site_setting,
 )
 from bot.config import ADMIN_CHAT_ID
-from bot.services.scheduler import get_export_parsers
+from bot.services.base.providers import get_export_parsers
 
 log = logging.getLogger(__name__)
 router = Router(name="admin")
@@ -616,7 +622,7 @@ async def adm_test_app(callback: CallbackQuery):
 
     await callback.message.edit_text("🔄 Запускаю полный тест приложения... Подождите 30-90 секунд.")
 
-    from bot.services.opi_checker import OPIChecker
+    from bot.integrations.opi_client import OPIChecker
 
     results: list[str] = []
 
@@ -790,7 +796,7 @@ async def adm_test_notif_menu(callback: CallbackQuery):
 
 async def _send_test_notification(callback: CallbackQuery, services: list[str]):
     """Fetch one real entry from each service and send formatted notification."""
-    from bot.services.notifier import format_notification
+    from bot.services.notifications.sender import format_notification
 
     chat_id = callback.message.chat.id
     await callback.message.edit_text("🔄 Загружаю заявки для тестовых уведомлений...")
@@ -823,7 +829,7 @@ async def _send_test_notification(callback: CallbackQuery, services: list[str]):
                         entry = entries[0]
 
             if entry:
-                from bot.models import Subscription
+                from bot.domain.models import Subscription
                 dummy_sub = Subscription(
                     id=0, chat_id=chat_id, service=svc,
                     label="🧪 Тестовое уведомление",

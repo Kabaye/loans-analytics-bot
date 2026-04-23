@@ -11,10 +11,12 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand, MenuButtonCommands
 
 from bot import config
-from bot.database import init_db
+from bot.repositories.db import init_db
+from bot.repositories.users import ensure_admin_user
 from bot.handlers import start, subscriptions, credentials, admin, export, search, overdue
-from bot.services.scheduler import setup_scheduler, shutdown_parsers
-from bot.services.notifier import router as notifier_router
+from bot.jobs.scheduler import setup_scheduler
+from bot.services.base.providers import shutdown_parsers
+from bot.services.notifications.sender import router as notifier_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,20 +36,7 @@ async def on_startup(bot: Bot) -> None:
 
     # Ensure admin user exists and is allowed
     if config.ADMIN_CHAT_ID:
-        from bot.database import get_db
-        db = await get_db()
-        try:
-            await db.execute(
-                "INSERT OR IGNORE INTO users (chat_id, is_admin, is_allowed) VALUES (?, 1, 1)",
-                (config.ADMIN_CHAT_ID,),
-            )
-            await db.execute(
-                "UPDATE users SET is_admin=1, is_allowed=1 WHERE chat_id=?",
-                (config.ADMIN_CHAT_ID,),
-            )
-            await db.commit()
-        finally:
-            await db.close()
+        await ensure_admin_user(config.ADMIN_CHAT_ID)
 
     log.info("Bot started. Admin chat_id=%s", config.ADMIN_CHAT_ID)
 

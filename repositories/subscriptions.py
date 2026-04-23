@@ -20,26 +20,30 @@ def _coerce_utc_datetime(value) -> datetime | None:
     return None
 
 
+def _row_value(row, key: str):
+    return row[key] if key in row.keys() else None
+
+
 def _to_subscription(row) -> Subscription:
     return Subscription(
-        id=row["id"],
-        chat_id=row["chat_id"],
-        service=row["service"],
-        label=row["label"],
-        sum_min=row["sum_min"],
-        sum_max=row["sum_max"],
-        rating_min=row["rating_min"],
-        rating_max=row["rating_max"],
-        period_min=row["period_min"],
-        period_max=row["period_max"],
-        interest_min=row["interest_min"],
-        interest_max=row["interest_max"],
-        require_employed=bool(row["require_employed"]) if row["require_employed"] is not None else None,
-        require_income_confirmed=bool(row["require_income_confirmed"]) if row["require_income_confirmed"] is not None else None,
-        is_active=bool(row["is_active"]) if row["is_active"] is not None else True,
-        night_paused=bool(row["night_paused"]) if row["night_paused"] is not None else False,
-        min_settled_loans=row["min_settled_loans"] if row["min_settled_loans"] else None,
-        created_at=_coerce_utc_datetime(row["created_at"]),
+        id=_row_value(row, "id"),
+        chat_id=_row_value(row, "chat_id"),
+        service=_row_value(row, "service"),
+        label=_row_value(row, "label"),
+        sum_min=_row_value(row, "sum_min"),
+        sum_max=_row_value(row, "sum_max"),
+        rating_min=_row_value(row, "rating_min"),
+        rating_max=_row_value(row, "rating_max"),
+        period_min=_row_value(row, "period_min"),
+        period_max=_row_value(row, "period_max"),
+        interest_min=_row_value(row, "interest_min"),
+        interest_max=_row_value(row, "interest_max"),
+        require_employed=bool(_row_value(row, "require_employed")) if _row_value(row, "require_employed") is not None else None,
+        require_income_confirmed=bool(_row_value(row, "require_income_confirmed")) if _row_value(row, "require_income_confirmed") is not None else None,
+        is_active=bool(_row_value(row, "is_active")) if _row_value(row, "is_active") is not None else True,
+        night_paused=bool(_row_value(row, "night_paused")) if _row_value(row, "night_paused") is not None else False,
+        min_settled_loans=_row_value(row, "min_settled_loans") if _row_value(row, "min_settled_loans") else None,
+        created_at=_coerce_utc_datetime(_row_value(row, "created_at")),
     )
 
 

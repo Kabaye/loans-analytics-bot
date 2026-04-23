@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
@@ -9,6 +8,7 @@ from typing import Optional
 @dataclass
 class BorrowEntry:
     """Unified borrow request from any platform."""
+
     id: str
     service: str  # 'kapusta' | 'finkit' | 'zaimis'
     request_type: str = "borrow"  # 'borrow' or 'lend'
@@ -21,19 +21,16 @@ class BorrowEntry:
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
-    # profit calculations
-    profit_gross: float = 0.0       # total interest earned
-    profit_net: float = 0.0         # after platform fee
-    amount_return: float = 0.0      # total borrower pays back
-    platform_fee_open: float = 0.0  # fee on loan issuance
-    platform_fee_close: float = 0.0 # fee on loan closure
+    profit_gross: float = 0.0
+    profit_net: float = 0.0
+    amount_return: float = 0.0
+    platform_fee_open: float = 0.0
+    platform_fee_close: float = 0.0
 
-    # borrower info
     full_name: Optional[str] = None
-    document_id: Optional[str] = None  # identification number for OPI
+    document_id: Optional[str] = None
     display_name: Optional[str] = None
 
-    # extra flags
     is_income_confirmed: Optional[bool] = None
     is_employed: Optional[bool] = None
     has_active_loan: Optional[bool] = None
@@ -45,10 +42,8 @@ class BorrowEntry:
     loans_count_settled: Optional[int] = None
     loans_count_overdue: Optional[int] = None
 
-    # borrower platform-specific user ID (for cross-loan matching)
     borrower_user_id: Optional[str] = None
 
-    # OPI enrichment
     opi_checked: bool = False
     opi_has_debt: Optional[bool] = None
     opi_debt_amount: Optional[float] = None
@@ -56,7 +51,6 @@ class BorrowEntry:
     opi_checked_at: Optional[datetime | str] = None
     opi_error: Optional[str] = None
 
-    # Known borrower enrichment (from investment history)
     kb_known: bool = False
     kb_total_loans: Optional[int] = None
     kb_settled: Optional[int] = None
@@ -67,20 +61,15 @@ class BorrowEntry:
     kb_last_rating: Optional[float] = None
     kb_total_invested: Optional[float] = None
 
-    # Borrower info card (from borrower_info table / Google Sheets import)
-    bi_loan_status: Optional[str] = None    # в срок / просрочка / все плохо
-    bi_sum_category: Optional[str] = None   # до 300 / 301-799 / больше 800
+    bi_loan_status: Optional[str] = None
+    bi_sum_category: Optional[str] = None
     bi_rating: Optional[float] = None
 
-    # Direct link to the loan on the platform
     loan_url: Optional[str] = None
-
-    # Raw API data — preserves all original fields including new/unknown ones
     raw_data: Optional[dict] = field(default=None, repr=False)
 
     def to_dict(self) -> dict:
-        """Serialize to dict for JSON API. Includes raw_data as extra fields."""
-        d = {
+        payload = {
             "id": self.id,
             "service": self.service,
             "request_type": self.request_type,
@@ -112,11 +101,7 @@ class BorrowEntry:
             "opi_has_debt": self.opi_has_debt,
             "opi_debt_amount": self.opi_debt_amount,
             "opi_full_name": self.opi_full_name,
-            "opi_checked_at": (
-                self.opi_checked_at.isoformat()
-                if isinstance(self.opi_checked_at, datetime)
-                else self.opi_checked_at
-            ),
+            "opi_checked_at": self.opi_checked_at.isoformat() if isinstance(self.opi_checked_at, datetime) else self.opi_checked_at,
             "opi_error": self.opi_error,
             "kb_known": self.kb_known,
             "kb_total_loans": self.kb_total_loans,
@@ -130,64 +115,8 @@ class BorrowEntry:
             "loan_url": self.loan_url,
         }
         if self.raw_data:
-            d["raw_data"] = self.raw_data
-        return d
+            payload["raw_data"] = self.raw_data
+        return payload
 
 
-@dataclass
-class Subscription:
-    id: int
-    chat_id: int
-    service: str
-    label: Optional[str] = None
-    sum_min: Optional[float] = None
-    sum_max: Optional[float] = None
-    rating_min: Optional[float] = None
-    rating_max: Optional[float] = None
-    period_min: Optional[int] = None
-    period_max: Optional[int] = None
-    interest_min: Optional[float] = None
-    interest_max: Optional[float] = None
-    require_employed: Optional[bool] = None
-    require_income_confirmed: Optional[bool] = None
-    is_active: bool = True
-    night_paused: bool = False
-    min_settled_loans: Optional[int] = None
-    created_at: Optional[datetime] = None
-
-    def matches(self, entry: BorrowEntry) -> bool:
-        if self.sum_min is not None and entry.amount < self.sum_min:
-            return False
-        if self.sum_max is not None and entry.amount > self.sum_max:
-            return False
-        if self.rating_min is not None and entry.credit_score < self.rating_min:
-            return False
-        if self.rating_max is not None and entry.credit_score > self.rating_max:
-            return False
-        if self.period_min is not None and entry.period_days < self.period_min:
-            return False
-        if self.period_max is not None and entry.period_days > self.period_max:
-            return False
-        if self.interest_min is not None and entry.interest_day < self.interest_min:
-            return False
-        if self.interest_max is not None and entry.interest_day > self.interest_max:
-            return False
-        if self.require_employed and not entry.is_employed:
-            return False
-        if self.require_income_confirmed and not entry.is_income_confirmed:
-            return False
-        if self.min_settled_loans is not None and self.min_settled_loans > 0:
-            settled = entry.loans_count_settled or entry.kb_settled or 0
-            if settled < self.min_settled_loans:
-                return False
-        return True
-
-
-@dataclass
-class UserCredentials:
-    chat_id: int
-    service: str
-    login: str
-    password: str
-    id: int = 0
-    username: Optional[str] = None
+__all__ = ["BorrowEntry"]

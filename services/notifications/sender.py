@@ -1,68 +1,20 @@
 """Notifier — matches new borrows against subscriptions and sends TG messages."""
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
 import math
-import uuid
-from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
 
-from aiogram import Bot, Router, F
-from aiogram.exceptions import TelegramRetryAfter
-from aiogram.types import (
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    CallbackQuery,
-)
-
-from bot.domain.models import BorrowEntry, Subscription
-from bot.repositories.borrowers import lookup_borrower
+from bot.domain.borrowers import BorrowEntry
+from bot.domain.subscriptions import Subscription
 from bot.repositories.subscriptions import (
     has_active_subscriptions_for_service,
     list_active_subscriptions_for_service,
 )
+from bot.services.borrowers.enrichment import enrich_entry_from_borrowers
 
 log = logging.getLogger(__name__)
-
-router = Router(name="notifier")
-
-# In-memory cache for raw_data (limited size, FIFO eviction)
-_RAW_DATA_CACHE: OrderedDict[str, dict] = OrderedDict()
-_RAW_DATA_CACHE_MAX = 500
-
-
-def _store_raw_data(raw_data: dict | None) -> str | None:
-    """Store raw_data and return a short key for the inline button callback."""
-    if not raw_data:
-        return None
-    key = uuid.uuid4().hex[:12]
-    _RAW_DATA_CACHE[key] = raw_data
-    # Evict oldest if over limit
-    while len(_RAW_DATA_CACHE) > _RAW_DATA_CACHE_MAX:
-        _RAW_DATA_CACHE.popitem(last=False)
-    return key
-
-
-@router.callback_query(F.data.startswith("raw_"))
-async def cb_show_raw_data(callback: CallbackQuery):
-    """Show raw JSON data for a notification entry."""
-    key = callback.data.replace("raw_", "")
-    raw = _RAW_DATA_CACHE.get(key)
-    if not raw:
-        await callback.answer("⏳ Данные устарели (перезапуск бота)", show_alert=True)
-        return
-
-    import html as html_mod
-    text = json.dumps(raw, ensure_ascii=False, indent=2, default=str)
-    # Telegram message limit is 4096 chars
-    if len(text) > 3900:
-        text = text[:3900] + "\n... (обрезано)"
-    escaped = html_mod.escape(text)
-    await callback.message.reply(f"<pre>{escaped}</pre>", parse_mode="HTML")
-    await callback.answer()
 
 SERVICE_ICONS = {
     "kapusta": "🥬",
@@ -90,6 +42,15 @@ COMMISSION_RATES = {
 }
 
 TAX_RATE = 0.13  # 13% income tax on gross profit
+
+
+@dataclass(slots=True)
+class PreparedNotification:
+    entry_id: str
+    chat_id: int
+    text: str
+    matched_subscriptions: list[Subscription]
+    raw_data: dict | None = None
 
 
 def _coerce_utc_datetime(value) -> datetime | None:
@@ -431,75 +392,20 @@ async def has_active_subscriptions(service: str) -> bool:
     return await has_active_subscriptions_for_service(service)
 
 
-async def enrich_entry_from_borrowers(entry: BorrowEntry) -> None:
-    """Enrich a BorrowEntry with data from borrowers + borrower_info tables."""
-    if not entry.borrower_user_id:
-        return
-    cached = await lookup_borrower(entry.service, entry.borrower_user_id)
-    if not cached:
-        return
-    if not entry.full_name and cached.get("full_name"):
-        entry.full_name = cached["full_name"]
-    if not entry.document_id and cached.get("document_id"):
-        entry.document_id = cached["document_id"]
-    # OPI data from borrower_info (via JOIN)
-    if cached.get("opi_checked_at") and not entry.opi_checked:
-        entry.opi_checked = True
-        entry.opi_has_debt = bool(cached.get("opi_has_debt"))
-        entry.opi_debt_amount = cached.get("opi_debt_amount")
-        entry.opi_full_name = cached.get("opi_full_name")
-        entry.opi_checked_at = cached.get("opi_checked_at")
-    # Investment stats from borrowers table
-    if cached.get("total_loans") and cached["total_loans"] > 0:
-        entry.kb_known = True
-        entry.kb_total_loans = cached.get("total_loans")
-        entry.kb_settled = cached.get("settled_loans")
-        entry.kb_overdue = cached.get("overdue_loans")
-        entry.kb_avg_rating = cached.get("avg_rating")
-        entry.kb_total_invested = cached.get("total_invested")
-    # Borrower_info card data (loan history from Google Sheets)
-    if cached.get("loan_status"):
-        entry.bi_loan_status = cached["loan_status"]
-    if cached.get("sum_category"):
-        entry.bi_sum_category = cached["sum_category"]
-    if cached.get("bi_rating") is not None:
-        entry.bi_rating = cached["bi_rating"]
-
-
-async def notify_users(
-    bot: Bot,
+async def prepare_notifications(
     entries: list[BorrowEntry],
     service: str,
     *,
     skip_enrichment: bool = False,
-) -> list[tuple[str, int, int, list[Subscription]]]:
-    """Match entries against subscriptions and send notifications.
-
-    Returns list of (entry_id, chat_id, message_id, subs) for sent messages
-    that can later be edited via update_sent_notifications().
-
-    If skip_enrichment=True, skip the enrich_entry_from_borrowers step
-    (caller handles enrichment separately).
-    """
-    from bot.services.fsm_guard import is_busy, enqueue
-
+) -> list[PreparedNotification]:
     subs = await get_active_subscriptions(service)
     if not subs:
         return []
 
-    sent_refs: list[tuple[str, int, int, list[Subscription]]] = []
+    plans: list[PreparedNotification] = []
     for entry in entries:
-        # Enrich from borrowers table (unless caller handles it)
         if not skip_enrichment and service != "finkit":
             await enrich_entry_from_borrowers(entry)
-
-        # Prepare raw_data button
-        raw_key = _store_raw_data(entry.raw_data)
-        kb = None
-        if raw_key:
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📋 Исходные данные", callback_data=f"raw_{raw_key}")]
-            ])
 
         matched_by_chat: dict[int, list[Subscription]] = {}
         for chat_id, sub in subs:
@@ -511,95 +417,24 @@ async def notify_users(
 
         for chat_id, matched_subs in matched_by_chat.items():
             text = format_notification(entry, matched_subs)
-
-            # If user is busy creating a subscription, queue the notification
-            if is_busy(chat_id):
-                enqueue(chat_id, text, kb)
-                continue
-
-            try:
-                msg = await bot.send_message(chat_id, text, parse_mode="HTML",
-                                             disable_web_page_preview=True,
-                                             reply_markup=kb)
-                sent_refs.append((entry.id, chat_id, msg.message_id, matched_subs))
-                await asyncio.sleep(0.1)
-            except TelegramRetryAfter as e:
-                log.warning("Flood control for %s: retry after %ds", chat_id, e.retry_after)
-                await asyncio.sleep(min(e.retry_after, 30))
-                try:
-                    msg = await bot.send_message(chat_id, text, parse_mode="HTML",
-                                                 disable_web_page_preview=True,
-                                                 reply_markup=kb)
-                    sent_refs.append((entry.id, chat_id, msg.message_id, matched_subs))
-                except Exception:
-                    pass
-            except Exception as e:
-                log.warning("Failed to send notification to %s: %s", chat_id, e)
-
-    log.info("Sent %d notifications for %s", len(sent_refs), service)
-    return sent_refs
-
-
-async def update_sent_notifications(
-    bot: Bot,
-    entries: list[BorrowEntry],
-    sent_refs: list[tuple[str, int, int, list[Subscription]]],
-    service: str,
-) -> int:
-    """Edit previously sent notifications with enriched data.
-
-    Compares new text with original; only edits if content actually changed.
-    Returns count of messages edited.
-    """
-    if not sent_refs:
-        return 0
-
-    entry_map = {e.id: e for e in entries}
-    edited = 0
-    for entry_id, chat_id, message_id, matched_subs in sent_refs:
-        entry = entry_map.get(entry_id)
-        if not entry:
-            continue
-
-        new_text = format_notification(entry, matched_subs)
-
-        # Rebuild raw_data button
-        raw_key = _store_raw_data(entry.raw_data)
-        kb = None
-        if raw_key:
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📋 Исходные данные", callback_data=f"raw_{raw_key}")]
-            ])
-
-        try:
-            await bot.edit_message_text(
-                new_text,
-                chat_id=chat_id,
-                message_id=message_id,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-                reply_markup=kb,
-            )
-            edited += 1
-            await asyncio.sleep(0.1)
-        except TelegramRetryAfter as e:
-            await asyncio.sleep(min(e.retry_after, 30))
-            try:
-                await bot.edit_message_text(
-                    new_text,
+            plans.append(
+                PreparedNotification(
+                    entry_id=entry.id,
                     chat_id=chat_id,
-                    message_id=message_id,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                    reply_markup=kb,
+                    text=text,
+                    matched_subscriptions=matched_subs,
+                    raw_data=entry.raw_data,
                 )
-                edited += 1
-            except Exception:
-                pass
-        except Exception as e:
-            if "message is not modified" not in str(e).lower():
-                log.warning("Failed to edit notification %s/%s: %s", chat_id, message_id, e)
+            )
 
-    if edited:
-        log.info("Edited %d/%d notifications for %s", edited, len(sent_refs), service)
-    return edited
+    return plans
+
+
+__all__ = [
+    "PreparedNotification",
+    "enrich_entry_from_borrowers",
+    "format_notification",
+    "get_active_subscriptions",
+    "has_active_subscriptions",
+    "prepare_notifications",
+]

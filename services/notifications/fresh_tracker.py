@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from bot.domain.models import BorrowEntry
+from bot.domain.borrowers import BorrowEntry
 from bot.repositories.seen_entries import (
     load_seen_entry_ids,
     seed_seen_entry_ids,

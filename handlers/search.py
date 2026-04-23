@@ -13,15 +13,15 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
-from bot.repositories.borrowers import (
-    search_borrower_info, lookup_borrower_info, upsert_borrower_info,
-)
 from bot.services.search.service import (
     add_borrower_and_refresh_opi,
     extract_document_ids,
     force_refresh_opi_card,
     format_borrower_card,
+    lookup_borrower_info,
     run_opi_batch,
+    search_borrower_info,
+    upsert_borrower_info,
 )
 from bot.services.base.access import is_allowed
 
@@ -180,7 +180,7 @@ async def msg_search_batch_ids(message: Message, state: FSMContext):
     if not await is_allowed(message.chat.id):
         return
 
-    doc_ids = _extract_document_ids(message.text or "")
+    doc_ids = extract_document_ids(message.text or "")
     if not doc_ids:
         await message.answer(
             "❌ Не нашёл ни одного ИН. Отправьте от 1 до 10 ИН по 14 символов.",

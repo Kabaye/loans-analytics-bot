@@ -1,12 +1,89 @@
-from bot.domain.models import UserCredentials
+import json
+
+from bot.domain.credentials import UserCredentials
 from bot.repositories.db import get_db
-from bot.repositories.legacy_database import (
-    delete_credential_session,
-    get_credential_by_id,
-    get_saved_credential_session,
-    list_user_credentials,
-    save_credential_session,
-)
+
+
+async def get_saved_credential_session(credential_id: int) -> dict | None:
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            "SELECT session_data FROM credential_sessions WHERE credential_id = ?",
+            (credential_id,),
+        )
+        if not rows:
+            return None
+        return json.loads(rows[0]["session_data"])
+    finally:
+        await db.close()
+
+
+async def save_credential_session(credential_id: int, service: str, session_data: dict) -> None:
+    db = await get_db()
+    try:
+        await db.execute(
+            """
+            INSERT INTO credential_sessions (credential_id, service, session_data, updated_at)
+            VALUES (?, ?, ?, datetime('now'))
+            ON CONFLICT(credential_id) DO UPDATE SET
+                service = excluded.service,
+                session_data = excluded.session_data,
+                updated_at = datetime('now')
+            """,
+            (credential_id, service, json.dumps(session_data, ensure_ascii=False)),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def delete_credential_session(credential_id: int) -> None:
+    db = await get_db()
+    try:
+        await db.execute(
+            "DELETE FROM credential_sessions WHERE credential_id = ?",
+            (credential_id,),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def list_user_credentials(chat_id: int, services: tuple[str, ...] | None = None) -> list[dict]:
+    db = await get_db()
+    try:
+        params: list[object] = [chat_id]
+        where = "WHERE chat_id = ?"
+        if services:
+            placeholders = ",".join("?" for _ in services)
+            where += f" AND service IN ({placeholders})"
+            params.extend(services)
+        rows = await db.execute_fetchall(
+            f"""
+            SELECT id, chat_id, service, login, password, label
+            FROM credentials
+            {where}
+            ORDER BY service, id
+            """,
+            params,
+        )
+        return [dict(row) for row in rows]
+    finally:
+        await db.close()
+
+
+async def get_credential_by_id(credential_id: int, chat_id: int | None = None) -> dict | None:
+    db = await get_db()
+    try:
+        sql = "SELECT id, chat_id, service, login, password, label FROM credentials WHERE id = ?"
+        params: list[object] = [credential_id]
+        if chat_id is not None:
+            sql += " AND chat_id = ?"
+            params.append(chat_id)
+        rows = await db.execute_fetchall(sql, params)
+        return dict(rows[0]) if rows else None
+    finally:
+        await db.close()
 
 
 async def list_credentials_rows(chat_id: int) -> list[dict]:

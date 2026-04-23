@@ -17,17 +17,13 @@ from aiogram.types import (
 )
 
 from bot import config
-from bot.domain.models import UserCredentials
-from bot.integrations.geolocation_client import lookup_belarus_zip
-from bot.repositories.credentials import (
+from bot.services.overdue.service import (
     get_credential_by_id,
-    list_user_credentials,
-)
-from bot.repositories.overdue import (
     get_credential_creditor_profile,
     get_overdue_case,
     get_user_signature_asset,
     list_overdue_cases,
+    list_user_credentials,
     save_generated_document,
     save_user_signature_asset,
     update_overdue_case_contacts,
@@ -35,7 +31,7 @@ from bot.repositories.overdue import (
     upsert_overdue_case,
 )
 from bot.services.base.access import is_allowed
-from bot.services.base.providers import ensure_finkit_parser
+from bot.services.overdue.cases import enrich_finkit_case_from_claims, resolve_belarus_zip
 from bot.services.overdue.documents import (
     build_sms_text,
     collect_claim_missing_fields,
@@ -234,73 +230,7 @@ async def _show_credential_profile_message(callback: CallbackQuery, credential_i
 
 
 async def _enrich_finkit_case_from_claims(case: dict) -> dict:
-    if case.get("service") != "finkit" or not case.get("credential_id"):
-        return case
-    if case.get("borrower_address") and case.get("borrower_zip") and case.get("document_id"):
-        return case
-
-    credential_row = await get_credential_by_id(int(case["credential_id"]), case["chat_id"])
-    if not credential_row:
-        return case
-    cred = UserCredentials(
-        id=int(credential_row["id"]),
-        chat_id=int(credential_row["chat_id"]),
-        service=str(credential_row["service"]),
-        login=str(credential_row["login"]),
-        password=str(credential_row["password"]),
-    )
-    parser = await ensure_finkit_parser(cred)
-    if parser is None:
-        return case
-
-    payload = _parse_raw(case)
-    detail = payload.get("detail") or {}
-    claims = detail.get("claims") or []
-    if not claims:
-        claims = await parser.fetch_claims(str(case.get("external_id") or ""), create_if_missing=True)
-        if claims:
-            detail["claims"] = claims
-            payload["detail"] = detail
-            await upsert_overdue_case(
-                chat_id=int(case["chat_id"]),
-                credential_id=int(case["credential_id"]),
-                service="finkit",
-                external_id=str(case["external_id"]),
-                raw_data=payload,
-            )
-
-    claim_document_url = next((claim.get("document_url") for claim in claims if claim.get("document_url")), None)
-    if claim_document_url:
-        claim_pdf_bytes = await parser.fetch_contract_pdf(claim_document_url)
-        if claim_pdf_bytes:
-            claim_data = parser.parse_claim_document_pdf(claim_pdf_bytes)
-            zipcode = case.get("borrower_zip") or await lookup_belarus_zip(claim_data.get("debtor_address"))
-            await update_overdue_case_contacts(
-                int(case["id"]),
-                int(case["chat_id"]),
-                borrower_address=claim_data.get("debtor_address"),
-                borrower_zip=zipcode,
-                borrower_phone=claim_data.get("debtor_phone"),
-                borrower_email=claim_data.get("debtor_email"),
-            )
-
-    if not case.get("document_id") and case.get("contract_url"):
-        contract_pdf = await parser.fetch_contract_pdf(str(case["contract_url"]))
-        if contract_pdf:
-            pdf_full_name, pdf_document_id = parser.parse_borrower_from_contract_pdf(contract_pdf)
-            if pdf_full_name or pdf_document_id:
-                await upsert_overdue_case(
-                    chat_id=int(case["chat_id"]),
-                    credential_id=int(case["credential_id"]),
-                    service="finkit",
-                    external_id=str(case["external_id"]),
-                    full_name=pdf_full_name,
-                    document_id=pdf_document_id,
-                    raw_data=payload,
-                )
-
-    refreshed = await get_overdue_case(int(case["id"]), int(case["chat_id"]))
-    return refreshed or case
+    return await enrich_finkit_case_from_claims(case)
 
 
 def _format_case_text(case: dict) -> str:
@@ -656,7 +586,7 @@ async def msg_overdue_contacts(message: Message, state: FSMContext):
         return
     zip_code = None if zip_code_raw == "-" else zip_code_raw
     if not zip_code:
-        zip_code = await lookup_belarus_zip(address)
+        zip_code = await resolve_belarus_zip(address)
     await update_overdue_case_contacts(
         case_id,
         message.chat.id,

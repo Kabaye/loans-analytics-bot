@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from bot.domain.models import UserCredentials
+from bot.domain.credentials import UserCredentials
 from bot.integrations.parsers.finkit import FinkitParser
 from bot.integrations.parsers.kapusta import KapustaParser
 from bot.integrations.parsers.zaimis import ZaimisParser

@@ -16,14 +16,14 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
-from bot.repositories.credentials import (
+from bot.services.credentials.service import (
     delete_credential,
     list_credentials_for_delete,
     list_credentials_rows,
+    load_investments_archive,
     upsert_credential,
 )
 from bot.services.base.access import is_allowed
-from bot.services.credentials.archive_loader import load_investments_archive
 
 log = logging.getLogger(__name__)
 router = Router(name="credentials")

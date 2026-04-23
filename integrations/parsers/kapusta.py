@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 from curl_cffi.requests import AsyncSession
 
-from bot.domain.models import BorrowEntry
+from bot.domain.borrowers import BorrowEntry
 from bot.integrations.parsers.base import BaseParser
 
 log = logging.getLogger(__name__)

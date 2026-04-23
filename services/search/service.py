@@ -124,5 +124,8 @@ __all__ = [
     "extract_document_ids",
     "force_refresh_opi_card",
     "format_borrower_card",
+    "lookup_borrower_info",
     "run_opi_batch",
+    "search_borrower_info",
+    "upsert_borrower_info",
 ]

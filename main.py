@@ -11,12 +11,12 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand, MenuButtonCommands
 
 from bot import config
+from bot.integrations.telegram_notifications import router as notifier_router
 from bot.repositories.db import init_db
 from bot.repositories.users import ensure_admin_user
 from bot.handlers import start, subscriptions, credentials, admin, export, search, overdue
 from bot.jobs.scheduler import setup_scheduler
 from bot.services.base.providers import shutdown_parsers
-from bot.services.notifications.sender import router as notifier_router
 
 logging.basicConfig(
     level=logging.INFO,

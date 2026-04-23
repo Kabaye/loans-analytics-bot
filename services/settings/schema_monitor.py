@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 
-from bot.domain.models import BorrowEntry
+from bot.domain.borrowers import BorrowEntry
 from bot.repositories.settings import (
     get_json_schema_state,
     save_api_change_alert,

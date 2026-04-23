@@ -11,7 +11,8 @@ from datetime import datetime
 
 import pdfplumber
 
-from bot.domain.models import BorrowEntry, Subscription
+from bot.domain.borrowers import BorrowEntry
+from bot.domain.subscriptions import Subscription
 from bot.integrations.parsers.base import BROWSER_UA, BaseParser
 
 log = logging.getLogger(__name__)
@@ -388,11 +389,15 @@ class ZaimisParser(BaseParser):
             return None, None
 
     async def enrich_borrowers_from_orders(
-        self, orders: list[dict], max_concurrent: int = 4
+        self,
+        orders: list[dict],
+        max_concurrent: int = 4,
+        *,
+        skip_counterparty_ids: set[str] | None = None,
     ) -> dict[str, tuple[str | None, str | None]]:
         """For each unique counterparty, fetch one order detail → PDF → extract ИН.
         Returns {counterparty_id: (full_name, document_id)}."""
-        from bot.repositories.borrowers import lookup_borrower
+        skip_counterparty_ids = skip_counterparty_ids or set()
 
         # Group orders by counterparty, pick one order per borrower (prefer settled)
         borrower_orders: dict[str, str] = {}  # cp_id → order_id
@@ -401,9 +406,7 @@ class ZaimisParser(BaseParser):
             cp_id = str(cp.get("id", ""))
             if not cp_id:
                 continue
-            # Check if already in DB with document_id
-            cached = await lookup_borrower("zaimis", cp_id)
-            if cached and cached.get("document_id"):
+            if cp_id in skip_counterparty_ids:
                 continue
             state = order.get("state")
             if cp_id not in borrower_orders or state == 3:

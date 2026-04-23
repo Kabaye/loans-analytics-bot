@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
-from bot.domain.models import BorrowEntry
+from bot.domain.borrowers import BorrowEntry
 from bot.integrations.parsers.base import BaseParser
 
 log = logging.getLogger(__name__)

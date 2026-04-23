@@ -8,15 +8,16 @@ from datetime import datetime, timedelta, timezone
 from html import escape
 
 import pdfplumber
-from aiogram import Bot
 
 from bot import config
+from bot.integrations.telegram_admin import send_admin_html_message
 from bot.repositories.borrowers import (
     get_borrowers_count,
     list_borrower_name_map,
     upsert_borrower,
     upsert_borrower_from_investment,
 )
+from bot.services.borrowers.enrichment import list_borrower_ids_with_documents
 from bot.services.base.providers import (
     ensure_finkit_parser,
     ensure_zaimis_parser,
@@ -51,7 +52,7 @@ def _extract_document_id_from_pdf(pdf_bytes: bytes) -> str | None:
     return None
 
 
-async def refresh_investments(bot: Bot) -> None:
+async def refresh_investments(bot) -> None:
     global _last_investment_refresh
 
     now = datetime.now(timezone.utc)
@@ -271,7 +272,14 @@ async def refresh_investments(bot: Bot) -> None:
                     )
 
                 try:
-                    pdf_results = await parser.enrich_borrowers_from_orders(orders)
+                    skip_counterparty_ids = await list_borrower_ids_with_documents(
+                        "zaimis",
+                        list(zaimis_stats.keys()),
+                    )
+                    pdf_results = await parser.enrich_borrowers_from_orders(
+                        orders,
+                        skip_counterparty_ids=skip_counterparty_ids,
+                    )
                     for borrower_user_id, (full_name, document_id) in pdf_results.items():
                         await upsert_borrower(
                             service="zaimis",
@@ -315,8 +323,7 @@ async def refresh_investments(bot: Bot) -> None:
             lines.append(f"\n⚠️ Ошибки ({len(errors)}):")
             for error in errors[:5]:
                 lines.append(f"  • {str(error)[:200]}")
-        if config.ADMIN_CHAT_ID:
-            await bot.send_message(config.ADMIN_CHAT_ID, "\n".join(lines), parse_mode="HTML")
+        await send_admin_html_message(bot, "\n".join(lines))
     except Exception:
         pass
 

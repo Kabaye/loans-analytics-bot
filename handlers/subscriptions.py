@@ -15,7 +15,7 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
-from bot.repositories.subscriptions import (
+from bot.services.subscriptions.service import (
     create_subscription,
     deactivate_all_subscriptions,
     delete_subscription,
@@ -28,8 +28,8 @@ from bot.repositories.subscriptions import (
     toggle_subscription_flag,
     update_subscription_field,
 )
+from bot.integrations.fsm_guard import set_busy, set_free, drain
 from bot.services.base.access import is_allowed
-from bot.services.fsm_guard import set_busy, set_free, drain
 
 log = logging.getLogger(__name__)
 router = Router(name="subscriptions")

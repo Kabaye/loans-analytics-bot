@@ -16,12 +16,8 @@ from aiogram.types import (
     BufferedInputFile,
 )
 
-from bot.domain.models import BorrowEntry
-from bot.integrations.opi_client import OPIChecker
-from bot.repositories.borrowers import lookup_borrower
 from bot.services.base.access import is_allowed
-from bot.services.base.providers import get_export_parsers as get_live_export_parsers
-from bot.services.notifications.sender import enrich_entry_from_borrowers
+from bot.services.export.service import collect_export_entries
 
 log = logging.getLogger(__name__)
 router = Router(name="export")
@@ -101,122 +97,6 @@ async def cb_export_format_select(callback: CallbackQuery):
         reply_markup=kb,
         parse_mode="HTML",
     )
-
-
-async def _collect_entries(services: list[str], chat_id: int) -> list[dict]:
-    """Fetch fresh borrow + lend entries from parsers, enrich with PDF, OPI, and known borrowers."""
-    all_entries: list[BorrowEntry] = []
-
-    for svc in services:
-        parsers, owned = await _get_export_parsers(svc, chat_id)
-        if not parsers:
-            log.info("Export: no parsers for %s (chat_id=%s)", svc, chat_id)
-            continue
-
-        try:
-            for parser in parsers:
-                try:
-                    borrows = await parser.fetch_borrows()
-                    if borrows:
-                        if svc == "finkit" and hasattr(parser, "enrich_with_pdf"):
-                            await parser.enrich_with_pdf(borrows)
-                        _extend_unique_entries(all_entries, borrows)
-                except Exception as e:
-                    log.warning("Export: failed to fetch borrows for %s: %s", svc, e)
-
-                try:
-                    lend_entries = await parser.fetch_lends()
-                    if lend_entries:
-                        _extend_unique_entries(all_entries, lend_entries)
-                except Exception as e:
-                    log.warning("Export: failed to fetch lends for %s: %s", svc, e)
-        finally:
-            for parser in owned:
-                try:
-                    await parser.close()
-                except Exception:
-                    pass
-
-    # DB enrichment from borrowers + borrower_info
-    for entry in all_entries:
-        try:
-            await enrich_entry_from_borrowers(entry)
-        except Exception as e:
-            log.warning("Export: borrowers enrichment error for %s: %s", entry.id, e)
-
-    # OPI enrichment for entries with document_id
-    entries_with_id = [e for e in all_entries if e.document_id]
-    if entries_with_id:
-        opi = OPIChecker()
-        try:
-            for entry in entries_with_id:
-                try:
-                    result = await asyncio.wait_for(
-                        opi.check(entry.document_id), timeout=30,
-                    )
-                    entry.opi_checked = True
-                    entry.opi_checked_at = datetime.now(timezone.utc)
-                    if result.error:
-                        entry.opi_error = result.error
-                        entry.opi_has_debt = None
-                    else:
-                        entry.opi_error = None
-                        entry.opi_has_debt = result.has_debt
-                        entry.opi_debt_amount = result.debt_amount
-                        entry.opi_full_name = result.full_name
-                except asyncio.TimeoutError:
-                    entry.opi_checked = True
-                    entry.opi_checked_at = datetime.now(timezone.utc)
-                    entry.opi_error = "таймаут (30с)"
-                except Exception as ex:
-                    entry.opi_checked = True
-                    entry.opi_checked_at = datetime.now(timezone.utc)
-                    entry.opi_error = str(ex)
-        finally:
-            await opi.close()
-
-    # Known borrower enrichment from borrowers table
-    for entry in all_entries:
-        buid = getattr(entry, "borrower_user_id", None)
-        service = entry.service if hasattr(entry, "service") else None
-        if not buid or not service:
-            continue
-        try:
-            kb = await lookup_borrower(service=service, borrower_user_id=buid)
-            if kb:
-                entry.kb_known = True
-                entry.kb_total_loans = kb.get("total_loans")
-                entry.kb_settled = kb.get("settled_loans")
-                entry.kb_overdue = kb.get("overdue_loans")
-                entry.kb_avg_rating = kb.get("avg_rating")
-                entry.kb_total_invested = kb.get("total_invested")
-        except Exception as e:
-            log.warning("KB enrichment error for %s: %s", entry.id, e)
-
-    return [e.to_dict() for e in all_entries]
-
-
-def _extend_unique_entries(target: list[BorrowEntry], entries: list[BorrowEntry]) -> None:
-    seen = {(e.service, e.request_type, e.id) for e in target}
-    for entry in entries:
-        key = (entry.service, entry.request_type, entry.id)
-        if key in seen:
-            continue
-        target.append(entry)
-        seen.add(key)
-
-
-async def _get_export_parsers(service: str, chat_id: int):
-    """Return (parsers, owned_parsers) for export."""
-    if service == "mongo":
-        from bot.integrations.parsers.mongo import MongoParser
-
-        parser = MongoParser()
-        await parser.login()
-        return [parser], [parser]
-
-    parsers = await get_live_export_parsers(service, chat_id)
-    return parsers, []
 
 
 def _entries_to_csv(entries: list[dict]) -> bytes:
@@ -309,7 +189,7 @@ async def cb_export_do(callback: CallbackQuery):
     await callback.message.edit_text(f"⏳ Загрузка данных ({label}, {ext})...")
 
     try:
-        entries = await _collect_entries(services, callback.message.chat.id)
+        entries = await collect_export_entries(services, callback.message.chat.id)
     except Exception as e:
         await callback.message.edit_text(
             f"❌ Ошибка загрузки: {e}",

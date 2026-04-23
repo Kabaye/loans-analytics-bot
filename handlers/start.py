@@ -14,11 +14,9 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
-from bot.repositories.credentials import list_credential_services
-from bot.repositories.subscriptions import count_active_subscriptions_by_service
-from bot.repositories.users import ensure_user
+from bot.integrations.fsm_guard import set_free, drain
 from bot.services.base.access import is_admin as _is_admin_service, is_allowed as _is_allowed_service
-from bot.services.fsm_guard import set_free, drain
+from bot.services.start.service import ensure_chat_user, get_status_snapshot
 
 log = logging.getLogger(__name__)
 router = Router(name="start")
@@ -58,7 +56,7 @@ def get_main_menu_kb(admin: bool = False) -> InlineKeyboardMarkup:
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     user = message.from_user
-    await ensure_user(
+    await ensure_chat_user(
         message.chat.id,
         username=user.username if user else None,
         first_name=user.first_name if user else None,
@@ -138,18 +136,16 @@ async def cb_help(callback: CallbackQuery):
 async def cb_status(callback: CallbackQuery):
     if not await is_allowed(callback.message.chat.id):
         return
-
-    from bot.repositories.settings import get_all_site_settings
-
-    subs = await count_active_subscriptions_by_service(callback.message.chat.id)
-    cred_services = await list_credential_services(callback.message.chat.id)
+    snapshot = await get_status_snapshot(callback.message.chat.id)
+    subs = snapshot["subscriptions"]
+    cred_services = snapshot["credential_services"]
 
     sub_lines = []
     for row in subs:
         sub_lines.append(f"  {row['service']}: {row['cnt']} подписок")
 
     # Site settings info
-    settings = await get_all_site_settings()
+    settings = snapshot["site_settings"]
     site_lines = []
     for s in settings:
         status = "✅" if s.get("polling_enabled") else "⏸"

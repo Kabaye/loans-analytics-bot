@@ -6,7 +6,7 @@ from typing import Optional
 
 import aiohttp
 
-from bot.domain.models import BorrowEntry
+from bot.domain.borrowers import BorrowEntry
 
 log = logging.getLogger(__name__)
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from bot.domain.models import Subscription
+from bot.domain.subscriptions import Subscription
 from bot.repositories.db import get_db
 
 

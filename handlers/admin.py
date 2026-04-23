@@ -17,28 +17,26 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
-from bot.repositories.borrowers import get_borrowers_count, get_borrowers_stats
-from bot.repositories.credentials import get_first_credential_owner_chat_id
-from bot.repositories.opi_cache import get_missing_opi_candidates
-from bot.repositories.settings import (
+from bot.services.admin.service import (
     clear_api_change_alerts,
     delete_api_change_alert,
     get_all_site_settings,
     get_api_change_alert,
+    get_missing_opi_candidates,
+    get_test_notification_entry as get_test_notification_entry_service,
+    get_test_parser as get_test_parser_service,
     list_api_change_alerts,
     update_site_setting,
-)
-from bot.repositories.users import (
     ensure_user,
     get_user,
-    is_chat_admin,
     list_users,
     list_users_by_access,
+    run_full_app_test as run_full_app_test_service,
+    is_admin as is_admin_service,
     set_user_admin,
     set_user_allowed,
 )
 from bot.config import ADMIN_CHAT_ID
-from bot.services.base.providers import get_export_parsers
 
 log = logging.getLogger(__name__)
 router = Router(name="admin")
@@ -68,7 +66,7 @@ def _display_name(row) -> str:
 
 
 async def is_admin(chat_id: int) -> bool:
-    return await is_chat_admin(chat_id, ADMIN_CHAT_ID)
+    return await is_admin_service(chat_id)
 
 
 def _is_main_owner_row(row) -> bool:
@@ -78,16 +76,7 @@ def _is_main_owner_row(row) -> bool:
 
 
 async def _get_test_parser(service: str, requester_chat_id: int):
-    """Reuse the same parser/session acquisition path as export."""
-    target_chat_id = requester_chat_id
-    if service in ("finkit", "zaimis"):
-        owner_chat_id = await get_first_credential_owner_chat_id(service)
-        if owner_chat_id is None:
-            return None
-        target_chat_id = owner_chat_id
-
-    parsers = await get_export_parsers(service, target_chat_id)
-    return parsers[0] if parsers else None
+    return await get_test_parser_service(service, requester_chat_id)
 
 
 class AdminAddUser(StatesGroup):
@@ -556,106 +545,7 @@ async def adm_test_app(callback: CallbackQuery):
         return
 
     await callback.message.edit_text("🔄 Запускаю полный тест приложения... Подождите 30-90 секунд.")
-
-    from bot.integrations.opi_client import OPIChecker
-
-    results: list[str] = []
-
-    # --- Kapusta ---
-    try:
-        kp = await _get_test_parser("kapusta", callback.message.chat.id)
-        if kp is None:
-            entries_k = []
-            results.append("🥬 <b>Kapusta</b>: ❌ parser unavailable")
-        else:
-            entries_k = await asyncio.wait_for(kp.fetch_borrows(), timeout=30)
-            results.append(f"🥬 <b>Kapusta</b>: {len(entries_k)} заявок")
-        if entries_k:
-            e = entries_k[0] if hasattr(entries_k[0], "amount") else type("E", (), entries_k[0])()
-            amt = e.amount if hasattr(e, "amount") else e.get("amount", 0) if isinstance(e, dict) else 0
-            results.append(f"  └ первая: {amt:.0f} BYN")
-    except Exception as ex:
-        results.append(f"🥬 <b>Kapusta</b>: ❌ {ex}")
-
-    # --- FinKit ---
-    try:
-        fp = await _get_test_parser("finkit", callback.message.chat.id)
-        if fp is None:
-            results.append("🔵 <b>FinKit</b>: ⚠️ Нет credentials")
-        else:
-            entries_f = await fp.fetch_borrows()
-            results.append(f"🔵 <b>FinKit</b>: {len(entries_f)} заявок")
-            if entries_f:
-                e = entries_f[0]
-                results.append(
-                    f"  └ #{e.id}: {e.amount:.0f} BYN, {e.period_days}д, "
-                    f"рейт {e.credit_score:.0f}, {e.interest_day:.2f}%/д"
-                )
-                # PDF + OPI enrichment on first with contract
-                to_enrich = [ee for ee in entries_f if ee.contract_url][:1]
-                if to_enrich:
-                    await fp.enrich_with_pdf(to_enrich)
-                    ee = to_enrich[0]
-                    results.append(
-                        f"  └ PDF: ФИО={ee.full_name or '—'}, ИН={ee.document_id or '—'}"
-                    )
-                    if ee.document_id:
-                        opi = OPIChecker()
-                        try:
-                            res = await opi.check(ee.document_id, use_cache=False)
-                            if res.error:
-                                results.append(f"  └ ОПИ: ⚠️ {res.error}")
-                            elif res.has_debt:
-                                results.append(
-                                    f"  └ ОПИ: 🔴 ДОЛГ {res.debt_amount:.2f} BYN ({res.full_name or '—'})"
-                                )
-                            else:
-                                results.append("  └ ОПИ: 🟢 Нет задолженности")
-                        finally:
-                            await opi.close()
-                    else:
-                        results.append("  └ ОПИ: ⏭ нет ИН")
-                else:
-                    results.append("  └ PDF: нет contract_url")
-    except Exception as ex:
-        results.append(f"🔵 <b>FinKit</b>: ❌ {ex}")
-
-    # --- ЗАЙМись ---
-    try:
-        zp = await _get_test_parser("zaimis", callback.message.chat.id)
-        if zp is None:
-            results.append("🟪 <b>ЗАЙМись</b>: ⚠️ Нет credentials")
-        else:
-            entries_z = await zp.fetch_borrows()
-            results.append(f"🟪 <b>ЗАЙМись</b>: {len(entries_z)} заявок")
-            if entries_z:
-                e = entries_z[0]
-                results.append(
-                    f"  └ #{e.id[:8]}…: {e.amount:.0f} BYN, {e.period_days}д, "
-                    f"рейт {e.credit_score:.0f}, {e.interest_day:.2f}%/д"
-                )
-    except Exception as ex:
-        results.append(f"🟪 <b>ЗАЙМись</b>: ❌ {ex}")
-
-    # --- Borrowers + borrower_info stats ---
-    try:
-        stats = await get_borrowers_stats()
-        missing_opi = await get_missing_opi_candidates(min_age_days=10, limit=500)
-        if stats and (stats.get("total") or stats.get("mappings")):
-            results.append(
-                f"\n📊 <b>Карточки заёмщиков (borrower_info)</b>:\n"
-                f"  Всего карточек: {stats.get('total', 0)}\n"
-                f"  OPI проверено: {stats.get('opi_checked', 0)}\n"
-                f"  С долгами: {stats.get('with_debt', 0)}\n"
-                f"  С инвестициями: {stats.get('with_investments', 0)}\n"
-                f"  Маппингов (borrowers): {stats.get('mappings', 0)}\n"
-                f"  С ИН: {stats.get('with_document', 0)}\n"
-                f"  Нет OPI 10+ дней: {len(missing_opi)}"
-            )
-        else:
-            results.append("\n📊 <b>Карточки заёмщиков</b>: пусто")
-    except Exception as ex:
-        results.append(f"\n📊 <b>Карточки заёмщиков</b>: ❌ {ex}")
+    results = await run_full_app_test_service(callback.message.chat.id)
 
     text = "\n".join(results)
     if len(text) > 4000:
@@ -732,6 +622,7 @@ async def adm_test_notif_menu(callback: CallbackQuery):
 async def _send_test_notification(callback: CallbackQuery, services: list[str]):
     """Fetch one real entry from each service and send formatted notification."""
     from bot.services.notifications.sender import format_notification
+    from bot.domain.subscriptions import Subscription
 
     chat_id = callback.message.chat.id
     await callback.message.edit_text("🔄 Загружаю заявки для тестовых уведомлений...")
@@ -741,36 +632,13 @@ async def _send_test_notification(callback: CallbackQuery, services: list[str]):
 
     for svc in services:
         try:
-            entry = None
-            if svc == "kapusta":
-                kp = await _get_test_parser("kapusta", chat_id)
-                if kp:
-                    entries = await kp.fetch_borrows()
-                    if entries:
-                        entry = entries[0]
-
-            elif svc == "finkit":
-                fp = await _get_test_parser("finkit", chat_id)
-                if fp:
-                    entries = await fp.fetch_borrows()
-                    if entries:
-                        entry = entries[0]
-
-            elif svc == "zaimis":
-                zp = await _get_test_parser("zaimis", chat_id)
-                if zp:
-                    entries = await zp.fetch_borrows()
-                    if entries:
-                        entry = entries[0]
-
+            entry = await get_test_notification_entry_service(svc, chat_id)
             if entry:
-                from bot.domain.models import Subscription
                 dummy_sub = Subscription(
                     id=0, chat_id=chat_id, service=svc,
                     label="🧪 Тестовое уведомление",
                 )
                 text = format_notification(entry, dummy_sub)
-                from aiogram import Bot
                 bot = callback.bot
                 await bot.send_message(
                     chat_id, text, parse_mode="HTML",

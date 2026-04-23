@@ -16,7 +16,7 @@ from aiogram.types import (
 
 from bot.integrations.fsm_guard import set_free, drain
 from bot.services.base.access import is_admin as _is_admin_service, is_allowed as _is_allowed_service
-from bot.services.start.service import ensure_chat_user, get_status_snapshot
+from bot.services.start.service import ensure_chat_user
 
 log = logging.getLogger(__name__)
 router = Router(name="start")
@@ -43,10 +43,7 @@ def get_main_menu_kb(admin: bool = False) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🔍 Поиск заёмщика", callback_data="search_borrower"),
             InlineKeyboardButton(text="⚖️ Просрочки", callback_data="overdue_menu"),
         ],
-        [
-            InlineKeyboardButton(text="ℹ️ Статус", callback_data="show_status"),
-            InlineKeyboardButton(text="❓ Помощь", callback_data="show_help"),
-        ],
+        [InlineKeyboardButton(text="❓ Помощь", callback_data="show_help")],
     ]
     if admin:
         buttons.append([InlineKeyboardButton(text="👑 Администрирование", callback_data="admin_menu")])
@@ -132,53 +129,8 @@ async def cb_help(callback: CallbackQuery):
     )
 
 
-@router.callback_query(F.data == "show_status")
-async def cb_status(callback: CallbackQuery):
-    if not await is_allowed(callback.message.chat.id):
-        return
-    snapshot = await get_status_snapshot(callback.message.chat.id)
-    subs = snapshot["subscriptions"]
-    cred_services = snapshot["credential_services"]
-
-    sub_lines = []
-    for row in subs:
-        sub_lines.append(f"  {row['service']}: {row['cnt']} подписок")
-
-    # Site settings info
-    settings = snapshot["site_settings"]
-    site_lines = []
-    for s in settings:
-        status = "✅" if s.get("polling_enabled") else "⏸"
-        interval = s.get("poll_interval", 60)
-        site_lines.append(f"  {status} {s['service']}: интервал {interval}с")
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")]
-    ])
-    text = (
-        "<b>📊 Ваш статус</b>\n\n"
-        f"<b>Подписки:</b>\n"
-        + ("\n".join(sub_lines) if sub_lines else "  Нет активных подписок")
-        + "\n\n<b>Учётные данные:</b>\n"
-        + (", ".join(cred_services) if cred_services else "  Не настроены")
-        + "\n\n<b>Парсеры:</b>\n"
-        + "\n".join(site_lines)
-    )
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-
-
 @router.message(Command("help"))
 async def cmd_help(message: Message):
-    if not await is_allowed(message.chat.id):
-        return
-    admin = await is_admin(message.chat.id)
-    kb = get_main_menu_kb(admin)
-    await message.answer(MAIN_MENU_TEXT, reply_markup=kb, parse_mode="HTML")
-
-
-@router.message(Command("status"))
-async def cmd_status(message: Message):
-    """Redirect /status to the callback handler."""
     if not await is_allowed(message.chat.id):
         return
     admin = await is_admin(message.chat.id)

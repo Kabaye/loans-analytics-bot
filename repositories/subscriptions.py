@@ -210,24 +210,6 @@ async def deactivate_all_subscriptions(chat_id: int) -> None:
         await db.close()
 
 
-async def count_active_subscriptions_by_service(chat_id: int) -> list[dict]:
-    db = await get_db()
-    try:
-        rows = await db.execute_fetchall(
-            """
-            SELECT service, COUNT(*) as cnt
-            FROM subscriptions
-            WHERE chat_id=? AND is_active=1
-            GROUP BY service
-            ORDER BY service
-            """,
-            (chat_id,),
-        )
-        return [dict(row) for row in rows]
-    finally:
-        await db.close()
-
-
 async def list_active_subscriptions_for_service(service: str) -> list[tuple[int, Subscription]]:
     db = await get_db()
     try:
@@ -265,7 +247,6 @@ async def has_active_subscriptions_for_service(service: str) -> bool:
 
 
 __all__ = [
-    "count_active_subscriptions_by_service",
     "create_subscription",
     "deactivate_all_subscriptions",
     "delete_subscription",

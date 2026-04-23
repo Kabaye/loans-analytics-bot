@@ -11,6 +11,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand, MenuButtonCommands
 
 from bot import config
+from bot.integrations.telegram_patch_notes import PatchNotesMiddleware
 from bot.integrations.telegram_notifications import router as notifier_router
 from bot.repositories.db import init_db
 from bot.repositories.users import ensure_admin_user
@@ -51,6 +52,9 @@ async def main() -> None:
     # Create bot and dispatcher
     bot = Bot(token=config.BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
+    patch_notes_middleware = PatchNotesMiddleware()
+    dp.message.outer_middleware(patch_notes_middleware)
+    dp.callback_query.outer_middleware(patch_notes_middleware)
 
     # Register handlers
     dp.include_router(start.router)

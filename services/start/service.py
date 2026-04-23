@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from bot.repositories.credentials import list_credential_services
-from bot.repositories.settings import get_all_site_settings
-from bot.repositories.subscriptions import count_active_subscriptions_by_service
-from bot.repositories.users import ensure_user
+from functools import lru_cache
+from pathlib import Path
+
+from bot import config
+from bot.repositories.users import ensure_user, get_user_seen_version, set_user_seen_version
 
 
 async def ensure_chat_user(
@@ -21,12 +22,24 @@ async def ensure_chat_user(
     )
 
 
-async def get_status_snapshot(chat_id: int) -> dict[str, list]:
-    return {
-        "subscriptions": await count_active_subscriptions_by_service(chat_id),
-        "credential_services": await list_credential_services(chat_id),
-        "site_settings": await get_all_site_settings(),
-    }
+@lru_cache(maxsize=1)
+def _load_patch_notes() -> str:
+    path = Path(config.PATCH_NOTES_PATH)
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return f"Обновление {config.APP_VERSION}"
 
 
-__all__ = ["ensure_chat_user", "get_status_snapshot"]
+async def get_pending_patch_notes(chat_id: int) -> str | None:
+    seen_version = await get_user_seen_version(chat_id)
+    if seen_version == config.APP_VERSION:
+        return None
+    return _load_patch_notes()
+
+
+async def mark_patch_notes_seen(chat_id: int) -> None:
+    await set_user_seen_version(chat_id, config.APP_VERSION)
+
+
+__all__ = ["ensure_chat_user", "get_pending_patch_notes", "mark_patch_notes_seen"]

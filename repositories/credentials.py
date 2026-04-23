@@ -182,18 +182,6 @@ async def list_allowed_user_credentials(service: str, chat_id: int | None = None
         await db.close()
 
 
-async def list_credential_services(chat_id: int) -> list[str]:
-    db = await get_db()
-    try:
-        rows = await db.execute_fetchall(
-            "SELECT service FROM credentials WHERE chat_id=? ORDER BY service, id",
-            (chat_id,),
-        )
-        return [row["service"] for row in rows]
-    finally:
-        await db.close()
-
-
 async def get_first_credential_owner_chat_id(service: str) -> int | None:
     db = await get_db()
     try:
@@ -212,7 +200,6 @@ __all__ = [
     "get_credential_by_id",
     "get_saved_credential_session",
     "list_allowed_user_credentials",
-    "list_credential_services",
     "list_credentials_for_delete",
     "list_credentials_rows",
     "list_user_credentials",

@@ -241,6 +241,7 @@ async def init_db() -> None:
 
         for definition in ("first_name TEXT", "last_name TEXT"):
             await _try_add_column(db, "users", definition)
+        await _try_add_column(db, "users", "last_seen_version TEXT")
 
         for definition in ("require_employed INTEGER", "require_income_confirmed INTEGER"):
             await _try_add_column(db, "subscriptions", definition)

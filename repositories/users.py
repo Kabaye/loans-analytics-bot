@@ -82,6 +82,32 @@ async def get_user(chat_id: int) -> dict | None:
         await db.close()
 
 
+async def get_user_seen_version(chat_id: int) -> str | None:
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            "SELECT last_seen_version FROM users WHERE chat_id=?",
+            (chat_id,),
+        )
+        if not rows:
+            return None
+        return rows[0]["last_seen_version"]
+    finally:
+        await db.close()
+
+
+async def set_user_seen_version(chat_id: int, version: str) -> None:
+    db = await get_db()
+    try:
+        await db.execute(
+            "UPDATE users SET last_seen_version=? WHERE chat_id=?",
+            (version, chat_id),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
 async def list_users() -> list[dict]:
     db = await get_db()
     try:
@@ -137,10 +163,12 @@ __all__ = [
     "ensure_admin_user",
     "ensure_user",
     "get_user",
+    "get_user_seen_version",
     "is_chat_admin",
     "is_chat_allowed",
     "list_users",
     "list_users_by_access",
+    "set_user_seen_version",
     "set_user_admin",
     "set_user_allowed",
 ]

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import re
 
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
@@ -17,7 +16,13 @@ from aiogram.types import (
 from bot.repositories.borrowers import (
     search_borrower_info, lookup_borrower_info, upsert_borrower_info,
 )
-from bot.integrations.opi_client import OPIChecker
+from bot.services.search.service import (
+    add_borrower_and_refresh_opi,
+    extract_document_ids,
+    force_refresh_opi_card,
+    format_borrower_card,
+    run_opi_batch,
+)
 from bot.services.base.access import is_allowed
 
 log = logging.getLogger(__name__)
@@ -62,63 +67,6 @@ def _search_nav_kb(include_add: bool = True) -> InlineKeyboardMarkup:
         buttons.append([InlineKeyboardButton(text="➕ Добавить заёмщика", callback_data="add_borrower")])
     buttons.append([InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-def _extract_document_ids(text: str) -> list[str]:
-    ids: list[str] = []
-    seen: set[str] = set()
-    for doc_id in re.findall(r"\b[0-9A-Z]{14}\b", text.upper()):
-        if doc_id in seen:
-            continue
-        seen.add(doc_id)
-        ids.append(doc_id)
-    return ids
-
-
-def _format_card(info: dict) -> str:
-    """Format a borrower_info record as a readable card."""
-    lines = ["<b>📋 Карточка заёмщика</b>"]
-    lines.append(f"\n<b>ИН:</b> <code>{info['document_id']}</code>")
-    if info.get("full_name"):
-        lines.append(f"<b>ФИО:</b> {info['full_name']}")
-
-    if info.get("loan_status"):
-        status_icon = {
-            "в срок": "✅",
-            "просрочка до 20 дней": "⚠️",
-            "просрочка > 20 дней": "🔶",
-            "все плохо": "🔴",
-        }.get(info["loan_status"], "📋")
-        lines.append(f"<b>Статус:</b> {status_icon} {info['loan_status']}")
-
-    if info.get("sum_category"):
-        lines.append(f"<b>Категория сумм:</b> {info['sum_category']}")
-    if info.get("rating") is not None:
-        lines.append(f"<b>Рейтинг:</b> {info['rating']:.0f}")
-    if info.get("loan_count"):
-        lines.append(f"<b>Займов:</b> {info['loan_count']}")
-    if info.get("last_loan_date"):
-        lines.append(f"<b>Последний займ:</b> {info['last_loan_date']}")
-
-    if info.get("opi_checked_at"):
-        if info.get("opi_has_debt"):
-            lines.append(f"\n❌ <b>ОПИ:</b> должен <b>{info.get('opi_debt_amount', 0):.2f}</b> BYN")
-            if info.get("opi_full_name"):
-                lines.append(f"  Имя в ОПИ: {info['opi_full_name']}")
-        else:
-            lines.append("\n✅ <b>ОПИ:</b> нет задолженности")
-        checked = info["opi_checked_at"][:19].replace("T", " ") if info["opi_checked_at"] else "—"
-        lines.append(f"  Проверено: {checked}")
-    else:
-        lines.append("\n⏳ ОПИ: не проверялось")
-
-    if info.get("notes"):
-        lines.append(f"\n📝 {info['notes']}")
-
-    if info.get("source"):
-        lines.append(f"\n<i>Источник: {info['source']}</i>")
-
-    return "\n".join(lines)
 
 
 def _result_card_kb(doc_id: str) -> InlineKeyboardMarkup:
@@ -197,7 +145,7 @@ async def msg_search_query(message: Message, state: FSMContext):
     if len(results) == 1:
         info = results[0]
         await message.answer(
-            _format_card(info),
+            format_borrower_card(info),
             reply_markup=_result_card_kb(info["document_id"]),
             parse_mode="HTML",
         )
@@ -248,31 +196,8 @@ async def msg_search_batch_ids(message: Message, state: FSMContext):
         )
         return
 
-    checker = OPIChecker()
-    lines = ["🆔 <b>Проверка по ИН</b>", ""]
-    try:
-        for idx, doc_id in enumerate(doc_ids, start=1):
-            info = await lookup_borrower_info(doc_id)
-            result = await checker.check(doc_id)
-
-            lines.append(f"{idx}. <code>{doc_id}</code>")
-            full_name = (info or {}).get("full_name") or result.full_name
-            if full_name:
-                lines.append(full_name)
-            if info and info.get("loan_status"):
-                lines.append(f"Статус: {info['loan_status']}")
-            if result.error:
-                lines.append("⚠️ ОПИ: ошибка проверки")
-            elif result.has_debt:
-                lines.append(f"❌ ОПИ: долг {result.debt_amount:.2f} BYN")
-            else:
-                lines.append("✅ ОПИ: нет задолженности")
-            lines.append("")
-    finally:
-        await checker.close()
-
     await message.answer(
-        "\n".join(lines).strip(),
+        await run_opi_batch(doc_ids),
         reply_markup=_search_nav_kb(include_add=False),
         parse_mode="HTML",
     )
@@ -289,7 +214,7 @@ async def cb_view_card(callback: CallbackQuery):
         return
 
     await callback.message.edit_text(
-        _format_card(info),
+        format_borrower_card(info),
         reply_markup=_result_card_kb(doc_id),
         parse_mode="HTML",
     )
@@ -302,20 +227,14 @@ async def cb_opi_check(callback: CallbackQuery):
     doc_id = callback.data.split(":", 1)[1]
     await callback.answer("⏳ Проверяю ОПИ...", show_alert=False)
 
-    checker = OPIChecker()
-    try:
-        result = await checker.check(doc_id, use_cache=False)
-    finally:
-        await checker.close()
-
-    info = await lookup_borrower_info(doc_id)
+    info, error = await force_refresh_opi_card(doc_id)
     if not info:
         await callback.answer("Ошибка: карточка не найдена", show_alert=True)
         return
 
-    text = _format_card(info)
-    if result.error:
-        text += f"\n\n⚠️ Ошибка OPI: {result.error}"
+    text = format_borrower_card(info)
+    if error:
+        text += f"\n\n⚠️ Ошибка OPI: {error}"
 
     await callback.message.edit_text(
         text,
@@ -354,7 +273,7 @@ async def msg_add_document_id(message: Message, state: FSMContext):
     existing = await lookup_borrower_info(doc_id)
     if existing:
         await message.answer(
-            f"ℹ️ Заёмщик с таким ИН уже есть в базе:\n\n{_format_card(existing)}",
+            f"ℹ️ Заёмщик с таким ИН уже есть в базе:\n\n{format_borrower_card(existing)}",
             reply_markup=_search_nav_kb(include_add=False),
             parse_mode="HTML",
         )
@@ -423,26 +342,13 @@ async def cb_add_sum(callback: CallbackQuery, state: FSMContext):
     full_name = data["full_name"]
     loan_status = data.get("loan_status")
 
-    await upsert_borrower_info(
-        document_id=doc_id,
-        full_name=full_name,
-        loan_status=loan_status,
-        sum_category=sum_cat,
-        source="added",
-    )
-
     await callback.message.edit_text("⏳ Сохраняю и проверяю ОПИ...", parse_mode="HTML")
-
-    checker = OPIChecker()
     try:
-        await checker.check(doc_id, use_cache=False)
+        info = await add_borrower_and_refresh_opi(doc_id, full_name, loan_status, sum_cat)
     except Exception as ex:
         log.warning("OPI check on add failed for %s: %s", doc_id, ex)
-    finally:
-        await checker.close()
-
-    info = await lookup_borrower_info(doc_id)
-    text = _format_card(info) if info else f"✅ Заёмщик {doc_id} сохранён"
+        info = await lookup_borrower_info(doc_id)
+    text = format_borrower_card(info) if info else f"✅ Заёмщик {doc_id} сохранён"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📚 Поиск по базе", callback_data="search_db")],

@@ -16,10 +16,14 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
-from bot.repositories.borrowers import upsert_borrower_from_investment
-from bot.repositories.credentials import save_credential_session
-from bot.repositories.db import get_db
+from bot.repositories.credentials import (
+    delete_credential,
+    list_credentials_for_delete,
+    list_credentials_rows,
+    upsert_credential,
+)
 from bot.services.base.access import is_allowed
+from bot.services.credentials.archive_loader import load_investments_archive
 
 log = logging.getLogger(__name__)
 router = Router(name="credentials")
@@ -38,14 +42,7 @@ class CredForm(StatesGroup):
 
 async def _show_credentials(target, chat_id: int, edit: bool = False):
     """Show credentials list. target is Message or CallbackQuery.message."""
-    db = await get_db()
-    try:
-        rows = await db.execute_fetchall(
-            "SELECT id, service, login, label FROM credentials WHERE chat_id=? ORDER BY service, id",
-            (chat_id,),
-        )
-    finally:
-        await db.close()
+    rows = await list_credentials_rows(chat_id)
 
     lines = ["<b>🔑 Ваши учётные данные:</b>\n"]
     for svc, name in AUTH_SERVICES.items():
@@ -124,26 +121,12 @@ async def cred_set_password(message: Message, state: FSMContext):
     except Exception:
         pass
 
-    # Save to DB
-    db = await get_db()
-    try:
-        await db.execute(
-            """
-            INSERT INTO credentials (chat_id, service, login, password)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(chat_id, service, login)
-            DO UPDATE SET password=excluded.password
-            """,
-            (message.chat.id, data["service"], data["login"], data["password"]),
-        )
-        row = await db.execute_fetchall(
-            "SELECT id FROM credentials WHERE chat_id = ? AND service = ? AND login = ?",
-            (message.chat.id, data["service"], data["login"]),
-        )
-        await db.commit()
-        credential_id = row[0]["id"]
-    finally:
-        await db.close()
+    credential_id = await upsert_credential(
+        message.chat.id,
+        data["service"],
+        data["login"],
+        data["password"],
+    )
 
     await state.clear()
     name = AUTH_SERVICES.get(data["service"], data["service"])
@@ -166,11 +149,7 @@ async def _autoload_investments(credential_id: int, service: str, login: str, pa
     """Load investment archive after credential save."""
     try:
         log.info("Auto-load investments starting for %s", service)
-        count = 0
-        if service == "zaimis":
-            count = await _load_zaimis_investments(credential_id, login, password)
-        elif service == "finkit":
-            count = await _load_finkit_investments(credential_id, login, password)
+        count = await load_investments_archive(credential_id, service, login, password)
 
         log.info("Auto-load investments done for %s: %d entries", service, count)
         name = AUTH_SERVICES.get(service, service)
@@ -201,153 +180,11 @@ async def _autoload_investments(credential_id: int, service: str, login: str, pa
             pass
 
 
-async def _load_zaimis_investments(credential_id: int, login: str, password: str) -> int:
-    """Fetch Zaimis investments and upsert into borrowers table."""
-    from bot.integrations.parsers.zaimis import ZaimisParser
-    zp = ZaimisParser()
-    try:
-        ok = await zp.login(login, password)
-        if not ok:
-            raise RuntimeError("Login failed")
-        if export := zp.export_session():
-            await save_credential_session(credential_id, "zaimis", export)
-
-        orders = await zp.fetch_investments()
-        # Aggregate per borrower
-        stats: dict[str, dict] = {}
-        for order in orders:
-            offer = order.get("offer", {}) or {}
-            owner = offer.get("owner", {}) or {}
-            buid = str(owner.get("id", ""))
-            if not buid:
-                continue
-            if buid not in stats:
-                stats[buid] = {
-                    "full_name": owner.get("displayName", ""),
-                    "total": 0, "settled": 0, "overdue": 0,
-                    "ratings": [], "invested": 0.0,
-                }
-            s = stats[buid]
-            s["total"] += 1
-            state = order.get("state")
-            if state == 3:
-                s["settled"] += 1
-            if state == 4:
-                s["overdue"] += 1
-            try:
-                s["invested"] += float(order.get("amount", 0))
-            except (ValueError, TypeError):
-                pass
-            score = offer.get("score")
-            if score is not None:
-                try:
-                    s["ratings"].append(float(score))
-                except (ValueError, TypeError):
-                    pass
-
-        for buid, s in stats.items():
-            avg_r = sum(s["ratings"]) / len(s["ratings"]) if s["ratings"] else None
-            await upsert_borrower_from_investment(
-                service="zaimis", borrower_user_id=buid,
-                full_name=s["full_name"] or None,
-                total_loans=s["total"], settled_loans=s["settled"],
-                overdue_loans=s["overdue"], avg_rating=avg_r,
-                total_invested=s["invested"],
-            )
-        return len(orders)
-    finally:
-        await zp.close()
-
-
-async def _load_finkit_investments(credential_id: int, login: str, password: str) -> int:
-    """Fetch Finkit investments and upsert into borrowers table."""
-    from bot.integrations.parsers.finkit import FinkitParser
-    fp = FinkitParser()
-    try:
-        ok = await fp.login(login, password)
-        if not ok:
-            raise RuntimeError("Login failed")
-        if export := fp.export_session():
-            await save_credential_session(credential_id, "finkit", export)
-
-        session = await fp._get_session()
-        cookie_str = "; ".join(f"{k}={v}" for k, v in fp._session_cookies.items())
-        headers = {"Accept": "application/json", "Referer": "https://finkit.by/", "Cookie": cookie_str}
-
-        # Aggregate per borrower from investment list
-        borrower_stats: dict[str, dict] = {}
-        total = 0
-        page = 1
-        while True:
-            url = f"https://api-p2p.finkit.by/user/investments/?page={page}"
-            async with session.get(url, headers=headers) as resp:
-                if resp.status != 200:
-                    break
-                data = await resp.json()
-
-            for inv in data.get("results", []):
-                total += 1
-                buid = inv.get("user")
-                if not buid:
-                    buid = inv.get("loan")  # fallback to loan ID
-                if not buid:
-                    continue
-                buid = str(buid)
-                bname = inv.get("borrower_full_name", "")
-                if buid not in borrower_stats:
-                    borrower_stats[buid] = {
-                        "full_name": bname, "total": 0, "settled": 0,
-                        "overdue": 0, "ratings": [], "invested": 0.0,
-                    }
-                s = borrower_stats[buid]
-                s["total"] += 1
-                status = inv.get("status")
-                if status == "settled":
-                    s["settled"] += 1
-                if inv.get("is_overdue"):
-                    s["overdue"] += 1
-                try:
-                    s["invested"] += float(inv.get("amount", 0))
-                except (ValueError, TypeError):
-                    pass
-                try:
-                    rating = float(inv.get("borrower_score", 0))
-                    if rating > 0:
-                        s["ratings"].append(rating)
-                except (ValueError, TypeError):
-                    pass
-
-            if not data.get("next"):
-                break
-            page += 1
-
-        # Upsert into borrowers
-        for buid, s in borrower_stats.items():
-            avg_r = sum(s["ratings"]) / len(s["ratings"]) if s["ratings"] else None
-            await upsert_borrower_from_investment(
-                service="finkit", borrower_user_id=buid,
-                full_name=s["full_name"] or None,
-                total_loans=s["total"], settled_loans=s["settled"],
-                overdue_loans=s["overdue"], avg_rating=avg_r,
-                total_invested=s["invested"],
-            )
-        return total
-    finally:
-        await fp.close()
-
-
 # ---- Delete credentials ----
 
 @router.callback_query(F.data == "cred_delete_choose")
 async def cred_delete_choose(callback: CallbackQuery):
-    db = await get_db()
-    try:
-        rows = await db.execute_fetchall(
-            "SELECT id, service, login FROM credentials WHERE chat_id=? ORDER BY service, id",
-            (callback.message.chat.id,),
-        )
-    finally:
-        await db.close()
+    rows = await list_credentials_for_delete(callback.message.chat.id)
 
     buttons = []
     for row in rows:
@@ -366,24 +203,12 @@ async def cred_delete_choose(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("cred_del_"))
 async def cred_delete(callback: CallbackQuery):
     cred_id = int(callback.data.replace("cred_del_", ""))
-    db = await get_db()
-    try:
-        rows = await db.execute_fetchall(
-            "SELECT service, login FROM credentials WHERE id=? AND chat_id=?",
-            (cred_id, callback.message.chat.id),
-        )
-        if not rows:
-            await callback.answer("❌ Не найдено")
-            return
-        svc = rows[0]["service"]
-        login = rows[0]["login"]
-        await db.execute(
-            "DELETE FROM credentials WHERE id=? AND chat_id=?",
-            (cred_id, callback.message.chat.id),
-        )
-        await db.commit()
-    finally:
-        await db.close()
+    deleted = await delete_credential(cred_id, callback.message.chat.id)
+    if not deleted:
+        await callback.answer("❌ Не найдено")
+        return
+    svc = deleted["service"]
+    login = deleted["login"]
 
     name = AUTH_SERVICES.get(svc, svc)
     await callback.message.edit_text(

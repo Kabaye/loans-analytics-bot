@@ -15,7 +15,19 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
-from bot.repositories.db import get_db
+from bot.repositories.subscriptions import (
+    create_subscription,
+    deactivate_all_subscriptions,
+    delete_subscription,
+    get_subscription,
+    list_subscription_briefs,
+    list_subscriptions,
+    pause_active_subscriptions_for_night,
+    resume_night_paused_subscriptions,
+    toggle_subscription_active,
+    toggle_subscription_flag,
+    update_subscription_field,
+)
 from bot.services.base.access import is_allowed
 from bot.services.fsm_guard import set_busy, set_free, drain
 
@@ -45,14 +57,7 @@ class SubEditForm(StatesGroup):
 
 async def _show_subscriptions(target, chat_id: int, edit: bool = False):
     """Show subscriptions list. target is Message or CallbackQuery.message."""
-    db = await get_db()
-    try:
-        rows = await db.execute_fetchall(
-            "SELECT * FROM subscriptions WHERE chat_id=? ORDER BY service, id",
-            (chat_id,),
-        )
-    finally:
-        await db.close()
+    rows = await list_subscriptions(chat_id)
 
     if not rows:
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -166,15 +171,7 @@ async def cb_subs_menu(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "sub_night_pause")
 async def sub_night_pause(callback: CallbackQuery):
     chat_id = callback.message.chat.id
-    db = await get_db()
-    try:
-        await db.execute(
-            "UPDATE subscriptions SET is_active=0, night_paused=1 WHERE chat_id=? AND is_active=1",
-            (chat_id,),
-        )
-        await db.commit()
-    finally:
-        await db.close()
+    await pause_active_subscriptions_for_night(chat_id)
     await callback.answer("🌙 Все подписки на паузе. Спокойной ночи!")
     await _show_subscriptions(callback.message, chat_id, edit=True)
 
@@ -182,15 +179,7 @@ async def sub_night_pause(callback: CallbackQuery):
 @router.callback_query(F.data == "sub_night_resume")
 async def sub_night_resume(callback: CallbackQuery):
     chat_id = callback.message.chat.id
-    db = await get_db()
-    try:
-        await db.execute(
-            "UPDATE subscriptions SET is_active=1, night_paused=0 WHERE chat_id=? AND night_paused=1",
-            (chat_id,),
-        )
-        await db.commit()
-    finally:
-        await db.close()
+    await resume_night_paused_subscriptions(chat_id)
     await callback.answer("☀️ Подписки возобновлены!")
     await _show_subscriptions(callback.message, chat_id, edit=True)
 
@@ -439,34 +428,7 @@ async def _save_subscription(target, state: FSMContext, edit: bool = False):
     data = await state.get_data()
     chat_id = target.chat.id
 
-    db = await get_db()
-    try:
-        await db.execute(
-            """
-            INSERT INTO subscriptions
-            (chat_id, service, label, sum_min, sum_max, rating_min,
-             period_min, period_max, interest_min,
-             require_employed, require_income_confirmed, min_settled_loans)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                chat_id,
-                data["service"],
-                data.get("label"),
-                data.get("sum_min"),
-                data.get("sum_max"),
-                data.get("rating_min"),
-                data.get("period_min"),
-                data.get("period_max"),
-                data.get("interest_min"),
-                1 if data.get("require_employed") else None,
-                1 if data.get("require_income_confirmed") else None,
-                data.get("min_settled_loans"),
-            ),
-        )
-        await db.commit()
-    finally:
-        await db.close()
+    await create_subscription(chat_id, data)
 
     await state.clear()
     set_free(chat_id)
@@ -511,14 +473,7 @@ EDITABLE_FIELDS = {
 
 @router.callback_query(F.data == "sub_edit_choose")
 async def sub_edit_choose(callback: CallbackQuery):
-    db = await get_db()
-    try:
-        rows = await db.execute_fetchall(
-            "SELECT id, service, label FROM subscriptions WHERE chat_id=?",
-            (callback.message.chat.id,),
-        )
-    finally:
-        await db.close()
+    rows = await list_subscription_briefs(callback.message.chat.id)
 
     if not rows:
         await callback.answer("Нет подписок")
@@ -542,20 +497,10 @@ async def sub_edit_choose(callback: CallbackQuery):
 @router.callback_query(F.data.regexp(r"^sub_edit_(\d+)$"))
 async def sub_edit_show(callback: CallbackQuery):
     sub_id = int(callback.data.split("_")[-1])
-    db = await get_db()
-    try:
-        rows = await db.execute_fetchall(
-            "SELECT * FROM subscriptions WHERE id=? AND chat_id=?",
-            (sub_id, callback.message.chat.id),
-        )
-    finally:
-        await db.close()
-
-    if not rows:
+    row = await get_subscription(sub_id, callback.message.chat.id)
+    if not row:
         await callback.answer("Подписка не найдена")
         return
-
-    row = rows[0]
     svc = SERVICES.get(row["service"], row["service"])
     label = _display_subscription_value(row["label"], fallback=f"#{row['id']}")
 
@@ -613,20 +558,7 @@ async def sub_edit_field(callback: CallbackQuery, state: FSMContext):
 
     if ftype == "bool":
         # Toggle directly
-        db = await get_db()
-        try:
-            rows = await db.execute_fetchall(
-                f"SELECT {field} FROM subscriptions WHERE id=?", (sub_id,)
-            )
-            current = rows[0][field] if rows else None
-            new_val = None if current else 1
-            await db.execute(
-                f"UPDATE subscriptions SET {field}=? WHERE id=?",
-                (new_val, sub_id),
-            )
-            await db.commit()
-        finally:
-            await db.close()
+        new_val = await toggle_subscription_flag(sub_id, field)
         await callback.answer(f"{name}: {'✅' if new_val else '❌'}")
         # Refresh edit view
         callback.data = f"sub_edit_{sub_id}"
@@ -662,15 +594,7 @@ async def sub_edit_save_value(message: Message, state: FSMContext):
     if field == "label" and val is None:
         val = None  # allowed to clear label
 
-    db = await get_db()
-    try:
-        await db.execute(
-            f"UPDATE subscriptions SET {field}=? WHERE id=? AND chat_id=?",
-            (val, sub_id, message.chat.id),
-        )
-        await db.commit()
-    finally:
-        await db.close()
+    await update_subscription_field(sub_id, message.chat.id, field, val)
 
     await state.clear()
     name = EDITABLE_FIELDS[field][0]
@@ -688,14 +612,7 @@ async def sub_edit_save_value(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "sub_delete_choose")
 async def sub_delete_choose(callback: CallbackQuery):
-    db = await get_db()
-    try:
-        rows = await db.execute_fetchall(
-            "SELECT id, service, label FROM subscriptions WHERE chat_id=?",
-            (callback.message.chat.id,),
-        )
-    finally:
-        await db.close()
+    rows = await list_subscription_briefs(callback.message.chat.id)
 
     if not rows:
         await callback.answer("Нет подписок для удаления")
@@ -719,15 +636,7 @@ async def sub_delete_choose(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("sub_del_"))
 async def sub_delete_confirm(callback: CallbackQuery):
     sub_id = int(callback.data.replace("sub_del_", ""))
-    db = await get_db()
-    try:
-        await db.execute(
-            "DELETE FROM subscriptions WHERE id=? AND chat_id=?",
-            (sub_id, callback.message.chat.id),
-        )
-        await db.commit()
-    finally:
-        await db.close()
+    await delete_subscription(sub_id, callback.message.chat.id)
 
     await callback.message.edit_text(
         "✅ Подписка удалена.",
@@ -742,14 +651,7 @@ async def sub_delete_confirm(callback: CallbackQuery):
 
 @router.callback_query(F.data == "sub_toggle_choose")
 async def sub_toggle_choose(callback: CallbackQuery):
-    db = await get_db()
-    try:
-        rows = await db.execute_fetchall(
-            "SELECT id, service, label, is_active FROM subscriptions WHERE chat_id=?",
-            (callback.message.chat.id,),
-        )
-    finally:
-        await db.close()
+    rows = await list_subscription_briefs(callback.message.chat.id)
 
     if not rows:
         await callback.answer("Нет подписок")
@@ -774,18 +676,7 @@ async def sub_toggle_choose(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("sub_tog_"))
 async def sub_toggle(callback: CallbackQuery):
     sub_id = int(callback.data.replace("sub_tog_", ""))
-    db = await get_db()
-    try:
-        await db.execute(
-            """UPDATE subscriptions
-               SET is_active = CASE WHEN is_active=1 THEN 0 ELSE 1 END,
-                   night_paused = 0
-               WHERE id=? AND chat_id=?""",
-            (sub_id, callback.message.chat.id),
-        )
-        await db.commit()
-    finally:
-        await db.close()
+    await toggle_subscription_active(sub_id, callback.message.chat.id)
 
     await callback.answer("Переключено!")
     await sub_toggle_choose(callback)
@@ -814,15 +705,7 @@ async def sub_back(callback: CallbackQuery, state: FSMContext):
 async def sub_stop_all(callback: CallbackQuery, state: FSMContext):
     """Deactivate ALL subscriptions for this user immediately."""
     chat_id = callback.message.chat.id
-    db = await get_db()
-    try:
-        await db.execute(
-            "UPDATE subscriptions SET is_active = 0 WHERE chat_id = ?",
-            (chat_id,),
-        )
-        await db.commit()
-    finally:
-        await db.close()
+    await deactivate_all_subscriptions(chat_id)
     await state.clear()
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔔 Подписки", callback_data="subs_menu")],

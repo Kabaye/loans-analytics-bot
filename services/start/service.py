@@ -22,20 +22,53 @@ async def ensure_chat_user(
     )
 
 
+def _version_key(value: str) -> tuple[int, ...]:
+    parts = []
+    for part in value.split("."):
+        try:
+            parts.append(int(part))
+        except ValueError:
+            parts.append(0)
+    return tuple(parts)
+
+
 @lru_cache(maxsize=1)
-def _load_patch_notes() -> str:
-    path = Path(config.PATCH_NOTES_PATH)
-    try:
-        return path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return f"Обновление {config.APP_VERSION}"
+def _load_patch_notes_history() -> list[tuple[str, str]]:
+    patch_dir = Path(config.PATCH_NOTES_DIR)
+    if not patch_dir.exists():
+        return [(config.APP_VERSION, f"Обновление {config.APP_VERSION}")]
+
+    items: list[tuple[str, str]] = []
+    for path in patch_dir.glob("*.md"):
+        version = path.stem
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if text:
+            items.append((version, text))
+
+    if not items:
+        return [(config.APP_VERSION, f"Обновление {config.APP_VERSION}")]
+
+    items.sort(key=lambda item: _version_key(item[0]))
+    return items
 
 
-async def get_pending_patch_notes(chat_id: int) -> str | None:
+async def get_pending_patch_notes(chat_id: int) -> list[str]:
     seen_version = await get_user_seen_version(chat_id)
-    if seen_version == config.APP_VERSION:
-        return None
-    return _load_patch_notes()
+    current_key = _version_key(config.APP_VERSION)
+    seen_key = _version_key(seen_version) if seen_version else None
+
+    pending: list[str] = []
+    for version, text in _load_patch_notes_history():
+        version_key = _version_key(version)
+        if version_key > current_key:
+            continue
+        if seen_key is not None and version_key <= seen_key:
+            continue
+        pending.append(text)
+    return pending
 
 
 async def mark_patch_notes_seen(chat_id: int) -> None:

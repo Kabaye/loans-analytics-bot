@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from bot.domain.credentials import UserCredentials
-from bot.integrations.geolocation_client import lookup_belarus_zip
+from bot.integrations.geolocation_client import lookup_belarus_zip, lookup_belarus_zip_details
 from bot.repositories.credentials import get_credential_by_id
 from bot.repositories.overdue import get_overdue_case, update_overdue_case_contacts, upsert_overdue_case
 from bot.services.base.providers import ensure_finkit_parser
@@ -11,6 +11,10 @@ from bot.services.base.providers import ensure_finkit_parser
 
 async def resolve_belarus_zip(address: str | None) -> str | None:
     return await lookup_belarus_zip(address)
+
+
+async def resolve_belarus_zip_details(address: str | None) -> dict | None:
+    return await lookup_belarus_zip_details(address)
 
 
 async def enrich_finkit_case_from_claims(case: dict) -> dict:
@@ -61,7 +65,8 @@ async def enrich_finkit_case_from_claims(case: dict) -> dict:
         claim_pdf_bytes = await parser.fetch_contract_pdf(claim_document_url)
         if claim_pdf_bytes:
             claim_data = parser.parse_claim_document_pdf(claim_pdf_bytes)
-            zipcode = case.get("borrower_zip") or await resolve_belarus_zip(claim_data.get("debtor_address"))
+            postal_lookup = await resolve_belarus_zip_details(claim_data.get("debtor_address"))
+            zipcode = str(postal_lookup.get("postcode")) if postal_lookup and postal_lookup.get("postcode") else case.get("borrower_zip")
             await update_overdue_case_contacts(
                 int(case["id"]),
                 int(case["chat_id"]),
@@ -69,6 +74,7 @@ async def enrich_finkit_case_from_claims(case: dict) -> dict:
                 borrower_zip=zipcode,
                 borrower_phone=claim_data.get("debtor_phone"),
                 borrower_email=claim_data.get("debtor_email"),
+                postal_lookup=postal_lookup,
             )
 
     if not case.get("document_id") and case.get("contract_url"):
@@ -90,4 +96,4 @@ async def enrich_finkit_case_from_claims(case: dict) -> dict:
     return refreshed or case
 
 
-__all__ = ["enrich_finkit_case_from_claims", "resolve_belarus_zip"]
+__all__ = ["enrich_finkit_case_from_claims", "resolve_belarus_zip", "resolve_belarus_zip_details"]

@@ -179,12 +179,11 @@ def _join_non_empty(parts: list[str | None]) -> str:
 
 def build_sms_text(case: dict, creditor: dict) -> str:
     del creditor
-    text = f"{_sms_name(case.get('full_name'))}, {_sms_service(case)} {_sms_date(case)}, долг {_sms_amount(case)}."
+    text = f"{_sms_name(case.get('full_name'))}, {_sms_service(case)} от {_sms_date(case)}, долг {_sms_amount(case)}."
     optional_parts = [
         f" Займ {_sms_ref(case)}.",
         " Прошу оплатить добровольно.",
-        " Иначе обращусь в суд.",
-        " С взысканием расходов.",
+        " Иначе обращусь в суд с взысканием расходов.",
     ]
     for part in optional_parts:
         if len(text + part) <= SMS_MAX_LEN:

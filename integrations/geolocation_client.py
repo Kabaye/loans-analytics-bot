@@ -94,7 +94,15 @@ async def _search_belpost(session: aiohttp.ClientSession, query: str) -> list[di
     return []
 
 
-async def lookup_belarus_zip(address: str | None) -> str | None:
+def _street_name(item: dict) -> str | None:
+    street = str(item.get("street") or "").strip()
+    if not street:
+        return None
+    street_type = str(item.get("street_type") or "").strip()
+    return f"{street_type} {street}".strip() if street_type else street
+
+
+async def lookup_belarus_zip_details(address: str | None) -> dict | None:
     query = _normalize_query(address or "")
     if not query:
         return None
@@ -117,15 +125,42 @@ async def lookup_belarus_zip(address: str | None) -> str | None:
                         continue
                     seen_keys.add(key)
                     candidates.append(item)
+            if not candidates:
+                return None
+
+            best = max(candidates, key=lambda item: _candidate_score(query, item))
+            postcode = str(best.get("postcode") or "").strip()
+            if not _POSTCODE_RE.fullmatch(postcode):
+                return None
+
+            same_postcode_candidates = [
+                item for item in await _search_belpost(session, postcode)
+                if str(item.get("postcode") or "").strip() == postcode
+            ]
     except Exception as exc:
         log.warning("ZIP lookup error for %s: %s", query, exc)
         return None
 
-    if not candidates:
-        return None
+    related_streets: list[str] = []
+    for item in same_postcode_candidates:
+        street_name = _street_name(item)
+        if not street_name or street_name in related_streets:
+            continue
+        related_streets.append(street_name)
+        if len(related_streets) >= 8:
+            break
 
-    best = max(candidates, key=lambda item: _candidate_score(query, item))
-    postcode = str(best.get("postcode") or "").strip()
-    if _POSTCODE_RE.fullmatch(postcode):
-        return postcode
-    return None
+    return {
+        "postcode": postcode,
+        "query": query,
+        "normalized_query": normalized,
+        "match_address": best.get("autocomplete_address") or best.get("short_address") or _candidate_label(best),
+        "match_street": _street_name(best),
+        "match_buildings": best.get("buildings"),
+        "related_streets": related_streets,
+    }
+
+
+async def lookup_belarus_zip(address: str | None) -> str | None:
+    details = await lookup_belarus_zip_details(address)
+    return str(details.get("postcode")) if details and details.get("postcode") else None

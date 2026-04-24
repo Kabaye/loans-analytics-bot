@@ -33,7 +33,7 @@ from bot.services.overdue.service import (
     upsert_overdue_case,
 )
 from bot.services.base.access import is_allowed
-from bot.services.overdue.cases import enrich_finkit_case_from_claims, resolve_belarus_zip
+from bot.services.overdue.cases import enrich_finkit_case_from_claims, resolve_belarus_zip, resolve_belarus_zip_details
 from bot.services.overdue.documents import (
     build_postal_address_text,
     build_sms_text,
@@ -180,6 +180,26 @@ def _parse_raw(case: dict) -> dict:
         return {}
 
 
+def _postal_lookup_note(case: dict) -> list[str]:
+    payload = _parse_raw(case)
+    lookup = payload.get("postal_lookup") or {}
+    postcode = lookup.get("postcode")
+    if not postcode:
+        return []
+    lines = [
+        f"<b>ZIP найден:</b> {_display_html(postcode)}",
+    ]
+    if lookup.get("match_address"):
+        lines.append(f"<b>Совпадение Белпочты:</b> {_display_html(lookup.get('match_address'))}")
+    streets = [street for street in lookup.get("related_streets") or [] if street]
+    if streets:
+        preview = ", ".join(streets[:5])
+        if len(streets) > 5:
+            preview += ", ..."
+        lines.append(f"<b>Улицы по этому ZIP:</b> {_display_html(preview)}")
+    return lines
+
+
 def _case_notes(case: dict) -> list[str]:
     payload = _parse_raw(case)
     detail = payload.get("detail") or {}
@@ -321,6 +341,9 @@ def _format_case_text(case: dict) -> str:
     notes = _case_notes(case)
     if notes:
         lines.extend(["", *notes])
+    postal_lookup = _postal_lookup_note(case)
+    if postal_lookup:
+        lines.extend(["", *postal_lookup])
     return "\n".join(lines)
 
 
@@ -358,6 +381,19 @@ async def _handle_claim_generation(callback: CallbackQuery, case_id: int) -> Non
         await callback.answer("Кейс не найден", show_alert=True)
         return
     case = await _enrich_finkit_case_from_claims(case)
+    if case.get("borrower_address"):
+        payload = _parse_raw(case)
+        postal_lookup = payload.get("postal_lookup") or {}
+        if not postal_lookup.get("postcode"):
+            lookup = await resolve_belarus_zip_details(case.get("borrower_address"))
+            if lookup and lookup.get("postcode"):
+                await update_overdue_case_contacts(
+                    case_id,
+                    callback.message.chat.id,
+                    borrower_zip=str(lookup.get("postcode")),
+                    postal_lookup=lookup,
+                )
+                case = await get_overdue_case(case_id, callback.message.chat.id) or case
     creditor = await _get_case_creditor_profile(case)
     signature = (
         await get_credential_signature_asset(callback.message.chat.id, int(case["credential_id"]))
@@ -858,30 +894,47 @@ async def msg_overdue_case_field(message: Message, state: FSMContext):
 
     raw_value = (message.text or "").strip()
     if field_name == "borrower_address":
-        zip_code = await resolve_belarus_zip(raw_value)
+        lookup = await resolve_belarus_zip_details(raw_value)
+        zip_code = str(lookup.get("postcode")) if lookup and lookup.get("postcode") else None
         await update_overdue_case_contacts(
             case_id,
             message.chat.id,
             borrower_address=raw_value,
             borrower_zip=zip_code,
+            postal_lookup=lookup,
         )
         await state.clear()
-        suffix = f" ZIP найден: {zip_code}." if zip_code else " ZIP автоматически не найден."
+        if zip_code and lookup:
+            streets = ", ".join((lookup.get("related_streets") or [])[:4])
+            suffix = f" ZIP найден: {zip_code}. Белпочта: {lookup.get('match_address') or '—'}."
+            if streets:
+                suffix += f" Улицы по индексу: {streets}."
+        else:
+            suffix = " ZIP автоматически не найден."
         await message.answer(f"✅ Адрес заемщика сохранён.{suffix}", reply_markup=_menu_kb())
         return
 
     if field_name == "borrower_zip":
         zip_code = raw_value
+        lookup = None
         if raw_value == "-":
-            zip_code = await resolve_belarus_zip(case.get("borrower_address"))
+            lookup = await resolve_belarus_zip_details(case.get("borrower_address"))
+            zip_code = str(lookup.get("postcode")) if lookup and lookup.get("postcode") else None
         await update_overdue_case_contacts(
             case_id,
             message.chat.id,
             borrower_zip=zip_code,
+            postal_lookup=lookup,
         )
         await state.clear()
         if zip_code:
-            await message.answer(f"✅ ZIP сохранён: {zip_code}.", reply_markup=_menu_kb())
+            details = ""
+            if lookup:
+                streets = ", ".join((lookup.get("related_streets") or [])[:5])
+                details = f" Белпочта: {lookup.get('match_address') or '—'}."
+                if streets:
+                    details += f" Улицы по индексу: {streets}."
+            await message.answer(f"✅ ZIP сохранён: {zip_code}.{details}", reply_markup=_menu_kb())
         else:
             await message.answer("⚠️ ZIP автоматически не найден.", reply_markup=_menu_kb())
         return

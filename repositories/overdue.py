@@ -188,9 +188,22 @@ async def update_overdue_case_contacts(
     borrower_phone: str | None = None,
     borrower_email: str | None = None,
     voluntary_term_days: int | None = None,
+    postal_lookup: dict | None = None,
 ) -> None:
     db = await get_db()
     try:
+        rows = await db.execute_fetchall(
+            "SELECT raw_data FROM overdue_cases WHERE id = ? AND chat_id = ?",
+            (case_id, chat_id),
+        )
+        raw_payload: dict = {}
+        if rows:
+            try:
+                raw_payload = json.loads(rows[0]["raw_data"] or "{}")
+            except Exception:
+                raw_payload = {}
+        if postal_lookup is not None:
+            raw_payload["postal_lookup"] = postal_lookup
         await db.execute(
             """
             UPDATE overdue_cases
@@ -199,6 +212,7 @@ async def update_overdue_case_contacts(
                 borrower_phone = COALESCE(?, borrower_phone),
                 borrower_email = COALESCE(?, borrower_email),
                 voluntary_term_days = COALESCE(?, voluntary_term_days),
+                raw_data = ?,
                 updated_at = datetime('now')
             WHERE id = ? AND chat_id = ?
             """,
@@ -208,6 +222,7 @@ async def update_overdue_case_contacts(
                 borrower_phone,
                 borrower_email,
                 voluntary_term_days,
+                json.dumps(raw_payload, ensure_ascii=False),
                 case_id,
                 chat_id,
             ),

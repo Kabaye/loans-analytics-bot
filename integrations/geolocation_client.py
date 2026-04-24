@@ -15,10 +15,6 @@ _HOUSE_RE = re.compile(r"\b\d+[A-Za-zА-Яа-я\-\/]*\b")
 
 def _normalize_query(address: str) -> str:
     text = " ".join((address or "").replace("\n", " ").split()).strip(" ,")
-    if not text:
-        return ""
-    if "беларус" not in text.lower():
-        text = f"Беларусь, {text}"
     return text
 
 
@@ -79,9 +75,10 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str):
 
 
 async def _normalize_with_nominatim(session: aiohttp.ClientSession, query: str) -> str | None:
+    nominatim_query = query if "беларус" in query.lower() else f"Беларусь, {query}"
     url = (
         "https://nominatim.openstreetmap.org/search"
-        f"?format=jsonv2&addressdetails=1&countrycodes=by&limit=1&q={quote(query)}"
+        f"?format=jsonv2&addressdetails=1&countrycodes=by&limit=1&q={quote(nominatim_query)}"
     )
     try:
         payload = await _fetch_json(session, url)

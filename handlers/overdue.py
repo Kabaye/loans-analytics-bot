@@ -55,6 +55,7 @@ class OverdueStates(StatesGroup):
     waiting_creditor_profile = State()
     waiting_signature = State()
     waiting_case_contacts = State()
+    waiting_case_field = State()
 
 
 def _back_main_kb() -> InlineKeyboardMarkup:
@@ -66,7 +67,6 @@ def _back_main_kb() -> InlineKeyboardMarkup:
 def _menu_kb(has_cases: bool = True) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="🗂 Список просрочек", callback_data="overdue_cases")],
-        [InlineKeyboardButton(text="🏦 Данные займодавца", callback_data="overdue_profile")],
         [InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -108,26 +108,17 @@ def _case_list_kb(cases: list[dict], page: int) -> InlineKeyboardMarkup:
         if current_page + 1 < total_pages:
             nav.append(InlineKeyboardButton(text="➡️", callback_data=f"overdue_cases_page_{current_page + 1}"))
         rows.append(nav)
-    rows.extend([
-        [InlineKeyboardButton(text="🏦 Данные займодавца", callback_data="overdue_profile")],
-        [InlineKeyboardButton(text="↩ Просрочки", callback_data="overdue_menu")],
-    ])
+    rows.append([InlineKeyboardButton(text="↩ Просрочки", callback_data="overdue_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _case_actions_kb(case_id: int, credential_id: int | None = None) -> InlineKeyboardMarkup:
-    credential_rows: list[list[InlineKeyboardButton]] = []
-    if credential_id:
-        credential_rows = [
-            [InlineKeyboardButton(text="🏦 Профиль займодавца", callback_data=f"overdue_profile_case_{case_id}")],
-            [InlineKeyboardButton(text="✍️ Подпись для логина", callback_data=f"overdue_signature_cred_{credential_id}")],
-        ]
+    del credential_id
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✉️ Сформировать SMS", callback_data=f"overdue_sms_{case_id}")],
         [InlineKeyboardButton(text="📄 Сформировать претензию", callback_data=f"overdue_claim_{case_id}")],
         [InlineKeyboardButton(text="🧾 Данные API", callback_data=f"overdue_raw_{case_id}")],
         [InlineKeyboardButton(text="📝 Данные должника", callback_data=f"overdue_edit_{case_id}")],
-        *credential_rows,
         [InlineKeyboardButton(text="↩ К списку просрочек", callback_data="overdue_cases")],
     ])
 
@@ -333,6 +324,21 @@ def _format_case_text(case: dict) -> str:
     return "\n".join(lines)
 
 
+def _missing_claim_kb(case: dict, missing: list[str]) -> InlineKeyboardMarkup:
+    missing_set = set(missing)
+    rows: list[list[InlineKeyboardButton]] = []
+    if "адрес заемщика" in missing_set:
+        rows.append([InlineKeyboardButton(text="🏠 Указать адрес заемщика", callback_data=f"overdue_fill_address_{case['id']}")])
+    if "ZIP-код заемщика" in missing_set:
+        rows.append([InlineKeyboardButton(text="📮 Указать / найти ZIP", callback_data=f"overdue_fill_zip_{case['id']}")])
+    if {"ФИО / название кредитора", "адрес кредитора", "подпись пользователя"} & missing_set and case.get("credential_id"):
+        rows.append([InlineKeyboardButton(text="🏦 Настройки займодавца", callback_data=f"cred_creditor_{case['credential_id']}")])
+    if "ИН заемщика" in missing_set and case.get("service") == "finkit":
+        rows.append([InlineKeyboardButton(text="🔄 Повторно подтянуть данные FinKit", callback_data=f"overdue_claim_retry_{case['id']}")])
+    rows.append([InlineKeyboardButton(text="↩ К кейсу", callback_data=f"overdue_case_{case['id']}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 async def _show_case(callback: CallbackQuery, case_id: int) -> None:
     case = await get_overdue_case(case_id, callback.message.chat.id)
     if not case:
@@ -344,6 +350,55 @@ async def _show_case(callback: CallbackQuery, case_id: int) -> None:
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
+
+
+async def _handle_claim_generation(callback: CallbackQuery, case_id: int) -> None:
+    case = await get_overdue_case(case_id, callback.message.chat.id)
+    if not case:
+        await callback.answer("Кейс не найден", show_alert=True)
+        return
+    case = await _enrich_finkit_case_from_claims(case)
+    creditor = await _get_case_creditor_profile(case)
+    signature = (
+        await get_credential_signature_asset(callback.message.chat.id, int(case["credential_id"]))
+        if case.get("credential_id")
+        else None
+    )
+    missing = collect_claim_missing_fields(case, creditor, signature)
+    if missing:
+        await save_generated_document(
+            case_id,
+            callback.message.chat.id,
+            doc_type="claim_missing",
+            payload=serialize_case_payload(case, creditor),
+            missing_fields=missing,
+        )
+        await callback.message.edit_text(
+            "⚠️ <b>Нельзя сформировать претензию</b>\n\n"
+            + "\n".join(f"• {escape(item)}" for item in missing),
+            reply_markup=_missing_claim_kb(case, missing),
+            parse_mode="HTML",
+        )
+        return
+
+    doc_path, claim_text = render_claim_docx(case, creditor or {}, signature["file_path"])
+    await save_generated_document(
+        case_id,
+        callback.message.chat.id,
+        doc_type="claim_docx",
+        file_path=str(doc_path),
+        text_content=claim_text,
+        payload=serialize_case_payload(case, creditor),
+    )
+    await callback.message.answer_document(
+        FSInputFile(str(doc_path), filename=doc_path.name),
+        caption="📄 Претензия сформирована.",
+    )
+    await callback.message.answer(
+        build_postal_address_text(case),
+        parse_mode="HTML",
+    )
+    await _show_case(callback, case_id)
 
 
 @router.callback_query(F.data.startswith("overdue_raw_"))
@@ -378,8 +433,7 @@ async def cb_overdue_menu(callback: CallbackQuery, state: FSMContext):
     text = (
         "⚖️ <b>Просрочки</b>\n\n"
         f"Активных кейсов: <b>{len(cases)}</b>\n"
-        "Здесь можно открыть список просроченных займов, заполнить данные займодавца по каждому логину, "
-        "назначить отдельные подписи и вручную сформировать SMS или претензию."
+        "Здесь можно открыть список просроченных займов и вручную сформировать SMS или претензию."
     )
     await callback.message.edit_text(text, reply_markup=_menu_kb(), parse_mode="HTML")
 
@@ -734,6 +788,108 @@ async def msg_overdue_signature_invalid(message: Message):
     await message.answer("Пришлите подпись как фото или изображение PNG/JPG.")
 
 
+@router.callback_query(F.data.startswith("overdue_fill_address_"))
+async def cb_overdue_fill_address(callback: CallbackQuery, state: FSMContext):
+    if not await is_allowed(callback.message.chat.id):
+        return
+    case_id = int(callback.data.replace("overdue_fill_address_", ""))
+    case = await get_overdue_case(case_id, callback.message.chat.id)
+    if not case:
+        await callback.answer("Кейс не найден", show_alert=True)
+        return
+    await state.set_state(OverdueStates.waiting_case_field)
+    await state.update_data(case_id=case_id, field_name="borrower_address")
+    await callback.message.edit_text(
+        "🏠 <b>Адрес заемщика</b>\n\n"
+        f"<b>Текущее значение:</b> {_display_html(case.get('borrower_address'))}\n\n"
+        "Отправьте только адрес заемщика. После этого я попробую сразу найти ZIP.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="↩ К кейсу", callback_data=f"overdue_case_{case_id}")],
+        ]),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("overdue_fill_zip_"))
+async def cb_overdue_fill_zip(callback: CallbackQuery, state: FSMContext):
+    if not await is_allowed(callback.message.chat.id):
+        return
+    case_id = int(callback.data.replace("overdue_fill_zip_", ""))
+    case = await get_overdue_case(case_id, callback.message.chat.id)
+    if not case:
+        await callback.answer("Кейс не найден", show_alert=True)
+        return
+    if not case.get("borrower_address"):
+        await callback.message.edit_text(
+            "⚠️ <b>Сначала нужен адрес заемщика</b>\n\nБез адреса я не смогу нормально найти ZIP.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🏠 Указать адрес", callback_data=f"overdue_fill_address_{case_id}")],
+                [InlineKeyboardButton(text="↩ К кейсу", callback_data=f"overdue_case_{case_id}")],
+            ]),
+            parse_mode="HTML",
+        )
+        return
+    await state.set_state(OverdueStates.waiting_case_field)
+    await state.update_data(case_id=case_id, field_name="borrower_zip")
+    await callback.message.edit_text(
+        "📮 <b>ZIP-код заемщика</b>\n\n"
+        f"<b>Адрес:</b> {_display_html(case.get('borrower_address'))}\n"
+        f"<b>Текущее значение:</b> {_display_html(case.get('borrower_zip'))}\n\n"
+        "Отправьте ZIP вручную или <code>-</code>, чтобы я попробовал найти его автоматически.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="↩ К кейсу", callback_data=f"overdue_case_{case_id}")],
+        ]),
+        parse_mode="HTML",
+    )
+
+
+@router.message(OverdueStates.waiting_case_field)
+async def msg_overdue_case_field(message: Message, state: FSMContext):
+    if not await is_allowed(message.chat.id):
+        return
+    data = await state.get_data()
+    case_id = int(data.get("case_id") or 0)
+    field_name = str(data.get("field_name") or "")
+    case = await get_overdue_case(case_id, message.chat.id)
+    if not case or not field_name:
+        await state.clear()
+        await message.answer("Не удалось определить поле для обновления.", reply_markup=_menu_kb())
+        return
+
+    raw_value = (message.text or "").strip()
+    if field_name == "borrower_address":
+        zip_code = await resolve_belarus_zip(raw_value)
+        await update_overdue_case_contacts(
+            case_id,
+            message.chat.id,
+            borrower_address=raw_value,
+            borrower_zip=zip_code,
+        )
+        await state.clear()
+        suffix = f" ZIP найден: {zip_code}." if zip_code else " ZIP автоматически не найден."
+        await message.answer(f"✅ Адрес заемщика сохранён.{suffix}", reply_markup=_menu_kb())
+        return
+
+    if field_name == "borrower_zip":
+        zip_code = raw_value
+        if raw_value == "-":
+            zip_code = await resolve_belarus_zip(case.get("borrower_address"))
+        await update_overdue_case_contacts(
+            case_id,
+            message.chat.id,
+            borrower_zip=zip_code,
+        )
+        await state.clear()
+        if zip_code:
+            await message.answer(f"✅ ZIP сохранён: {zip_code}.", reply_markup=_menu_kb())
+        else:
+            await message.answer("⚠️ ZIP автоматически не найден.", reply_markup=_menu_kb())
+        return
+
+    await state.clear()
+    await message.answer("Неизвестное поле для обновления.", reply_markup=_menu_kb())
+
+
 @router.callback_query(F.data.startswith("overdue_edit_"))
 async def cb_overdue_edit(callback: CallbackQuery, state: FSMContext):
     if not await is_allowed(callback.message.chat.id):
@@ -837,65 +993,18 @@ async def cb_overdue_claim(callback: CallbackQuery):
     if not await is_allowed(callback.message.chat.id):
         return
     case_id = int(callback.data.replace("overdue_claim_", ""))
+    await _handle_claim_generation(callback, case_id)
+
+
+@router.callback_query(F.data.startswith("overdue_claim_retry_"))
+async def cb_overdue_claim_retry(callback: CallbackQuery):
+    if not await is_allowed(callback.message.chat.id):
+        return
+    case_id = int(callback.data.replace("overdue_claim_retry_", ""))
     case = await get_overdue_case(case_id, callback.message.chat.id)
     if not case:
         await callback.answer("Кейс не найден", show_alert=True)
         return
-    case = await _enrich_finkit_case_from_claims(case)
-    creditor = await _get_case_creditor_profile(case)
-    signature = (
-        await get_credential_signature_asset(callback.message.chat.id, int(case["credential_id"]))
-        if case.get("credential_id")
-        else None
-    )
-    missing = collect_claim_missing_fields(case, creditor, signature)
-    if missing:
-        profile_button = (
-            [InlineKeyboardButton(text="🏦 Данные займодавца", callback_data=f"overdue_profile_case_{case_id}")]
-            if case.get("credential_id")
-            else [InlineKeyboardButton(text="🏦 Данные займодавца", callback_data="overdue_profile")]
-        )
-        signature_button = (
-            [InlineKeyboardButton(text="✍️ Подпись для логина", callback_data=f"overdue_signature_cred_{case['credential_id']}")]
-            if case.get("credential_id")
-            else [InlineKeyboardButton(text="✍️ Подпись", callback_data="overdue_signature")]
-        )
-        await save_generated_document(
-            case_id,
-            callback.message.chat.id,
-            doc_type="claim_missing",
-            payload=serialize_case_payload(case, creditor),
-            missing_fields=missing,
-        )
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📝 Данные должника", callback_data=f"overdue_edit_{case_id}")],
-            profile_button,
-            signature_button,
-            [InlineKeyboardButton(text="↩ К кейсу", callback_data=f"overdue_case_{case_id}")],
-        ])
-        await callback.message.edit_text(
-            "⚠️ <b>Нельзя сформировать претензию</b>\n\n"
-            + "\n".join(f"• {escape(item)}" for item in missing),
-            reply_markup=kb,
-            parse_mode="HTML",
-        )
-        return
-
-    doc_path, claim_text = render_claim_docx(case, creditor or {}, signature["file_path"])
-    await save_generated_document(
-        case_id,
-        callback.message.chat.id,
-        doc_type="claim_docx",
-        file_path=str(doc_path),
-        text_content=claim_text,
-        payload=serialize_case_payload(case, creditor),
-    )
-    await callback.message.answer_document(
-        FSInputFile(str(doc_path), filename=doc_path.name),
-        caption="📄 Претензия сформирована.",
-    )
-    await callback.message.answer(
-        build_postal_address_text(case),
-        parse_mode="HTML",
-    )
-    await _show_case(callback, case_id)
+    await _enrich_finkit_case_from_claims(case)
+    await callback.answer("Данные обновлены, проверяю снова…")
+    await _handle_claim_generation(callback, case_id)

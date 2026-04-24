@@ -21,8 +21,12 @@ SERVICE_URLS = {
 }
 
 GENERATED_DOCS_DIR = Path(config.BASE_DIR) / "data" / "generated-docs"
-SMS_MIN_LEN = 130
 SMS_MAX_LEN = 140
+SMS_SERVICE_NAMES = {
+    "finkit": "ФинКит",
+    "zaimis": "ЗАЙМись",
+    "kapusta": "Kapusta",
+}
 
 
 def _money(value: float | int | None) -> str:
@@ -68,15 +72,15 @@ def _sms_name(full_name: str | None) -> str:
     if not parts:
         return "Должник"
     if len(parts) == 1:
-        return parts[0][:24]
-    surname = parts[0].title()
-    initials = "".join(f"{part[0].upper()}." for part in parts[1:] if part)
-    return f"{surname} {initials}".strip()
+        return parts[0][:20]
+    surname = parts[0].title()[:18]
+    initials = "".join(part[0].upper() for part in parts[1:] if part)
+    return f"{surname} {initials}".strip()[:24]
 
 
 def _sms_ref(case: dict) -> str:
     ref = _loan_ref(case)
-    return ref if len(ref) <= 12 else ref[-8:]
+    return ref if len(ref) <= 8 else ref[-5:]
 
 
 def _sms_date(case: dict) -> str:
@@ -93,9 +97,24 @@ def _fit_sms(text: str) -> str:
         return compact
     trimmed = compact[:SMS_MAX_LEN + 1]
     cut_at = trimmed.rfind(" ")
-    if cut_at >= SMS_MIN_LEN - 10:
+    if cut_at >= 90:
         return trimmed[:cut_at].rstrip(" ,.-")
     return compact[:SMS_MAX_LEN].rstrip(" ,.-")
+
+
+def _sms_service(case: dict) -> str:
+    return SMS_SERVICE_NAMES.get(str(case.get("service") or "").lower(), str(case.get("service") or "займ"))
+
+
+def _sms_amount(case: dict) -> str:
+    try:
+        value = float(case.get("total_due") or 0)
+    except (TypeError, ValueError):
+        return "0р"
+    if value.is_integer():
+        return f"{int(value)}р"
+    text = f"{value:.2f}".rstrip("0").rstrip(".")
+    return f"{text}р"
 
 
 def _address_line(zip_code: str | None, address: str | None) -> str:
@@ -160,25 +179,17 @@ def _join_non_empty(parts: list[str | None]) -> str:
 
 def build_sms_text(case: dict, creditor: dict) -> str:
     del creditor
-    amount = _money(case.get("total_due")).replace(" BYN", " р")
-    text = (
-        f"{_sms_name(case.get('full_name'))}, долг по займу {_sms_ref(case)} от {_sms_date(case)} — {amount}. "
-        "Просим оплатить добровольно. Иначе подадим иск и взыщем судебные расходы."
-    )
-    text = _fit_sms(text)
-    if len(text) >= SMS_MIN_LEN:
-        return text
-    extras = (
-        " Просьба не затягивать оплату.",
-        " Урегулируйте вопрос без суда.",
-    )
-    for extra in extras:
-        candidate = _fit_sms(text + extra)
-        if len(candidate) > len(text):
-            text = candidate
-        if len(text) >= SMS_MIN_LEN:
-            break
-    return text
+    text = f"{_sms_name(case.get('full_name'))}, {_sms_service(case)} {_sms_date(case)}, долг {_sms_amount(case)}."
+    optional_parts = [
+        f" Займ {_sms_ref(case)}.",
+        " Прошу оплатить добровольно.",
+        " Иначе обращусь в суд.",
+        " С взысканием расходов.",
+    ]
+    for part in optional_parts:
+        if len(text + part) <= SMS_MAX_LEN:
+            text = text + part
+    return _fit_sms(text)
 
 
 def build_postal_address_text(case: dict) -> str:

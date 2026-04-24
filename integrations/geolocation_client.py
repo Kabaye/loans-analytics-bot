@@ -11,6 +11,7 @@ log = logging.getLogger(__name__)
 
 _POSTCODE_RE = re.compile(r"\b(\d{6})\b")
 _HOUSE_RE = re.compile(r"\b\d+[A-Za-zА-Яа-я\-\/]*\b")
+_STREET_STOPWORDS = {"улица", "ул", "переулок", "пер", "проспект", "пр", "бульвар", "бул", "шоссе", "тракт"}
 
 
 def _normalize_query(address: str) -> str:
@@ -58,12 +59,15 @@ def _candidate_score(query: str, candidate: dict) -> float:
         if street_value in query_norm:
             score += 0.45
         else:
-            street_tokens = [token for token in street_value.split() if len(token) > 2]
+            street_tokens = [
+                token for token in street_value.split()
+                if len(token) > 2 and token not in _STREET_STOPWORDS and not token.isdigit()
+            ]
             overlap = sum(1 for token in street_tokens if token in query_norm)
             if overlap:
-                score += min(0.25, overlap * 0.12)
+                score += 0.35 + min(0.3, overlap * 0.15)
             else:
-                score -= 0.45
+                score -= 1.2
     return score
 
 

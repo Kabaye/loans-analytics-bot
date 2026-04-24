@@ -18,14 +18,16 @@ from aiogram.types import (
 
 from bot import config
 from bot.services.overdue.service import (
+    clone_credential_creditor_profile,
     get_credential_by_id,
     get_credential_creditor_profile,
+    get_credential_signature_asset,
     get_overdue_case,
-    get_user_signature_asset,
     list_overdue_cases,
     list_user_credentials,
+    copy_credential_signature_asset,
     save_generated_document,
-    save_user_signature_asset,
+    save_credential_signature_asset,
     update_overdue_case_contacts,
     upsert_credential_creditor_profile,
     upsert_overdue_case,
@@ -33,6 +35,7 @@ from bot.services.overdue.service import (
 from bot.services.base.access import is_allowed
 from bot.services.overdue.cases import enrich_finkit_case_from_claims, resolve_belarus_zip
 from bot.services.overdue.documents import (
+    build_postal_address_text,
     build_sms_text,
     collect_claim_missing_fields,
     collect_sms_missing_fields,
@@ -45,6 +48,7 @@ router = Router(name="overdue")
 
 SIGNATURES_DIR = Path(config.BASE_DIR) / "data" / "signatures"
 BELPOST_INDEX_URL = "https://www.belpost.by/services/post-index.html"
+CASES_PER_PAGE = 10
 
 
 class OverdueStates(StatesGroup):
@@ -62,38 +66,68 @@ def _back_main_kb() -> InlineKeyboardMarkup:
 def _menu_kb(has_cases: bool = True) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="🗂 Список просрочек", callback_data="overdue_cases")],
-        [InlineKeyboardButton(text="👤 Мой профиль", callback_data="overdue_profile")],
-        [InlineKeyboardButton(text="✍️ Подпись", callback_data="overdue_signature")],
+        [InlineKeyboardButton(text="🏦 Данные займодавца", callback_data="overdue_profile")],
         [InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _case_list_kb(cases: list[dict]) -> InlineKeyboardMarkup:
+def _profile_status_icon(profile: dict | None) -> str:
+    return "✅" if profile and profile.get("full_name") and profile.get("address") else "⚠️"
+
+
+def _signature_status_icon(signature: dict | None) -> str:
+    if not signature or not signature.get("file_path"):
+        return "⚠️"
+    return "♻️" if signature.get("source") == "legacy" else "✅"
+
+
+def _paginate_cases(cases: list[dict], page: int) -> tuple[list[dict], int, int]:
+    total_pages = max(1, (len(cases) + CASES_PER_PAGE - 1) // CASES_PER_PAGE)
+    current_page = min(max(page, 0), total_pages - 1)
+    start = current_page * CASES_PER_PAGE
+    end = start + CASES_PER_PAGE
+    return cases[start:end], current_page, total_pages
+
+
+def _case_list_kb(cases: list[dict], page: int) -> InlineKeyboardMarkup:
+    page_items, current_page, total_pages = _paginate_cases(cases, page)
     rows: list[list[InlineKeyboardButton]] = []
-    for case in cases[:20]:
+    for case in page_items:
         rows.append([
             InlineKeyboardButton(
                 text=_case_button_label(case),
                 callback_data=f"overdue_case_{case['id']}",
             )
         ])
+    if total_pages > 1:
+        nav: list[InlineKeyboardButton] = []
+        if current_page > 0:
+            nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"overdue_cases_page_{current_page - 1}"))
+        nav.append(InlineKeyboardButton(text=f"{current_page + 1}/{total_pages}", callback_data="overdue_cases"))
+        if current_page + 1 < total_pages:
+            nav.append(InlineKeyboardButton(text="➡️", callback_data=f"overdue_cases_page_{current_page + 1}"))
+        rows.append(nav)
     rows.extend([
-        [InlineKeyboardButton(text="👤 Мой профиль", callback_data="overdue_profile")],
-        [InlineKeyboardButton(text="✍️ Подпись", callback_data="overdue_signature")],
+        [InlineKeyboardButton(text="🏦 Данные займодавца", callback_data="overdue_profile")],
         [InlineKeyboardButton(text="↩ Просрочки", callback_data="overdue_menu")],
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _case_actions_kb(case_id: int) -> InlineKeyboardMarkup:
+def _case_actions_kb(case_id: int, credential_id: int | None = None) -> InlineKeyboardMarkup:
+    credential_rows: list[list[InlineKeyboardButton]] = []
+    if credential_id:
+        credential_rows = [
+            [InlineKeyboardButton(text="🏦 Профиль займодавца", callback_data=f"overdue_profile_case_{case_id}")],
+            [InlineKeyboardButton(text="✍️ Подпись для логина", callback_data=f"overdue_signature_cred_{credential_id}")],
+        ]
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✉️ Сформировать SMS", callback_data=f"overdue_sms_{case_id}")],
         [InlineKeyboardButton(text="📄 Сформировать претензию", callback_data=f"overdue_claim_{case_id}")],
         [InlineKeyboardButton(text="🧾 Данные API", callback_data=f"overdue_raw_{case_id}")],
         [InlineKeyboardButton(text="📝 Данные должника", callback_data=f"overdue_edit_{case_id}")],
-        [InlineKeyboardButton(text="👤 Профиль займодавца", callback_data=f"overdue_profile_case_{case_id}")],
-        [InlineKeyboardButton(text="✍️ Подпись", callback_data="overdue_signature")],
+        *credential_rows,
         [InlineKeyboardButton(text="↩ К списку просрочек", callback_data="overdue_cases")],
     ])
 
@@ -212,7 +246,8 @@ async def _show_credential_profile_message(callback: CallbackQuery, credential_i
         await callback.answer("Логин не найден", show_alert=True)
         return
     profile = await get_credential_creditor_profile(callback.message.chat.id, credential_id)
-    lines = [f"👤 <b>Профиль займодавца</b>", "", f"<b>Логин:</b> {_display_html(_credential_label(credential))}", ""]
+    signature = await get_credential_signature_asset(callback.message.chat.id, credential_id)
+    lines = [f"🏦 <b>Данные займодавца</b>", "", f"<b>Логин:</b> {_display_html(_credential_label(credential))}", ""]
     if not profile:
         lines.append("Пока не заполнен.")
     else:
@@ -222,11 +257,44 @@ async def _show_credential_profile_message(callback: CallbackQuery, credential_i
             f"<b>Телефон:</b> {_display_html(profile.get('phone'))}",
             f"<b>Email:</b> {_display_html(profile.get('email'))}",
         ])
+    lines.extend([
+        "",
+        f"<b>Подпись:</b> {'загружена' if signature and signature.get('file_path') else 'не загружена'}",
+    ])
+    if signature and signature.get("source") == "legacy":
+        lines.append("<i>Сейчас используется старая общая подпись. Можно закрепить отдельную для этого логина.</i>")
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Заполнить / обновить", callback_data=f"overdue_profile_edit_{credential_id}")],
+        [InlineKeyboardButton(text="♻️ Скопировать с другого логина", callback_data=f"overdue_profile_copy_{credential_id}")],
+        [InlineKeyboardButton(text="✍️ Управление подписью", callback_data=f"overdue_signature_cred_{credential_id}")],
         [InlineKeyboardButton(text="↩ К профилям", callback_data="overdue_profile")],
     ])
     await callback.message.edit_text("\n".join(lines), reply_markup=kb, parse_mode="HTML")
+
+
+async def _show_signature_message(callback: CallbackQuery, credential_id: int, state: FSMContext | None = None) -> None:
+    credential = await get_credential_by_id(credential_id, callback.message.chat.id)
+    if not credential:
+        await callback.answer("Логин не найден", show_alert=True)
+        return
+    signature = await get_credential_signature_asset(callback.message.chat.id, credential_id)
+    text = (
+        "✍️ <b>Подпись для логина</b>\n\n"
+        f"Логин: <b>{escape(_credential_label(credential))}</b>\n\n"
+        + (
+            "Подпись уже загружена. Можно прислать новую или переиспользовать из другого логина."
+            if signature and signature.get("file_path")
+            else "Подпись еще не загружена. Можно загрузить новую или переиспользовать из другого логина."
+        )
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 Загрузить подпись", callback_data=f"overdue_signature_upload_{credential_id}")],
+        [InlineKeyboardButton(text="♻️ Скопировать с другого логина", callback_data=f"overdue_signature_copy_{credential_id}")],
+        [InlineKeyboardButton(text="↩ К логину", callback_data=f"overdue_profile_cred_{credential_id}")],
+    ])
+    if state is not None:
+        await state.clear()
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
 
 async def _enrich_finkit_case_from_claims(case: dict) -> dict:
@@ -272,7 +340,7 @@ async def _show_case(callback: CallbackQuery, case_id: int) -> None:
         return
     await callback.message.edit_text(
         _format_case_text(case),
-        reply_markup=_case_actions_kb(case_id),
+        reply_markup=_case_actions_kb(case_id, int(case["credential_id"]) if case.get("credential_id") else None),
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
@@ -296,7 +364,7 @@ async def cb_overdue_raw(callback: CallbackQuery):
     pretty = pretty[:3500]
     await callback.message.edit_text(
         f"🧾 <b>Данные API</b>\n\n<pre>{escape(pretty)}</pre>",
-        reply_markup=_case_actions_kb(case_id),
+        reply_markup=_case_actions_kb(case_id, int(case["credential_id"]) if case.get("credential_id") else None),
         parse_mode="HTML",
     )
 
@@ -310,14 +378,18 @@ async def cb_overdue_menu(callback: CallbackQuery, state: FSMContext):
     text = (
         "⚖️ <b>Просрочки</b>\n\n"
         f"Активных кейсов: <b>{len(cases)}</b>\n"
-        "Здесь можно открыть список просроченных займов, заполнить профиль займодавца по логину, "
-        "загрузить подпись и вручную сформировать SMS или претензию."
+        "Здесь можно открыть список просроченных займов, заполнить данные займодавца по каждому логину, "
+        "назначить отдельные подписи и вручную сформировать SMS или претензию."
     )
     await callback.message.edit_text(text, reply_markup=_menu_kb(), parse_mode="HTML")
 
 
 @router.callback_query(F.data == "overdue_cases")
 async def cb_overdue_cases(callback: CallbackQuery):
+    await _show_overdue_cases_page(callback, 0)
+
+
+async def _show_overdue_cases_page(callback: CallbackQuery, page: int) -> None:
     if not await is_allowed(callback.message.chat.id):
         return
     cases = await list_overdue_cases(callback.message.chat.id)
@@ -328,11 +400,20 @@ async def cb_overdue_cases(callback: CallbackQuery):
             parse_mode="HTML",
         )
         return
+    _, current_page, total_pages = _paginate_cases(cases, page)
     await callback.message.edit_text(
-        "🗂 <b>Список просроченных кейсов</b>\n\nВыберите кейс:",
-        reply_markup=_case_list_kb(cases),
+        f"🗂 <b>Список просроченных кейсов</b>\n\nВыберите кейс.\nСтраница: <b>{current_page + 1}/{total_pages}</b>",
+        reply_markup=_case_list_kb(cases, current_page),
         parse_mode="HTML",
     )
+
+
+@router.callback_query(F.data.startswith("overdue_cases_page_"))
+async def cb_overdue_cases_page(callback: CallbackQuery):
+    if not await is_allowed(callback.message.chat.id):
+        return
+    page = int(callback.data.replace("overdue_cases_page_", ""))
+    await _show_overdue_cases_page(callback, page)
 
 
 @router.callback_query(F.data.startswith("overdue_case_"))
@@ -348,7 +429,7 @@ async def cb_overdue_profile(callback: CallbackQuery):
     if not await is_allowed(callback.message.chat.id):
         return
     credentials = await list_user_credentials(callback.message.chat.id, services=("finkit", "zaimis"))
-    lines = ["👤 <b>Профили займодавца по логинам</b>", ""]
+    lines = ["🏦 <b>Данные займодавца по логинам</b>", ""]
     if not credentials:
         lines.append("Сначала добавьте учётные данные сервиса.")
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -361,7 +442,10 @@ async def cb_overdue_profile(callback: CallbackQuery):
     buttons: list[list[InlineKeyboardButton]] = []
     for credential in credentials:
         profile = await get_credential_creditor_profile(callback.message.chat.id, int(credential["id"]))
-        status = "✅" if profile and profile.get("full_name") and profile.get("address") else "⚠️"
+        signature = await get_credential_signature_asset(callback.message.chat.id, int(credential["id"]))
+        profile_status = _profile_status_icon(profile)
+        signature_status = _signature_status_icon(signature)
+        status = f"{profile_status}👤 {signature_status}✍️"
         lines.append(f"{status} {_credential_label(credential)}")
         buttons.append([
             InlineKeyboardButton(
@@ -409,7 +493,7 @@ async def cb_overdue_profile_edit(callback: CallbackQuery, state: FSMContext):
     await state.update_data(credential_id=credential_id)
     await state.set_state(OverdueStates.waiting_creditor_profile)
     await callback.message.edit_text(
-        "👤 <b>Профиль займодавца</b>\n\n"
+        "🏦 <b>Данные займодавца</b>\n\n"
         f"Логин: <b>{escape(_credential_label(credential))}</b>\n\n"
         "Отправьте 4 строки:\n"
         "1. ФИО / название займодавца\n"
@@ -426,6 +510,55 @@ async def cb_overdue_profile_edit(callback: CallbackQuery, state: FSMContext):
         ]),
         parse_mode="HTML",
     )
+
+
+@router.callback_query(F.data.startswith("overdue_profile_copy_"))
+async def cb_overdue_profile_copy(callback: CallbackQuery):
+    if not await is_allowed(callback.message.chat.id):
+        return
+    if callback.data.startswith("overdue_profile_copy_from_"):
+        return
+    target_credential_id = int(callback.data.replace("overdue_profile_copy_", ""))
+    credentials = await list_user_credentials(callback.message.chat.id, services=("finkit", "zaimis"))
+    buttons: list[list[InlineKeyboardButton]] = []
+    for credential in credentials:
+        source_id = int(credential["id"])
+        if source_id == target_credential_id:
+            continue
+        profile = await get_credential_creditor_profile(callback.message.chat.id, source_id)
+        if not profile:
+            continue
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"♻️ {_credential_label(credential)}",
+                callback_data=f"overdue_profile_copy_from_{target_credential_id}_{source_id}",
+            )
+        ])
+    buttons.append([InlineKeyboardButton(text="↩ К логину", callback_data=f"overdue_profile_cred_{target_credential_id}")])
+    text = (
+        "♻️ <b>Скопировать данные займодавца</b>\n\n"
+        "Выберите логин-источник, с которого нужно переиспользовать профиль."
+    )
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("overdue_profile_copy_from_"))
+async def cb_overdue_profile_copy_from(callback: CallbackQuery):
+    if not await is_allowed(callback.message.chat.id):
+        return
+    payload = callback.data.replace("overdue_profile_copy_from_", "")
+    target_id_raw, source_id_raw = payload.split("_", 1)
+    target_credential_id = int(target_id_raw)
+    source_credential_id = int(source_id_raw)
+    copied = await clone_credential_creditor_profile(
+        callback.message.chat.id,
+        source_credential_id,
+        target_credential_id,
+    )
+    if not copied:
+        await callback.answer("Не удалось найти источник профиля", show_alert=True)
+        return
+    await _show_credential_profile_message(callback, target_credential_id)
 
 
 @router.message(OverdueStates.waiting_creditor_profile)
@@ -456,37 +589,91 @@ async def msg_overdue_profile(message: Message, state: FSMContext):
 
 
 @router.callback_query(F.data == "overdue_signature")
-async def cb_overdue_signature(callback: CallbackQuery, state: FSMContext):
+async def cb_overdue_signature(callback: CallbackQuery):
+    await cb_overdue_profile(callback)
+
+
+@router.callback_query(F.data.startswith("overdue_signature_cred_"))
+async def cb_overdue_signature_credential(callback: CallbackQuery, state: FSMContext):
     if not await is_allowed(callback.message.chat.id):
         return
-    signature = await get_user_signature_asset(callback.message.chat.id)
-    text = (
-        "✍️ <b>Подпись</b>\n\n"
-        + ("Подпись уже загружена. Можно прислать новую, чтобы заменить текущую." if signature else "Подпись еще не загружена.")
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📤 Загрузить подпись", callback_data="overdue_signature_upload")],
-        [InlineKeyboardButton(text="↩ Просрочки", callback_data="overdue_menu")],
-    ])
-    await state.clear()
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    credential_id = int(callback.data.replace("overdue_signature_cred_", ""))
+    await _show_signature_message(callback, credential_id, state)
 
 
-@router.callback_query(F.data == "overdue_signature_upload")
+@router.callback_query(F.data.startswith("overdue_signature_upload_"))
 async def cb_overdue_signature_upload(callback: CallbackQuery, state: FSMContext):
     if not await is_allowed(callback.message.chat.id):
         return
+    credential_id = int(callback.data.replace("overdue_signature_upload_", ""))
+    credential = await get_credential_by_id(credential_id, callback.message.chat.id)
+    if not credential:
+        await callback.answer("Логин не найден", show_alert=True)
+        return
+    await state.update_data(credential_id=credential_id)
     await state.set_state(OverdueStates.waiting_signature)
     await callback.message.edit_text(
         "✍️ <b>Загрузка подписи</b>\n\n"
+        f"Логин: <b>{escape(_credential_label(credential))}</b>\n\n"
         "Пришлите изображение подписи как фото или файл PNG/JPG.\n"
-        "Мы сохраним его и будем автоматически вставлять в документ претензии.",
-        reply_markup=_back_main_kb(),
+        "Мы сохраним его именно для этого логина и будем автоматически вставлять в документ претензии.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="↩ К подписи", callback_data=f"overdue_signature_cred_{credential_id}")],
+        ]),
         parse_mode="HTML",
     )
 
 
-async def _save_signature_message(message: Message) -> str | None:
+@router.callback_query(F.data.startswith("overdue_signature_copy_"))
+async def cb_overdue_signature_copy(callback: CallbackQuery):
+    if not await is_allowed(callback.message.chat.id):
+        return
+    if callback.data.startswith("overdue_signature_copy_from_"):
+        return
+    target_credential_id = int(callback.data.replace("overdue_signature_copy_", ""))
+    credentials = await list_user_credentials(callback.message.chat.id, services=("finkit", "zaimis"))
+    buttons: list[list[InlineKeyboardButton]] = []
+    for credential in credentials:
+        source_id = int(credential["id"])
+        if source_id == target_credential_id:
+            continue
+        signature = await get_credential_signature_asset(callback.message.chat.id, source_id)
+        if not signature or not signature.get("file_path"):
+            continue
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"♻️ {_credential_label(credential)}",
+                callback_data=f"overdue_signature_copy_from_{target_credential_id}_{source_id}",
+            )
+        ])
+    buttons.append([InlineKeyboardButton(text="↩ К подписи", callback_data=f"overdue_signature_cred_{target_credential_id}")])
+    await callback.message.edit_text(
+        "♻️ <b>Скопировать подпись</b>\n\nВыберите логин-источник.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("overdue_signature_copy_from_"))
+async def cb_overdue_signature_copy_from(callback: CallbackQuery):
+    if not await is_allowed(callback.message.chat.id):
+        return
+    payload = callback.data.replace("overdue_signature_copy_from_", "")
+    target_raw, source_raw = payload.split("_", 1)
+    target_credential_id = int(target_raw)
+    source_credential_id = int(source_raw)
+    copied = await copy_credential_signature_asset(
+        callback.message.chat.id,
+        source_credential_id,
+        target_credential_id,
+    )
+    if not copied:
+        await callback.answer("Не удалось найти подпись-источник", show_alert=True)
+        return
+    await _show_signature_message(callback, target_credential_id)
+
+
+async def _save_signature_message(message: Message, credential_id: int) -> str | None:
     SIGNATURES_DIR.mkdir(parents=True, exist_ok=True)
     bot = message.bot
 
@@ -505,10 +692,11 @@ async def _save_signature_message(message: Message) -> str | None:
     else:
         return None
 
-    out_path = SIGNATURES_DIR / f"{message.chat.id}{ext}"
+    out_path = SIGNATURES_DIR / f"{message.chat.id}_{credential_id}{ext}"
     await bot.download_file(tg_file.file_path, destination=str(out_path))
-    await save_user_signature_asset(
+    await save_credential_signature_asset(
         message.chat.id,
+        credential_id,
         file_path=str(out_path),
         mime_type=mime_type,
         telegram_file_id=file_id,
@@ -521,12 +709,22 @@ async def _save_signature_message(message: Message) -> str | None:
 async def msg_overdue_signature(message: Message, state: FSMContext):
     if not await is_allowed(message.chat.id):
         return
-    saved = await _save_signature_message(message)
+    data = await state.get_data()
+    credential_id = data.get("credential_id")
+    if not credential_id:
+        await state.clear()
+        await message.answer("Не удалось определить логин для подписи.", reply_markup=_menu_kb())
+        return
+    saved = await _save_signature_message(message, int(credential_id))
     if not saved:
         await message.answer("Не удалось сохранить подпись. Пришлите фото или PNG/JPG файл.")
         return
+    credential = await get_credential_by_id(int(credential_id), message.chat.id)
     await state.clear()
-    await message.answer("✅ Подпись сохранена.", reply_markup=_menu_kb())
+    await message.answer(
+        f"✅ Подпись сохранена для логина {_credential_label(credential) if credential else credential_id}.",
+        reply_markup=_menu_kb(),
+    )
 
 
 @router.message(OverdueStates.waiting_signature)
@@ -615,7 +813,7 @@ async def cb_overdue_sms(callback: CallbackQuery):
         await callback.message.edit_text(
             "⚠️ <b>Нельзя сформировать SMS</b>\n\n"
             + "\n".join(f"• {escape(item)}" for item in missing),
-            reply_markup=_case_actions_kb(case_id),
+            reply_markup=_case_actions_kb(case_id, int(case["credential_id"]) if case.get("credential_id") else None),
             parse_mode="HTML",
         )
         return
@@ -629,7 +827,7 @@ async def cb_overdue_sms(callback: CallbackQuery):
     )
     await callback.message.edit_text(
         f"✉️ <b>SMS</b>\n\n<pre>{escape(sms_text)}</pre>",
-        reply_markup=_case_actions_kb(case_id),
+        reply_markup=_case_actions_kb(case_id, int(case["credential_id"]) if case.get("credential_id") else None),
         parse_mode="HTML",
     )
 
@@ -640,14 +838,28 @@ async def cb_overdue_claim(callback: CallbackQuery):
         return
     case_id = int(callback.data.replace("overdue_claim_", ""))
     case = await get_overdue_case(case_id, callback.message.chat.id)
-    signature = await get_user_signature_asset(callback.message.chat.id)
     if not case:
         await callback.answer("Кейс не найден", show_alert=True)
         return
     case = await _enrich_finkit_case_from_claims(case)
     creditor = await _get_case_creditor_profile(case)
+    signature = (
+        await get_credential_signature_asset(callback.message.chat.id, int(case["credential_id"]))
+        if case.get("credential_id")
+        else None
+    )
     missing = collect_claim_missing_fields(case, creditor, signature)
     if missing:
+        profile_button = (
+            [InlineKeyboardButton(text="🏦 Данные займодавца", callback_data=f"overdue_profile_case_{case_id}")]
+            if case.get("credential_id")
+            else [InlineKeyboardButton(text="🏦 Данные займодавца", callback_data="overdue_profile")]
+        )
+        signature_button = (
+            [InlineKeyboardButton(text="✍️ Подпись для логина", callback_data=f"overdue_signature_cred_{case['credential_id']}")]
+            if case.get("credential_id")
+            else [InlineKeyboardButton(text="✍️ Подпись", callback_data="overdue_signature")]
+        )
         await save_generated_document(
             case_id,
             callback.message.chat.id,
@@ -657,8 +869,8 @@ async def cb_overdue_claim(callback: CallbackQuery):
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📝 Данные должника", callback_data=f"overdue_edit_{case_id}")],
-            [InlineKeyboardButton(text="👤 Профиль займодавца", callback_data=f"overdue_profile_case_{case_id}")],
-            [InlineKeyboardButton(text="✍️ Подпись", callback_data="overdue_signature")],
+            profile_button,
+            signature_button,
             [InlineKeyboardButton(text="↩ К кейсу", callback_data=f"overdue_case_{case_id}")],
         ])
         await callback.message.edit_text(
@@ -681,5 +893,9 @@ async def cb_overdue_claim(callback: CallbackQuery):
     await callback.message.answer_document(
         FSInputFile(str(doc_path), filename=doc_path.name),
         caption="📄 Претензия сформирована.",
+    )
+    await callback.message.answer(
+        build_postal_address_text(case),
+        parse_mode="HTML",
     )
     await _show_case(callback, case_id)

@@ -21,6 +21,8 @@ SERVICE_URLS = {
 }
 
 GENERATED_DOCS_DIR = Path(config.BASE_DIR) / "data" / "generated-docs"
+SMS_MIN_LEN = 130
+SMS_MAX_LEN = 140
 
 
 def _money(value: float | int | None) -> str:
@@ -74,7 +76,7 @@ def _sms_name(full_name: str | None) -> str:
 
 def _sms_ref(case: dict) -> str:
     ref = _loan_ref(case)
-    return ref if len(ref) <= 18 else ref[-8:]
+    return ref if len(ref) <= 12 else ref[-8:]
 
 
 def _sms_date(case: dict) -> str:
@@ -86,8 +88,26 @@ def _sms_date(case: dict) -> str:
 
 
 def _fit_sms(text: str) -> str:
-    compact = " ".join(text.split())
-    return compact[:140].rstrip()
+    compact = " ".join(text.split()).strip()
+    if len(compact) <= SMS_MAX_LEN:
+        return compact
+    trimmed = compact[:SMS_MAX_LEN + 1]
+    cut_at = trimmed.rfind(" ")
+    if cut_at >= SMS_MIN_LEN - 10:
+        return trimmed[:cut_at].rstrip(" ,.-")
+    return compact[:SMS_MAX_LEN].rstrip(" ,.-")
+
+
+def _address_line(zip_code: str | None, address: str | None) -> str:
+    parts = []
+    if zip_code:
+        parts.append(str(zip_code).strip())
+    if address:
+        parts.append(str(address).strip())
+    line = ", ".join(part for part in parts if part)
+    if "беларус" not in line.lower():
+        line = f"Республика Беларусь, {line}" if line else "Республика Беларусь"
+    return line
 
 
 def _build_contacts_block(name: str | None, address: str | None, phone: str | None, email: str | None) -> list[str]:
@@ -140,12 +160,35 @@ def _join_non_empty(parts: list[str | None]) -> str:
 
 def build_sms_text(case: dict, creditor: dict) -> str:
     del creditor
-    amount = _money(case.get("total_due")).replace(" BYN", "р")
+    amount = _money(case.get("total_due")).replace(" BYN", " р")
     text = (
-        f"{_sms_name(case.get('full_name'))}, займ {_sms_ref(case)} {_sms_date(case)}. "
-        f"Долг {amount}. При неоплате - взыскание через суд."
+        f"{_sms_name(case.get('full_name'))}, долг по займу {_sms_ref(case)} от {_sms_date(case)} — {amount}. "
+        "Просим оплатить добровольно. Иначе подадим иск и взыщем судебные расходы."
     )
-    return _fit_sms(text)
+    text = _fit_sms(text)
+    if len(text) >= SMS_MIN_LEN:
+        return text
+    extras = (
+        " Просьба не затягивать оплату.",
+        " Урегулируйте вопрос без суда.",
+    )
+    for extra in extras:
+        candidate = _fit_sms(text + extra)
+        if len(candidate) > len(text):
+            text = candidate
+        if len(text) >= SMS_MIN_LEN:
+            break
+    return text
+
+
+def build_postal_address_text(case: dict) -> str:
+    recipient = case.get("full_name") or "Получатель не указан"
+    address_line = _address_line(case.get("borrower_zip"), case.get("borrower_address"))
+    details: list[str] = [recipient]
+    if case.get("document_id"):
+        details.append(f"ИН: {case['document_id']}")
+    details.append(address_line)
+    return "📮 <b>Адрес для отправки через Белпочту</b>\n\n<pre>" + "\n".join(details) + "</pre>"
 
 
 def build_claim_text(case: dict, creditor: dict) -> str:
@@ -226,7 +269,7 @@ def render_claim_docx(case: dict, creditor: dict, signature_path: str) -> tuple[
 
     debtor_lines = _build_contacts_block(
         case.get("full_name"),
-        " ".join(part for part in [case.get("borrower_zip"), case.get("borrower_address")] if part),
+        _address_line(case.get("borrower_zip"), case.get("borrower_address")),
         case.get("borrower_phone"),
         case.get("borrower_email"),
     )

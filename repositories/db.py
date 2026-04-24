@@ -224,6 +224,20 @@ async def init_db() -> None:
             FOREIGN KEY (chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS credential_signature_assets (
+            chat_id             INTEGER NOT NULL,
+            credential_id       INTEGER NOT NULL,
+            file_path           TEXT NOT NULL,
+            mime_type           TEXT,
+            telegram_file_id    TEXT,
+            telegram_unique_id  TEXT,
+            created_at          TEXT DEFAULT (datetime('now')),
+            updated_at          TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (chat_id, credential_id),
+            FOREIGN KEY (chat_id) REFERENCES users(chat_id) ON DELETE CASCADE,
+            FOREIGN KEY (credential_id) REFERENCES credentials(id) ON DELETE CASCADE
+        );
+
         CREATE TABLE IF NOT EXISTS generated_documents (
             id                  INTEGER PRIMARY KEY AUTOINCREMENT,
             overdue_case_id     INTEGER NOT NULL,

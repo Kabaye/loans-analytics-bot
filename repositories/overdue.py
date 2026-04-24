@@ -276,6 +276,51 @@ async def upsert_credential_creditor_profile(
         await db.close()
 
 
+async def copy_credential_creditor_profile(
+    chat_id: int,
+    source_credential_id: int,
+    target_credential_id: int,
+) -> bool:
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            """
+            SELECT full_name, address, phone, email
+            FROM credential_creditor_profiles
+            WHERE chat_id = ? AND credential_id = ?
+            """,
+            (chat_id, source_credential_id),
+        )
+        if not rows:
+            return False
+        source = rows[0]
+        await db.execute(
+            """
+            INSERT INTO credential_creditor_profiles (
+                chat_id, credential_id, full_name, address, phone, email, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(chat_id, credential_id) DO UPDATE SET
+                full_name = excluded.full_name,
+                address = excluded.address,
+                phone = excluded.phone,
+                email = excluded.email,
+                updated_at = datetime('now')
+            """,
+            (
+                chat_id,
+                target_credential_id,
+                source["full_name"],
+                source["address"],
+                source["phone"],
+                source["email"],
+            ),
+        )
+        await db.commit()
+        return True
+    finally:
+        await db.close()
+
+
 async def upsert_creditor_profile(
     chat_id: int,
     *,
@@ -321,6 +366,37 @@ async def get_user_signature_asset(chat_id: int) -> dict | None:
         await db.close()
 
 
+async def get_credential_signature_asset(chat_id: int, credential_id: int) -> dict | None:
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            """
+            SELECT csa.*, c.service, c.login, c.label
+            FROM credential_signature_assets csa
+            JOIN credentials c ON c.id = csa.credential_id
+            WHERE csa.chat_id = ? AND csa.credential_id = ?
+            """,
+            (chat_id, credential_id),
+        )
+        if rows:
+            data = dict(rows[0])
+            data["source"] = "credential"
+            return data
+
+        legacy_rows = await db.execute_fetchall(
+            "SELECT * FROM user_signature_assets WHERE chat_id = ?",
+            (chat_id,),
+        )
+        if not legacy_rows:
+            return None
+        data = dict(legacy_rows[0])
+        data["credential_id"] = credential_id
+        data["source"] = "legacy"
+        return data
+    finally:
+        await db.close()
+
+
 async def save_user_signature_asset(
     chat_id: int,
     *,
@@ -346,6 +422,93 @@ async def save_user_signature_asset(
             (chat_id, file_path, mime_type, telegram_file_id, telegram_unique_id),
         )
         await db.commit()
+    finally:
+        await db.close()
+
+
+async def save_credential_signature_asset(
+    chat_id: int,
+    credential_id: int,
+    *,
+    file_path: str,
+    mime_type: str | None = None,
+    telegram_file_id: str | None = None,
+    telegram_unique_id: str | None = None,
+) -> None:
+    db = await get_db()
+    try:
+        await db.execute(
+            """
+            INSERT INTO credential_signature_assets (
+                chat_id, credential_id, file_path, mime_type, telegram_file_id, telegram_unique_id, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(chat_id, credential_id) DO UPDATE SET
+                file_path = excluded.file_path,
+                mime_type = excluded.mime_type,
+                telegram_file_id = excluded.telegram_file_id,
+                telegram_unique_id = excluded.telegram_unique_id,
+                updated_at = datetime('now')
+            """,
+            (chat_id, credential_id, file_path, mime_type, telegram_file_id, telegram_unique_id),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def copy_credential_signature_asset(
+    chat_id: int,
+    source_credential_id: int,
+    target_credential_id: int,
+) -> bool:
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            """
+            SELECT file_path, mime_type, telegram_file_id, telegram_unique_id
+            FROM credential_signature_assets
+            WHERE chat_id = ? AND credential_id = ?
+            """,
+            (chat_id, source_credential_id),
+        )
+        if rows:
+            source = rows[0]
+        else:
+            legacy_rows = await db.execute_fetchall(
+                """
+                SELECT file_path, mime_type, telegram_file_id, telegram_unique_id
+                FROM user_signature_assets
+                WHERE chat_id = ?
+                """,
+                (chat_id,),
+            )
+            if not legacy_rows:
+                return False
+            source = legacy_rows[0]
+
+        await db.execute(
+            """
+            INSERT INTO credential_signature_assets (
+                chat_id, credential_id, file_path, mime_type, telegram_file_id, telegram_unique_id, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(chat_id, credential_id) DO UPDATE SET
+                file_path = excluded.file_path,
+                mime_type = excluded.mime_type,
+                telegram_file_id = excluded.telegram_file_id,
+                telegram_unique_id = excluded.telegram_unique_id,
+                updated_at = datetime('now')
+            """,
+            (
+                chat_id,
+                target_credential_id,
+                source["file_path"],
+                source["mime_type"],
+                source["telegram_file_id"],
+                source["telegram_unique_id"],
+            ),
+        )
+        await db.commit()
+        return True
     finally:
         await db.close()
 
@@ -420,12 +583,16 @@ async def clear_finkit_suspect_address(
 
 __all__ = [
     "clear_finkit_suspect_address",
+    "copy_credential_creditor_profile",
+    "copy_credential_signature_asset",
     "deactivate_missing_overdue_cases",
     "get_creditor_profile",
     "get_credential_creditor_profile",
+    "get_credential_signature_asset",
     "get_overdue_case",
     "get_user_signature_asset",
     "list_overdue_cases",
+    "save_credential_signature_asset",
     "save_generated_document",
     "save_user_signature_asset",
     "update_overdue_case_contacts",

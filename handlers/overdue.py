@@ -33,7 +33,7 @@ from bot.services.overdue.service import (
     upsert_overdue_case,
 )
 from bot.services.base.access import is_allowed
-from bot.services.overdue.cases import enrich_finkit_case_from_claims, resolve_belarus_zip, resolve_belarus_zip_details
+from bot.services.overdue.cases import enrich_finkit_case_from_claims, resolve_belarus_zip_details
 from bot.services.overdue.documents import (
     build_postal_address_text,
     build_sms_text,
@@ -118,7 +118,6 @@ def _case_actions_kb(case_id: int, credential_id: int | None = None) -> InlineKe
         [InlineKeyboardButton(text="✉️ Сформировать SMS", callback_data=f"overdue_sms_{case_id}")],
         [InlineKeyboardButton(text="📄 Сформировать претензию", callback_data=f"overdue_claim_{case_id}")],
         [InlineKeyboardButton(text="🧾 Данные API", callback_data=f"overdue_raw_{case_id}")],
-        [InlineKeyboardButton(text="📝 Данные должника", callback_data=f"overdue_edit_{case_id}")],
         [InlineKeyboardButton(text="↩ К списку просрочек", callback_data="overdue_cases")],
     ])
 

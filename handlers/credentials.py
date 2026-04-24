@@ -127,14 +127,14 @@ async def _show_credential_creditor_detail(callback: CallbackQuery, credential_i
         "🏦 <b>Данные займодавца</b>",
         "",
         f"<b>Логин:</b> {_display_html(_credential_label(credential))}",
-        f"<b>ФИО / название:</b> {_display_html(profile.get('full_name') if profile else None)}",
+        f"<b>ФИО:</b> {_display_html(profile.get('full_name') if profile else None)}",
         f"<b>Адрес:</b> {_display_html(profile.get('address') if profile else None)}",
         f"<b>Телефон:</b> {_display_html(profile.get('phone') if profile else None)}",
         f"<b>Email:</b> {_display_html(profile.get('email') if profile else None)}",
         f"<b>Подпись:</b> {'закреплена за логином' if signature and signature.get('file_path') and signature.get('source') != 'legacy' else 'используется общая' if signature and signature.get('file_path') else 'не загружена'}",
     ]
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ ФИО / название", callback_data=f"cred_creditor_field_{credential_id}_full_name")],
+        [InlineKeyboardButton(text="✏️ ФИО", callback_data=f"cred_creditor_field_{credential_id}_full_name")],
         [InlineKeyboardButton(text="✏️ Адрес", callback_data=f"cred_creditor_field_{credential_id}_address")],
         [InlineKeyboardButton(text="✏️ Телефон", callback_data=f"cred_creditor_field_{credential_id}_phone")],
         [InlineKeyboardButton(text="✏️ Email", callback_data=f"cred_creditor_field_{credential_id}_email")],
@@ -224,11 +224,14 @@ async def cb_cred_creditor_menu(callback: CallbackQuery, state: FSMContext):
     await _show_creditor_profiles(callback.message, callback.message.chat.id, edit=True)
 
 
-@router.callback_query(F.data.startswith("cred_creditor_"))
+@router.callback_query(
+    lambda callback: bool(callback.data)
+    and callback.data.startswith("cred_creditor_")
+    and not callback.data.startswith("cred_creditor_field_")
+    and not callback.data.startswith("cred_creditor_copy_")
+)
 async def cb_cred_creditor_detail(callback: CallbackQuery):
     if not await is_allowed(callback.message.chat.id):
-        return
-    if callback.data.startswith("cred_creditor_field_") or callback.data.startswith("cred_creditor_copy_"):
         return
     credential_id = int(callback.data.replace("cred_creditor_", ""))
     await _show_credential_creditor_detail(callback, credential_id)
@@ -247,7 +250,7 @@ async def cb_cred_creditor_field(callback: CallbackQuery, state: FSMContext):
         return
     profile = await get_credential_creditor_profile(callback.message.chat.id, credential_id) or {}
     field_labels = {
-        "full_name": "ФИО / название займодавца",
+        "full_name": "ФИО займодавца",
         "address": "адрес займодавца",
         "phone": "телефон займодавца",
         "email": "email займодавца",
@@ -306,7 +309,11 @@ async def msg_cred_creditor_field(message: Message, state: FSMContext):
     )
 
 
-@router.callback_query(F.data.startswith("cred_creditor_copy_"))
+@router.callback_query(
+    lambda callback: bool(callback.data)
+    and callback.data.startswith("cred_creditor_copy_")
+    and not callback.data.startswith("cred_creditor_copy_from_")
+)
 async def cb_cred_creditor_copy(callback: CallbackQuery):
     if not await is_allowed(callback.message.chat.id):
         return
@@ -349,11 +356,14 @@ async def cb_cred_creditor_copy_from(callback: CallbackQuery):
     await _show_credential_creditor_detail(callback, target_credential_id)
 
 
-@router.callback_query(F.data.startswith("cred_signature_"))
+@router.callback_query(
+    lambda callback: bool(callback.data)
+    and callback.data.startswith("cred_signature_")
+    and not callback.data.startswith("cred_signature_upload_")
+    and not callback.data.startswith("cred_signature_copy_")
+)
 async def cb_cred_signature(callback: CallbackQuery, state: FSMContext):
     if not await is_allowed(callback.message.chat.id):
-        return
-    if callback.data.startswith("cred_signature_upload_") or callback.data.startswith("cred_signature_copy_"):
         return
     credential_id = int(callback.data.replace("cred_signature_", ""))
     await _show_signature_detail(callback, credential_id, state)
@@ -381,11 +391,13 @@ async def cb_cred_signature_upload(callback: CallbackQuery, state: FSMContext):
     )
 
 
-@router.callback_query(F.data.startswith("cred_signature_copy_"))
+@router.callback_query(
+    lambda callback: bool(callback.data)
+    and callback.data.startswith("cred_signature_copy_")
+    and not callback.data.startswith("cred_signature_copy_from_")
+)
 async def cb_cred_signature_copy(callback: CallbackQuery):
     if not await is_allowed(callback.message.chat.id):
-        return
-    if callback.data.startswith("cred_signature_copy_from_"):
         return
     target_credential_id = int(callback.data.replace("cred_signature_copy_", ""))
     rows = await list_credentials_rows(callback.message.chat.id)

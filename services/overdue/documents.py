@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 import json
 import logging
+import re
 
 from docx import Document
 from docx.enum.table import WD_TABLE_ALIGNMENT
@@ -27,6 +28,27 @@ SMS_SERVICE_NAMES = {
     "zaimis": "ЗАЙМись",
     "kapusta": "Kapusta",
 }
+ADDRESS_ABBREVIATIONS = (
+    (r"^город\s+", "г. "),
+    (r"^г\.?\s+", "г. "),
+    (r"^деревня\s+", "д. "),
+    (r"^д\.?\s+", "д. "),
+    (r"^агрогородок\s+", "аг. "),
+    (r"^аг\.?\s+", "аг. "),
+    (r"^пос[её]лок\s+", "пос. "),
+    (r"^пос\.?\s+", "пос. "),
+    (r"^улица\s+", "ул. "),
+    (r"^ул\.?\s+", "ул. "),
+    (r"^проспект\s+", "пр-т "),
+    (r"^пр\-т\s+", "пр-т "),
+    (r"^переулок\s+", "пер. "),
+    (r"^пер\.?\s+", "пер. "),
+    (r"^дом\s+", "д. "),
+    (r"^д\.?\s+", "д. "),
+    (r"^квартира\s+", "кв. "),
+    (r"^кв\.?\s+", "кв. "),
+)
+LOCALITY_PREFIXES = ("г.", "город ", "д.", "деревня ", "аг.", "агрогородок ", "пос.", "поселок ", "посёлок ")
 
 
 def _money(value: float | int | None) -> str:
@@ -129,6 +151,110 @@ def _address_line(zip_code: str | None, address: str | None) -> str:
     return line
 
 
+def _parse_case_raw(case: dict) -> dict:
+    raw = case.get("raw_data")
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def _normalize_address_token(token: str) -> str:
+    text = " ".join((token or "").split()).strip(" ,")
+    if not text:
+        return ""
+    for pattern, replacement in ADDRESS_ABBREVIATIONS:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    text = text.lower().title()
+    return (
+        text.replace("Г. ", "г. ")
+        .replace("Д. ", "д. ")
+        .replace("Аг. ", "аг. ")
+        .replace("Пос. ", "пос. ")
+        .replace("Ул. ", "ул. ")
+        .replace("Пер. ", "пер. ")
+        .replace("Пр-Т ", "пр-т ")
+        .replace("Кв. ", "кв. ")
+        .replace(" Область", " область")
+        .replace(" Район", " район")
+    )
+
+
+def _split_address(address: str | None) -> dict[str, str | None]:
+    parts = [
+        _normalize_address_token(part)
+        for part in str(address or "").split(",")
+        if str(part).strip()
+    ]
+    city: str | None = None
+    street_parts: list[str] = []
+    extra: list[str] = []
+    for part in parts:
+        low = part.lower()
+        if "беларус" in low:
+            continue
+        if city is None and low.startswith(LOCALITY_PREFIXES):
+            city = part
+            continue
+        if low.startswith(("ул.", "пер.", "пр-т", "д.", "кв.")):
+            street_parts.append(part)
+        else:
+            extra.append(part)
+    street_line = ", ".join(street_parts) if street_parts else ", ".join(extra)
+    return {"city": city, "street_line": street_line or None}
+
+
+def _postal_lookup_meta(case: dict) -> dict[str, str | None]:
+    payload = _parse_case_raw(case)
+    lookup = payload.get("postal_lookup") or {}
+    postcode = str(lookup.get("postcode") or case.get("borrower_zip") or "").strip() or None
+    match_address = str(lookup.get("match_address") or "").strip()
+    region = None
+    locality = None
+    if match_address:
+        parts = [part.strip() for part in match_address.split(",") if part.strip()]
+        if parts and re.fullmatch(r"\d{6}", parts[0]):
+            parts = parts[1:]
+        if parts:
+            region = _normalize_address_token(parts[0])
+        if len(parts) >= 2:
+            locality = _normalize_address_token(parts[1])
+    return {"postcode": postcode, "region": region, "locality": locality}
+
+
+def _postal_address_lines(case: dict) -> list[str]:
+    address_parts = _split_address(case.get("borrower_address"))
+    lookup = _postal_lookup_meta(case)
+    lines = [case.get("full_name") or "Получатель не указан"]
+    if address_parts.get("street_line"):
+        lines.append(str(address_parts["street_line"]))
+    if address_parts.get("city") or lookup.get("locality"):
+        lines.append(str(address_parts.get("city") or lookup.get("locality")))
+    zip_region = ", ".join(part for part in [lookup.get("postcode"), lookup.get("region")] if part)
+    if zip_region:
+        lines.append(zip_region)
+    if case.get("borrower_phone"):
+        lines.append(f"Тел: {case['borrower_phone']}")
+    return lines
+
+
+def _debtor_header_lines(case: dict) -> list[str]:
+    address_parts = _split_address(case.get("borrower_address"))
+    lines = [case.get("full_name") or "—"]
+    compact_address = ", ".join(part for part in [address_parts.get("city"), address_parts.get("street_line")] if part)
+    if compact_address:
+        lines.append(compact_address)
+    if case.get("borrower_phone"):
+        lines.append(f"Тел: {case['borrower_phone']}")
+    if case.get("borrower_email"):
+        lines.append(f"Email: {case['borrower_email']}")
+    return lines
+
+
 def _build_contacts_block(name: str | None, address: str | None, phone: str | None, email: str | None) -> list[str]:
     lines = [name or "—"]
     if address:
@@ -157,7 +283,7 @@ def collect_sms_missing_fields(case: dict, creditor: dict | None) -> list[str]:
 def collect_claim_missing_fields(case: dict, creditor: dict | None, signature: dict | None) -> list[str]:
     missing = collect_sms_missing_fields(case, creditor)
     if not creditor or not creditor.get("full_name"):
-        missing.append("ФИО / название кредитора")
+        missing.append("ФИО кредитора")
     if not case.get("document_id"):
         missing.append("ИН заемщика")
     if not case.get("borrower_address"):
@@ -192,49 +318,34 @@ def build_sms_text(case: dict, creditor: dict) -> str:
 
 
 def build_postal_address_text(case: dict) -> str:
-    recipient = case.get("full_name") or "Получатель не указан"
-    address_line = _address_line(case.get("borrower_zip"), case.get("borrower_address"))
-    details: list[str] = [recipient]
-    if case.get("document_id"):
-        details.append(f"ИН: {case['document_id']}")
-    details.append(address_line)
-    return "📮 <b>Адрес для отправки через Белпочту</b>\n\n<pre>" + "\n".join(details) + "</pre>"
+    return "📮 <b>Адрес для отправки через Белпочту</b>\n\n<pre>" + "\n".join(_postal_address_lines(case)) + "</pre>"
 
 
 def build_claim_text(case: dict, creditor: dict) -> str:
-    service_url = _service_url(case)
-    debtor_line = _join_non_empty([
-        case.get("full_name"),
-        f"ИН {case.get('document_id')}" if case.get("document_id") else None,
-        case.get("borrower_address"),
-    ])
+    service_name = _sms_service(case)
     debt_calc = (
-        f"Основной долг: {_money(case.get('principal_outstanding'))}\n"
-        f"Проценты: {_money(case.get('accrued_percent'))}\n"
-        f"Пеня: {_money(case.get('fine_outstanding'))}\n"
-        f"Итого к оплате: {_money(case.get('total_due'))} на дату отправки документа."
+        f"Сумма займа: {_money(case.get('amount'))} | "
+        f"Проценты: {_money(case.get('accrued_percent'))} | "
+        f"Пени за просрочку: {_money(case.get('fine_outstanding'))}\n"
+        f"ИТОГО к оплате: {_money(case.get('total_due'))} на дату отправки данного предложения."
     )
     sections = [
-        "ПРЕДЛОЖЕНИЕ\nо добровольном урегулировании задолженности",
         (
-            f"Я, {creditor.get('full_name')}, направляю настоящее письмо-предложение в адрес {debtor_line or 'заемщика'} "
-            f"по договору займа {_loan_ref(case)} "
-            f"от {_date(case.get('issued_at'))} через сервис онлайн-заимствования {service_url}, "
+            f"Направляю настоящее письмо-предложение по договору займа {_loan_ref(case)} "
+            f"от {_date(case.get('issued_at'))} через сервис {service_name}, "
             "с целью урегулирования задолженности в добровольном досудебном порядке."
         ),
+        (
+            "Убедительно прошу Вас погасить задолженность в полном объеме в кратчайший срок. "
+            "Это позволит избежать судебного разбирательства и дополнительных расходов."
+        ),
+        (
+            "При обращении в суд сумма требований увеличится за счет дальнейшего начисления процентов, "
+            "пени, государственной пошлины и иных расходов. После вынесения решения задолженность может "
+            "взыскиваться принудительно, включая арест имущества и другие меры исполнения."
+        ),
+        "Готов урегулировать вопрос добровольно без обращения в суд.",
         debt_calc,
-        (
-            f"Убедительно прошу Вас погасить задолженность в полном объеме в течение "
-            f"{_voluntary_term(case)} дней с даты получения настоящего документа."
-        ),
-        (
-            "Обращаю Ваше внимание на то, что при передаче дела в суд размер требований "
-            "будет увеличен за счет дальнейшего начисления процентов, пени и судебных расходов."
-        ),
-        (
-            f"Для связи и добровольного урегулирования: {creditor.get('full_name')}, "
-            f"{creditor.get('phone') or '—'}, {creditor.get('email') or '—'}."
-        ),
     ]
     return "\n\n".join(part for part in sections if part).strip()
 
@@ -242,29 +353,36 @@ def build_claim_text(case: dict, creditor: dict) -> str:
 def _set_default_style(doc: Document) -> None:
     style = doc.styles["Normal"]
     style.font.name = "Times New Roman"
-    style.font.size = Pt(12)
+    style.font.size = Pt(10)
+    section = doc.sections[0]
+    section.top_margin = Mm(8)
+    section.bottom_margin = Mm(8)
+    section.left_margin = Mm(10)
+    section.right_margin = Mm(10)
 
 
 def _add_block(doc: Document, title: str, lines: list[str]) -> None:
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    p.paragraph_format.space_after = Pt(1)
     run = p.add_run(title)
     run.bold = True
-    run.font.size = Pt(13)
+    run.font.size = Pt(10.5)
     for line in lines:
         p = doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        p.paragraph_format.space_after = Pt(0)
         run = p.add_run(line)
-        run.font.size = Pt(12)
+        run.font.size = Pt(10)
 
 
 def _add_body_paragraph(doc: Document, text: str) -> None:
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-    p.paragraph_format.first_line_indent = Mm(10)
-    p.paragraph_format.space_after = Pt(8)
+    p.paragraph_format.first_line_indent = Mm(4)
+    p.paragraph_format.space_after = Pt(2)
     run = p.add_run(text)
-    run.font.size = Pt(12)
+    run.font.size = Pt(10)
 
 
 def render_claim_docx(case: dict, creditor: dict, signature_path: str) -> tuple[Path, str]:
@@ -277,12 +395,7 @@ def render_claim_docx(case: dict, creditor: dict, signature_path: str) -> tuple[
     doc = Document()
     _set_default_style(doc)
 
-    debtor_lines = _build_contacts_block(
-        case.get("full_name"),
-        _address_line(case.get("borrower_zip"), case.get("borrower_address")),
-        case.get("borrower_phone"),
-        case.get("borrower_email"),
-    )
+    debtor_lines = _debtor_header_lines(case)
     creditor_lines = _build_contacts_block(
         creditor.get("full_name"),
         creditor.get("address"),
@@ -291,45 +404,39 @@ def render_claim_docx(case: dict, creditor: dict, signature_path: str) -> tuple[
     )
 
     _add_block(doc, "Кому:", debtor_lines)
-    doc.add_paragraph()
+    doc.add_paragraph().paragraph_format.space_after = Pt(1)
     _add_block(doc, "От:", creditor_lines)
-    doc.add_paragraph()
+    doc.add_paragraph().paragraph_format.space_after = Pt(2)
 
     title = doc.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    title.paragraph_format.space_after = Pt(1)
     run = title.add_run("ПРЕДЛОЖЕНИЕ")
     run.bold = True
-    run.font.size = Pt(14)
+    run.font.size = Pt(11.5)
 
     subtitle = doc.add_paragraph()
     subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    subtitle.paragraph_format.space_after = Pt(4)
     run = subtitle.add_run("о добровольном урегулировании задолженности")
     run.bold = True
-    run.font.size = Pt(12)
+    run.font.size = Pt(10)
 
     for paragraph in build_claim_text(case, creditor).split("\n\n"):
         _add_body_paragraph(doc, paragraph)
 
-    totals = doc.add_table(rows=2, cols=2)
-    totals.alignment = WD_TABLE_ALIGNMENT.CENTER
-    totals.cell(0, 0).text = "Структура долга"
-    totals.cell(0, 1).text = (
-        f"Сумма займа: {_money(case.get('amount'))}\n"
-        f"Проценты: {_money(case.get('accrued_percent'))}\n"
-        f"Пени: {_money(case.get('fine_outstanding'))}"
-    )
-    totals.cell(1, 0).text = "Итого к оплате"
-    totals.cell(1, 1).text = _money(case.get("total_due"))
-
-    doc.add_paragraph()
-    footer = doc.add_table(rows=1, cols=3)
+    doc.add_paragraph().paragraph_format.space_after = Pt(2)
+    footer = doc.add_table(rows=1, cols=2)
     footer.alignment = WD_TABLE_ALIGNMENT.CENTER
     footer.cell(0, 0).text = datetime.now().strftime("%d.%m.%Y")
-    sign_par = footer.cell(0, 1).paragraphs[0]
+    sign_cell = footer.cell(0, 1)
+    sign_par = sign_cell.paragraphs[0]
     sign_par.alignment = WD_ALIGN_PARAGRAPH.CENTER
     sign_run = sign_par.add_run()
-    sign_run.add_picture(str(signature_path), width=Mm(35))
-    footer.cell(0, 2).text = creditor.get("full_name") or ""
+    sign_run.add_picture(str(signature_path), width=Mm(25))
+    sign_name = sign_cell.add_paragraph()
+    sign_name.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    sign_name.add_run(creditor.get("full_name") or "").font.size = Pt(10)
 
     doc.save(out_path)
     claim_text = build_claim_text(case, creditor)

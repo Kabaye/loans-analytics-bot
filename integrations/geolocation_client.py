@@ -51,10 +51,23 @@ def _candidate_score(query: str, candidate: dict) -> float:
     candidate_houses = set(_HOUSE_RE.findall(label_norm))
     if query_houses and candidate_houses and query_houses & candidate_houses:
         score += 0.25
-    for key in ("city", "street"):
-        query_value = _normalize_compare_text(str(candidate.get(key) or ""))
-        if query_value and query_value in query_norm:
-            score += 0.15
+    city_value = _normalize_compare_text(str(candidate.get("city") or ""))
+    if city_value:
+        score += 0.2 if city_value in query_norm else -0.1
+    street_value = _normalize_compare_text(" ".join(
+        part for part in (str(candidate.get("street_type") or "").strip(), str(candidate.get("street") or "").strip())
+        if part
+    ))
+    if street_value:
+        if street_value in query_norm:
+            score += 0.45
+        else:
+            street_tokens = [token for token in street_value.split() if len(token) > 2]
+            overlap = sum(1 for token in street_tokens if token in query_norm)
+            if overlap:
+                score += min(0.25, overlap * 0.12)
+            else:
+                score -= 0.45
     return score
 
 

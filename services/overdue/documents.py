@@ -7,7 +7,7 @@ import logging
 import re
 
 from docx import Document
-from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Mm, Pt
 
@@ -426,17 +426,30 @@ def render_claim_docx(case: dict, creditor: dict, signature_path: str) -> tuple[
         _add_body_paragraph(doc, paragraph)
 
     doc.add_paragraph().paragraph_format.space_after = Pt(2)
-    footer = doc.add_table(rows=1, cols=2)
+    footer = doc.add_table(rows=1, cols=3)
     footer.alignment = WD_TABLE_ALIGNMENT.CENTER
-    footer.cell(0, 0).text = datetime.now().strftime("%d.%m.%Y")
-    sign_cell = footer.cell(0, 1)
+    footer.autofit = False
+    left_cell, sign_cell, right_cell = footer.rows[0].cells
+    left_cell.width = Mm(30)
+    sign_cell.width = Mm(130)
+    right_cell.width = Mm(30)
+    for cell in (left_cell, sign_cell, right_cell):
+        cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+
+    left_par = left_cell.paragraphs[0]
+    left_par.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    left_run = left_par.add_run(datetime.now().strftime("%d.%m.%Y"))
+    left_run.font.size = Pt(10)
+
     sign_par = sign_cell.paragraphs[0]
     sign_par.alignment = WD_ALIGN_PARAGRAPH.CENTER
     sign_run = sign_par.add_run()
     sign_run.add_picture(str(signature_path), width=Mm(25))
-    sign_name = sign_cell.add_paragraph()
-    sign_name.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    sign_name.add_run(creditor.get("full_name") or "").font.size = Pt(10)
+
+    right_par = right_cell.paragraphs[0]
+    right_par.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    right_run = right_par.add_run(creditor.get("full_name") or "")
+    right_run.font.size = Pt(10)
 
     doc.save(out_path)
     claim_text = build_claim_text(case, creditor)

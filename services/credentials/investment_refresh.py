@@ -14,6 +14,8 @@ from bot.integrations.telegram_admin import send_admin_html_message
 from bot.repositories.borrowers import (
     get_borrowers_count,
     list_borrower_name_map,
+    lookup_borrower,
+    lookup_borrower_contacts,
     upsert_borrower,
     upsert_borrower_contacts,
     upsert_borrower_from_investment,
@@ -53,6 +55,57 @@ def _extract_document_id_from_pdf(pdf_bytes: bytes) -> str | None:
     return None
 
 
+async def _enrich_finkit_borrower_from_detail(
+    session,
+    headers: dict[str, str],
+    *,
+    user_tag: str,
+    borrower_name: str,
+    investment_id: str,
+    borrower_user_id: str | None = None,
+) -> tuple[str | None, bool, bool]:
+    detail_url = f"https://api-p2p.finkit.by/user/investments/{investment_id}/"
+    async with session.get(detail_url, headers=headers) as resp:
+        if resp.status != 200:
+            return borrower_user_id, False, False
+        detail = await resp.json()
+
+    resolved_borrower_user_id = str(detail.get("user") or detail.get("loan") or borrower_user_id or investment_id)
+    existing = await lookup_borrower("finkit", resolved_borrower_user_id)
+    document_id = existing.get("document_id") if existing else None
+    document_enriched = False
+
+    if not document_id:
+        pdf_url = detail.get("latest_contract_url")
+        if pdf_url:
+            async with session.get(pdf_url) as pdf_resp:
+                if pdf_resp.status == 200:
+                    document_id = _extract_document_id_from_pdf(await pdf_resp.read())
+        if document_id:
+            await upsert_borrower(
+                service="finkit",
+                borrower_user_id=resolved_borrower_user_id,
+                full_name=borrower_name,
+                document_id=document_id,
+                source=f"finkit_archive_{user_tag}",
+            )
+            log.info("Finkit midnight PDF: %s → ИН %s", borrower_name, document_id)
+            document_enriched = True
+
+    contacts_updated = False
+    if document_id and (detail.get("borrower_phone_number") or detail.get("borrower_email")):
+        await upsert_borrower_contacts(
+            document_id,
+            full_name=borrower_name,
+            borrower_phone=detail.get("borrower_phone_number"),
+            borrower_email=detail.get("borrower_email"),
+            source=f"finkit_investment_detail_{user_tag}",
+        )
+        contacts_updated = True
+
+    return resolved_borrower_user_id, document_enriched, contacts_updated
+
+
 async def refresh_investments(bot) -> None:
     global _last_investment_refresh
 
@@ -78,6 +131,7 @@ async def refresh_investments(bot) -> None:
     try:
         creds = await list_service_credentials("finkit")
         for cred in creds:
+            parser = None
             try:
                 user_tag = telegram_user_tag(cred)
                 parser = await ensure_finkit_parser(cred)
@@ -94,10 +148,15 @@ async def refresh_investments(bot) -> None:
                     url = f"https://api-p2p.finkit.by/user/investments/?page={page}"
                     async with session.get(url, headers=headers) as resp:
                         if resp.status in (401, 403) and not relogged:
-                            parser = await ensure_finkit_parser(cred, force_login=True)
-                            if parser is None:
+                            new_parser = await ensure_finkit_parser(cred, force_login=True)
+                            if new_parser is None:
                                 errors.append(f"Finkit re-login failed: {cred.login}")
                                 break
+                            try:
+                                await parser.close()
+                            except Exception:
+                                pass
+                            parser = new_parser
                             session = await parser._get_session()
                             headers = _cookie_headers(parser)
                             relogged = True
@@ -151,43 +210,36 @@ async def refresh_investments(bot) -> None:
 
                 name_to_borrower_id = await list_borrower_name_map("finkit")
                 pdf_enriched = 0
+                contacts_enriched = 0
                 for borrower_name, stats in name_stats.items():
                     borrower_user_id = name_to_borrower_id.get(borrower_name)
-                    if not borrower_user_id and name_to_inv_ids.get(borrower_name):
+                    if name_to_inv_ids.get(borrower_name):
                         investment_id = name_to_inv_ids[borrower_name][0]
-                        detail_url = f"https://api-p2p.finkit.by/user/investments/{investment_id}/"
+                        enrichment_needed = not borrower_user_id
+                        if borrower_user_id and not enrichment_needed:
+                            existing = await lookup_borrower("finkit", borrower_user_id)
+                            document_id = existing.get("document_id") if existing else None
+                            enrichment_needed = not document_id
+                            if document_id and not enrichment_needed:
+                                enrichment_needed = await lookup_borrower_contacts(document_id) is None
+
                         try:
-                            async with session.get(detail_url, headers=headers) as resp:
-                                if resp.status == 200:
-                                    detail = await resp.json()
-                                    borrower_user_id = str(detail.get("user") or detail.get("loan") or investment_id)
-                                    pdf_url = detail.get("latest_contract_url")
-                                    document_id = None
-                                    if pdf_url:
-                                        try:
-                                            async with session.get(pdf_url) as pdf_resp:
-                                                if pdf_resp.status == 200:
-                                                    document_id = _extract_document_id_from_pdf(await pdf_resp.read())
-                                                    if document_id:
-                                                        await upsert_borrower(
-                                                            service="finkit",
-                                                            borrower_user_id=borrower_user_id,
-                                                            full_name=borrower_name,
-                                                            document_id=document_id,
-                                                            source=f"finkit_archive_{user_tag}",
-                                                        )
-                                                        pdf_enriched += 1
-                                                        log.info("Finkit midnight PDF: %s → ИН %s", borrower_name, document_id)
-                                        except Exception as exc:
-                                            log.debug("Finkit midnight PDF error for %s: %s", borrower_name, exc)
-                                    if document_id and (detail.get("borrower_phone_number") or detail.get("borrower_email")):
-                                        await upsert_borrower_contacts(
-                                            document_id,
-                                            full_name=borrower_name,
-                                            borrower_phone=detail.get("borrower_phone_number"),
-                                            borrower_email=detail.get("borrower_email"),
-                                            source=f"finkit_investment_detail_{user_tag}",
-                                        )
+                            if enrichment_needed:
+                                previous_user_id = borrower_user_id
+                                borrower_user_id, document_enriched, contacts_updated = await _enrich_finkit_borrower_from_detail(
+                                    session,
+                                    headers,
+                                    user_tag=user_tag,
+                                    borrower_name=borrower_name,
+                                    investment_id=investment_id,
+                                    borrower_user_id=borrower_user_id,
+                                )
+                                if borrower_user_id and borrower_user_id != previous_user_id:
+                                    name_to_borrower_id[borrower_name] = borrower_user_id
+                                if document_enriched:
+                                    pdf_enriched += 1
+                                if contacts_updated:
+                                    contacts_enriched += 1
                             await asyncio.sleep(0.2)
                         except Exception as exc:
                             log.warning("Finkit detail fetch error for %s: %s", borrower_name, exc)
@@ -209,14 +261,23 @@ async def refresh_investments(bot) -> None:
 
                 if pdf_enriched:
                     log.info("Finkit midnight: enriched %d new borrowers with ИН from PDF", pdf_enriched)
+                if contacts_enriched:
+                    log.info("Finkit midnight: enriched %d borrowers with contacts from detail", contacts_enriched)
             except Exception as exc:
                 errors.append(f"Finkit {cred.login}: {exc}")
+            finally:
+                if parser is not None:
+                    try:
+                        await parser.close()
+                    except Exception:
+                        pass
     except Exception as exc:
         errors.append(f"Finkit global: {exc}")
 
     try:
         creds = await list_service_credentials("zaimis")
         for cred in creds:
+            parser = None
             try:
                 user_tag = telegram_user_tag(cred)
                 parser = await ensure_zaimis_parser(cred)
@@ -226,10 +287,15 @@ async def refresh_investments(bot) -> None:
 
                 orders = await parser.fetch_investments()
                 if parser.needs_reauth:
-                    parser = await ensure_zaimis_parser(cred, force_login=True)
-                    if parser is None:
+                    new_parser = await ensure_zaimis_parser(cred, force_login=True)
+                    if new_parser is None:
                         errors.append(f"Zaimis re-login failed: {cred.login}")
                         continue
+                    try:
+                        await parser.close()
+                    except Exception:
+                        pass
+                    parser = new_parser
                     orders = await parser.fetch_investments()
 
                 zaimis_stats: dict[str, dict] = {}
@@ -304,6 +370,12 @@ async def refresh_investments(bot) -> None:
                     errors.append(f"Zaimis PDF enrichment: {exc}")
             except Exception as exc:
                 errors.append(f"Zaimis {cred.login}: {exc}")
+            finally:
+                if parser is not None:
+                    try:
+                        await parser.close()
+                    except Exception:
+                        pass
     except Exception as exc:
         errors.append(f"Zaimis global: {exc}")
 

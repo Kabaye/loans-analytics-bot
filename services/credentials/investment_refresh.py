@@ -15,6 +15,7 @@ from bot.repositories.borrowers import (
     get_borrowers_count,
     list_borrower_name_map,
     upsert_borrower,
+    upsert_borrower_contacts,
     upsert_borrower_from_investment,
 )
 from bot.services.borrowers.enrichment import list_borrower_ids_with_documents
@@ -159,8 +160,9 @@ async def refresh_investments(bot) -> None:
                             async with session.get(detail_url, headers=headers) as resp:
                                 if resp.status == 200:
                                     detail = await resp.json()
-                                    borrower_user_id = str(detail.get("loan", investment_id))
+                                    borrower_user_id = str(detail.get("user") or detail.get("loan") or investment_id)
                                     pdf_url = detail.get("latest_contract_url")
+                                    document_id = None
                                     if pdf_url:
                                         try:
                                             async with session.get(pdf_url) as pdf_resp:
@@ -178,6 +180,14 @@ async def refresh_investments(bot) -> None:
                                                         log.info("Finkit midnight PDF: %s → ИН %s", borrower_name, document_id)
                                         except Exception as exc:
                                             log.debug("Finkit midnight PDF error for %s: %s", borrower_name, exc)
+                                    if document_id and (detail.get("borrower_phone_number") or detail.get("borrower_email")):
+                                        await upsert_borrower_contacts(
+                                            document_id,
+                                            full_name=borrower_name,
+                                            borrower_phone=detail.get("borrower_phone_number"),
+                                            borrower_email=detail.get("borrower_email"),
+                                            source=f"finkit_investment_detail_{user_tag}",
+                                        )
                             await asyncio.sleep(0.2)
                         except Exception as exc:
                             log.warning("Finkit detail fetch error for %s: %s", borrower_name, exc)

@@ -82,16 +82,8 @@ def _result_card_kb(doc_id: str) -> InlineKeyboardMarkup:
 
 
 async def _batch_result_kb(doc_ids: list[str]) -> InlineKeyboardMarkup:
-    buttons: list[list[InlineKeyboardButton]] = []
-    for idx, doc_id in enumerate(doc_ids, start=1):
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"📇 {idx}. Телефон / email",
-                callback_data=f"bi_contacts:{doc_id}",
-            )
-        ])
-    buttons.extend(_search_nav_kb(include_add=False).inline_keyboard)
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    del doc_ids
+    return _search_nav_kb(include_add=False)
 
 
 # --- Search ---

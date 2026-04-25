@@ -102,6 +102,7 @@ async def run_opi_batch(doc_ids: list[str]) -> str:
     try:
         for idx, doc_id in enumerate(doc_ids, start=1):
             info = await lookup_borrower_info(doc_id)
+            contacts = await lookup_borrower_contact_info(doc_id)
             result = await checker.check(doc_id)
 
             lines.append(f"{idx}. <code>{doc_id}</code>")
@@ -116,6 +117,14 @@ async def run_opi_batch(doc_ids: list[str]) -> str:
                 lines.append(f"❌ ОПИ: долг {result.debt_amount:.2f} BYN")
             else:
                 lines.append("✅ ОПИ: нет задолженности")
+            if contacts:
+                if contacts.get("phone"):
+                    lines.append(f"📞 Телефон: <code>{contacts['phone']}</code>")
+                if contacts.get("email"):
+                    lines.append(f"✉️ Email: <code>{contacts['email']}</code>")
+                source_label = humanize_borrower_source(contacts.get("source"))
+                if source_label:
+                    lines.append(f"ℹ️ Контакты: {source_label}")
             lines.append("")
     finally:
         await checker.close()

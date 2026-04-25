@@ -49,6 +49,19 @@ def _claim_sort_key(claim: dict) -> tuple[str, str, str]:
     )
 
 
+def _today_claim(claims: list[dict] | None) -> dict | None:
+    today = datetime.now().date().isoformat()
+    rows = [
+        claim
+        for claim in (claims or [])
+        if isinstance(claim, dict) and str(claim.get("claim_date") or "")[:10] == today
+    ]
+    if not rows:
+        return None
+    rows.sort(key=_claim_sort_key, reverse=True)
+    return rows[0]
+
+
 def get_latest_finkit_claim(case: dict) -> dict | None:
     payload = _parse_case_payload(case)
     detail = payload.get("detail") or {}
@@ -176,8 +189,9 @@ async def refresh_finkit_case_for_claim(case: dict, *, create_pretrial_claim: bo
     try:
         payload = _parse_case_payload(case)
         detail = await parser.fetch_investment_detail(str(case.get("external_id") or "")) or payload.get("detail") or {}
+        today_claim = _today_claim(detail.get("claims") or payload.get("claims") or [])
 
-        if create_pretrial_claim and detail.get("can_generate_claim") is not False:
+        if create_pretrial_claim and not today_claim and detail.get("can_generate_claim") is not False:
             claims = await parser.create_pretrial_claims(str(case.get("external_id") or ""))
             refreshed_detail = await parser.fetch_investment_detail(str(case.get("external_id") or ""))
             if refreshed_detail:

@@ -4,8 +4,6 @@ import json
 import logging
 from pathlib import Path
 from html import escape
-from urllib.parse import quote
-
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -189,15 +187,8 @@ def _parse_raw(case: dict) -> dict:
 
 
 def _sms_result_kb(case: dict, sms_text: str) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    phone = (case.get("borrower_phone") or "").strip()
-    if phone:
-        sms_url = f"sms:{phone}?body={quote(sms_text)}"
-        rows.append([
-            InlineKeyboardButton(text="📲 Открыть SMS", url=sms_url),
-        ])
-    rows.extend(_case_actions_kb(case["id"], int(case["credential_id"]) if case.get("credential_id") else None).inline_keyboard)
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    del sms_text
+    return _case_actions_kb(case["id"], int(case["credential_id"]) if case.get("credential_id") else None)
 
 
 def _claim_result_kb(case: dict, latest_claim: dict | None) -> InlineKeyboardMarkup:

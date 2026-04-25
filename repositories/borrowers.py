@@ -53,7 +53,7 @@ async def lookup_borrower(service: str, borrower_user_id: str) -> dict | None:
                    b.total_loans, b.settled_loans, b.overdue_loans,
                    b.avg_rating, b.total_invested,
                    bi.loan_status, bi.sum_category, bi.rating AS bi_rating,
-                   bi.notes, bi.last_loan_date, bi.loan_count,
+                   bi.notes, bi.last_loan_date, bi.loan_count, bi.source AS info_source,
                    bi.opi_has_debt, bi.opi_debt_amount, bi.opi_checked_at, bi.opi_full_name
             FROM borrowers b
             LEFT JOIN borrower_info bi ON b.document_id = bi.document_id

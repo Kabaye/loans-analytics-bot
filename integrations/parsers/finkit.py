@@ -140,6 +140,16 @@ class FinkitParser(BaseParser):
             "Cookie": cookie_str,
         }
 
+    def _api_post_headers(self) -> dict[str, str]:
+        csrf_token = self._session_cookies.get("csrftoken") or self._csrf_token or ""
+        return {
+            **self._api_headers(),
+            "Content-Type": "application/json",
+            "Origin": "https://finkit.by",
+            "Referer": "https://finkit.by/",
+            "x-csrftoken": csrf_token,
+        }
+
     async def fetch_investments(self, page: int = 1) -> list[dict]:
         if not self._authenticated:
             log.error("Finkit: not logged in, cannot fetch investments")
@@ -221,14 +231,7 @@ class FinkitParser(BaseParser):
             return []
 
         session = await self._get_session()
-        csrf_token = self._session_cookies.get("csrftoken") or self._csrf_token or ""
-        headers = {
-            **self._api_headers(),
-            "Content-Type": "application/json",
-            "Origin": "https://finkit.by",
-            "Referer": "https://finkit.by/",
-            "x-csrftoken": csrf_token,
-        }
+        headers = self._api_post_headers() if create_if_missing else self._api_headers()
         method = session.post if create_if_missing else session.get
         kwargs = {"json": {}} if create_if_missing else {}
 
@@ -251,6 +254,57 @@ class FinkitParser(BaseParser):
         except Exception as e:
             log.warning("Finkit claims request error %s: %s", investment_id, e)
             return []
+
+    async def create_pretrial_claims(self, investment_id: str) -> list[dict]:
+        return await self.fetch_claims(investment_id, create_if_missing=True)
+
+    async def send_pretrial_claim(self, claim_id: str) -> dict | None:
+        if not self._authenticated or not claim_id:
+            return None
+        session = await self._get_session()
+        try:
+            async with session.post(
+                f"https://api-p2p.finkit.by/user/claims/{claim_id}/send/",
+                json={},
+                headers=self._api_post_headers(),
+            ) as resp:
+                if resp.status in (401, 403):
+                    self._authenticated = False
+                    self._needs_reauth = True
+                    return None
+                if resp.status not in (200, 201):
+                    body = await resp.text()
+                    log.warning("Finkit send claim failed %s: %s %s", claim_id, resp.status, body[:300])
+                    return None
+                data = await resp.json()
+                return data if isinstance(data, dict) else {"result": data}
+        except Exception as e:
+            log.warning("Finkit send claim error %s: %s", claim_id, e)
+            return None
+
+    async def resolve_pretrial_claim(self, claim_id: str) -> dict | None:
+        if not self._authenticated or not claim_id:
+            return None
+        session = await self._get_session()
+        try:
+            async with session.post(
+                f"https://api-p2p.finkit.by/user/claims/{claim_id}/resolve/",
+                json={},
+                headers=self._api_post_headers(),
+            ) as resp:
+                if resp.status in (401, 403):
+                    self._authenticated = False
+                    self._needs_reauth = True
+                    return None
+                if resp.status not in (200, 201):
+                    body = await resp.text()
+                    log.warning("Finkit resolve claim failed %s: %s %s", claim_id, resp.status, body[:300])
+                    return None
+                data = await resp.json()
+                return data if isinstance(data, dict) else {"result": data}
+        except Exception as e:
+            log.warning("Finkit resolve claim error %s: %s", claim_id, e)
+            return None
 
     @staticmethod
     def parse_borrower_from_contract_pdf(pdf_bytes: bytes) -> tuple[str | None, str | None]:

@@ -31,6 +31,8 @@ def _apply_cached_borrower(entry: BorrowEntry, cached: dict) -> None:
         entry.bi_sum_category = cached["sum_category"]
     if cached.get("bi_rating") is not None:
         entry.bi_rating = cached["bi_rating"]
+    if cached.get("info_source") or cached.get("source"):
+        entry.enrichment_source = cached.get("info_source") or cached.get("source")
 
 
 async def enrich_entry_from_borrowers(entry: BorrowEntry) -> bool:

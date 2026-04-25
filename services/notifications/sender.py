@@ -13,6 +13,7 @@ from bot.repositories.subscriptions import (
     list_active_subscriptions_for_service,
 )
 from bot.services.borrowers.enrichment import enrich_entry_from_borrowers
+from bot.services.borrowers.source_labels import humanize_borrower_source
 
 log = logging.getLogger(__name__)
 
@@ -296,7 +297,8 @@ def _format_enrichment_section(entry: BorrowEntry) -> list[str]:
     if not has_enrichment:
         return []
 
-    lines.append("\n<i>Инфа из займов:</i>")
+    source_label = humanize_borrower_source(entry.enrichment_source) or SERVICE_NAMES.get(entry.service, entry.service)
+    lines.append(f"\n<i>Инфа из займов ({source_label}):</i>")
     if enriched_name:
         lines.append(f"<b>{enriched_name}</b>")
     if enriched_doc_id:
@@ -305,7 +307,6 @@ def _format_enrichment_section(entry: BorrowEntry) -> list[str]:
         lines.append(enriched_opi)
 
     if enriched_history:
-        lines.append("История займов:")
         total = entry.kb_total_loans or 0
         settled = entry.kb_settled or 0
         overdue = entry.kb_overdue or 0

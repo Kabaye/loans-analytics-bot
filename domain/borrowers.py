@@ -64,6 +64,7 @@ class BorrowEntry:
     bi_loan_status: Optional[str] = None
     bi_sum_category: Optional[str] = None
     bi_rating: Optional[float] = None
+    enrichment_source: Optional[str] = None
 
     loan_url: Optional[str] = None
     raw_data: Optional[dict] = field(default=None, repr=False)
@@ -112,6 +113,7 @@ class BorrowEntry:
             "kb_avg_rating": self.kb_avg_rating,
             "kb_last_rating": self.kb_last_rating,
             "kb_total_invested": self.kb_total_invested,
+            "enrichment_source": self.enrichment_source,
             "loan_url": self.loan_url,
         }
         if self.raw_data:

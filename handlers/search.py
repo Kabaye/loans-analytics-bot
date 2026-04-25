@@ -16,8 +16,10 @@ from aiogram.types import (
 from bot.services.search.service import (
     add_borrower_and_refresh_opi,
     extract_document_ids,
+    format_contact_card,
     force_refresh_opi_card,
     format_borrower_card,
+    lookup_borrower_contact_info,
     lookup_borrower_info,
     run_opi_batch,
     search_borrower_info,
@@ -72,10 +74,25 @@ def _search_nav_kb(include_add: bool = True) -> InlineKeyboardMarkup:
 def _result_card_kb(doc_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Проверить ОПИ", callback_data=f"opi_check:{doc_id}")],
+        [InlineKeyboardButton(text="📇 Телефон / email", callback_data=f"bi_contacts:{doc_id}")],
         [InlineKeyboardButton(text="📚 Поиск по базе", callback_data="search_db")],
         [InlineKeyboardButton(text="🆔 Поиск по ИН", callback_data="search_opi_batch")],
         [InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")],
     ])
+
+
+async def _batch_result_kb(doc_ids: list[str]) -> InlineKeyboardMarkup:
+    buttons: list[list[InlineKeyboardButton]] = []
+    for idx, doc_id in enumerate(doc_ids, start=1):
+        if await lookup_borrower_contact_info(doc_id):
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"📇 {idx}. Телефон / email",
+                    callback_data=f"bi_contacts:{doc_id}",
+                )
+            ])
+    buttons.extend(_search_nav_kb(include_add=False).inline_keyboard)
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 # --- Search ---
@@ -198,7 +215,7 @@ async def msg_search_batch_ids(message: Message, state: FSMContext):
 
     await message.answer(
         await run_opi_batch(doc_ids),
-        reply_markup=_search_nav_kb(include_add=False),
+        reply_markup=await _batch_result_kb(doc_ids),
         parse_mode="HTML",
     )
 
@@ -241,6 +258,22 @@ async def cb_opi_check(callback: CallbackQuery):
         reply_markup=_result_card_kb(doc_id),
         parse_mode="HTML",
     )
+
+
+@router.callback_query(F.data.startswith("bi_contacts:"))
+async def cb_view_contacts(callback: CallbackQuery):
+    if not await is_allowed(callback.message.chat.id):
+        return
+    doc_id = callback.data.split(":", 1)[1]
+    info = await lookup_borrower_contact_info(doc_id)
+    if not info:
+        await callback.answer("Контакты не найдены", show_alert=True)
+        return
+    await callback.message.answer(
+        format_contact_card(doc_id, info),
+        parse_mode="HTML",
+    )
+    await callback.answer()
 
 
 # --- Add borrower ---

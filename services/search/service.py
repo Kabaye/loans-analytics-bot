@@ -8,6 +8,14 @@ from bot.repositories.borrowers import (
     search_borrower_info,
     upsert_borrower_info,
 )
+from bot.repositories.overdue import lookup_latest_borrower_contacts
+from bot.services.borrowers.source_labels import humanize_borrower_source
+
+SERVICE_NAMES = {
+    "kapusta": "Kapusta",
+    "finkit": "FinKit",
+    "zaimis": "ЗАЙМись",
+}
 
 
 def extract_document_ids(text: str) -> list[str]:
@@ -60,10 +68,32 @@ def format_borrower_card(info: dict) -> str:
     if info.get("notes"):
         lines.append(f"\n📝 {info['notes']}")
 
-    if info.get("source"):
-        lines.append(f"\n<i>Источник: {info['source']}</i>")
+    source_label = humanize_borrower_source(info.get("source"))
+    if source_label:
+        lines.append(f"\n<i>Источник: {source_label}</i>")
 
     return "\n".join(lines)
+
+
+def format_contact_card(document_id: str, payload: dict) -> str:
+    lines = ["📇 <b>Доп. инфа по ИН</b>", ""]
+    lines.append(f"<b>ИН:</b> <code>{document_id}</code>")
+    if payload.get("full_name"):
+        lines.append(payload["full_name"])
+    if payload.get("phone"):
+        lines.append(f"<b>Телефон:</b> <code>{payload['phone']}</code>")
+    if payload.get("email"):
+        lines.append(f"<b>Email:</b> <code>{payload['email']}</code>")
+    if payload.get("service"):
+        lines.append(f"<b>Сервис:</b> {SERVICE_NAMES.get(str(payload['service']), str(payload['service']))}")
+    source_label = humanize_borrower_source(payload.get("source"))
+    if source_label:
+        lines.append(f"<i>Источник: {source_label}</i>")
+    return "\n".join(lines)
+
+
+async def lookup_borrower_contact_info(document_id: str) -> dict | None:
+    return await lookup_latest_borrower_contacts(document_id)
 
 
 async def run_opi_batch(doc_ids: list[str]) -> str:
@@ -127,7 +157,9 @@ __all__ = [
     "add_borrower_and_refresh_opi",
     "extract_document_ids",
     "force_refresh_opi_card",
+    "format_contact_card",
     "format_borrower_card",
+    "lookup_borrower_contact_info",
     "lookup_borrower_info",
     "run_opi_batch",
     "search_borrower_info",

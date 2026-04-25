@@ -4,6 +4,7 @@ import json
 import logging
 from pathlib import Path
 from html import escape
+from urllib.parse import quote
 
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
@@ -33,7 +34,15 @@ from bot.services.overdue.service import (
     upsert_overdue_case,
 )
 from bot.services.base.access import is_allowed
-from bot.services.overdue.cases import enrich_finkit_case_from_claims, resolve_belarus_zip_details
+from bot.services.borrowers.source_labels import humanize_borrower_source
+from bot.services.overdue.cases import (
+    enrich_finkit_case_from_claims,
+    get_latest_finkit_claim,
+    refresh_finkit_case_for_claim,
+    resolve_belarus_zip,
+    resolve_belarus_zip_details,
+    send_finkit_pretrial_claim,
+)
 from bot.services.overdue.documents import (
     build_postal_address_text,
     build_sms_text,
@@ -179,6 +188,37 @@ def _parse_raw(case: dict) -> dict:
         return {}
 
 
+def _sms_result_kb(case: dict, sms_text: str) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    phone = (case.get("borrower_phone") or "").strip()
+    if phone:
+        sms_url = f"sms:{phone}?body={quote(sms_text)}"
+        rows.append([
+            InlineKeyboardButton(text="📲 Открыть SMS", url=sms_url),
+        ])
+    rows.extend(_case_actions_kb(case["id"], int(case["credential_id"]) if case.get("credential_id") else None).inline_keyboard)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _claim_result_kb(case: dict, latest_claim: dict | None) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if (
+        case.get("service") == "finkit"
+        and latest_claim
+        and latest_claim.get("id")
+        and latest_claim.get("can_send")
+        and not latest_claim.get("sent_at")
+    ):
+        rows.append([
+            InlineKeyboardButton(
+                text="📨 Отправить претензию через FinKit",
+                callback_data=f"overdue_claim_send_{case['id']}_{latest_claim['id']}",
+            )
+        ])
+    rows.extend(_case_actions_kb(case["id"], int(case["credential_id"]) if case.get("credential_id") else None).inline_keyboard)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def _postal_lookup_note(case: dict) -> list[str]:
     payload = _parse_raw(case)
     lookup = payload.get("postal_lookup") or {}
@@ -228,6 +268,9 @@ def _case_notes(case: dict) -> list[str]:
     )
     if claim_sent_at:
         notes.append(f"<b>Претензия уже отправлялась:</b> {_display_html(claim_sent_at)}")
+    contact_source = humanize_borrower_source(payload.get("contact_source"))
+    if contact_source:
+        notes.append(f"<b>Контакты подтянуты из:</b> {_display_html(contact_source)}")
 
     return notes
 
@@ -262,7 +305,7 @@ async def _show_credential_profile_message(callback: CallbackQuery, credential_i
         lines.append("Пока не заполнен.")
     else:
         lines.extend([
-            f"<b>ФИО / название:</b> {_display_html(profile.get('full_name'))}",
+            f"<b>ФИО:</b> {_display_html(profile.get('full_name'))}",
             f"<b>Адрес:</b> {_display_html(profile.get('address'))}",
             f"<b>Телефон:</b> {_display_html(profile.get('phone'))}",
             f"<b>Email:</b> {_display_html(profile.get('email'))}",
@@ -353,7 +396,7 @@ def _missing_claim_kb(case: dict, missing: list[str]) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text="🏠 Указать адрес заемщика", callback_data=f"overdue_fill_address_{case['id']}")])
     if "ZIP-код заемщика" in missing_set:
         rows.append([InlineKeyboardButton(text="📮 Указать / найти ZIP", callback_data=f"overdue_fill_zip_{case['id']}")])
-    if {"ФИО / название кредитора", "адрес кредитора", "подпись пользователя"} & missing_set and case.get("credential_id"):
+    if {"ФИО кредитора", "адрес кредитора", "подпись пользователя"} & missing_set and case.get("credential_id"):
         rows.append([InlineKeyboardButton(text="🏦 Настройки займодавца", callback_data=f"cred_creditor_{case['credential_id']}")])
     if "ИН заемщика" in missing_set and case.get("service") == "finkit":
         rows.append([InlineKeyboardButton(text="🔄 Повторно подтянуть данные FinKit", callback_data=f"overdue_claim_retry_{case['id']}")])
@@ -379,7 +422,21 @@ async def _handle_claim_generation(callback: CallbackQuery, case_id: int) -> Non
     if not case:
         await callback.answer("Кейс не найден", show_alert=True)
         return
-    case = await _enrich_finkit_case_from_claims(case)
+    latest_claim: dict | None = None
+    if case.get("service") == "finkit":
+        case, latest_claim = await refresh_finkit_case_for_claim(case, create_pretrial_claim=True)
+        detail = (_parse_raw(case).get("detail") or {})
+        if not latest_claim:
+            reason = detail.get("claim_generation_reason") or "FinKit не дал сформировать актуальную претензию."
+            await callback.message.edit_text(
+                "⚠️ <b>Нельзя сформировать претензию</b>\n\n"
+                f"{escape(str(reason))}",
+                reply_markup=_case_actions_kb(case_id, int(case["credential_id"]) if case.get("credential_id") else None),
+                parse_mode="HTML",
+            )
+            return
+    else:
+        case = await _enrich_finkit_case_from_claims(case)
     if case.get("borrower_address"):
         payload = _parse_raw(case)
         postal_lookup = payload.get("postal_lookup") or {}
@@ -432,6 +489,7 @@ async def _handle_claim_generation(callback: CallbackQuery, case_id: int) -> Non
     await callback.message.answer(
         build_postal_address_text(case),
         parse_mode="HTML",
+        reply_markup=_claim_result_kb(case, latest_claim),
     )
     await _show_case(callback, case_id)
 
@@ -585,7 +643,7 @@ async def cb_overdue_profile_edit(callback: CallbackQuery, state: FSMContext):
         "🏦 <b>Данные займодавца</b>\n\n"
         f"Логин: <b>{escape(_credential_label(credential))}</b>\n\n"
         "Отправьте 4 строки:\n"
-        "1. ФИО / название займодавца\n"
+        "1. ФИО займодавца\n"
         "2. Адрес займодавца\n"
         "3. Телефон (или '-')\n"
         "4. Email (или '-')\n\n"
@@ -901,6 +959,7 @@ async def msg_overdue_case_field(message: Message, state: FSMContext):
             borrower_address=raw_value,
             borrower_zip=zip_code,
             postal_lookup=lookup,
+            contact_source="manual",
         )
         await state.clear()
         if zip_code and lookup:
@@ -1001,6 +1060,7 @@ async def msg_overdue_contacts(message: Message, state: FSMContext):
         borrower_phone=None if phone == "-" else phone,
         borrower_email=None if email == "-" else email,
         voluntary_term_days=voluntary_days,
+        contact_source="manual",
     )
     await state.clear()
     suffix = f" ZIP: {zip_code}." if zip_code else " ZIP не найден автоматически."
@@ -1034,18 +1094,47 @@ async def cb_overdue_sms(callback: CallbackQuery):
         payload=serialize_case_payload(case, None),
     )
     await callback.message.edit_text(
-        f"✉️ <b>SMS</b>\n\n<pre>{escape(sms_text)}</pre>",
-        reply_markup=_case_actions_kb(case_id, int(case["credential_id"]) if case.get("credential_id") else None),
+        f"✉️ <b>SMS</b>\n\n<pre>{escape(sms_text)}</pre>"
+        + (
+            f"\n\n<b>Номер:</b> <code>{escape(str(case['borrower_phone']))}</code>"
+            if case.get("borrower_phone")
+            else ""
+        ),
+        reply_markup=_sms_result_kb(case, sms_text),
         parse_mode="HTML",
     )
 
 
-@router.callback_query(F.data.startswith("overdue_claim_"))
+@router.callback_query(
+    lambda callback: bool(callback.data)
+    and callback.data.startswith("overdue_claim_")
+    and not callback.data.startswith("overdue_claim_send_")
+    and not callback.data.startswith("overdue_claim_retry_")
+)
 async def cb_overdue_claim(callback: CallbackQuery):
     if not await is_allowed(callback.message.chat.id):
         return
     case_id = int(callback.data.replace("overdue_claim_", ""))
     await _handle_claim_generation(callback, case_id)
+
+
+@router.callback_query(F.data.startswith("overdue_claim_send_"))
+async def cb_overdue_claim_send(callback: CallbackQuery):
+    if not await is_allowed(callback.message.chat.id):
+        return
+    payload = callback.data.replace("overdue_claim_send_", "")
+    case_id_raw, claim_id = payload.split("_", 1)
+    case_id = int(case_id_raw)
+    case = await get_overdue_case(case_id, callback.message.chat.id)
+    if not case:
+        await callback.answer("Кейс не найден", show_alert=True)
+        return
+    ok, refreshed = await send_finkit_pretrial_claim(case, claim_id)
+    if not ok:
+        await callback.answer("Не удалось отправить претензию через FinKit", show_alert=True)
+        return
+    await callback.message.answer("✅ Претензия отправлена заемщику через FinKit.")
+    await _show_case(callback, refreshed["id"])
 
 
 @router.callback_query(F.data.startswith("overdue_claim_retry_"))

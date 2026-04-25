@@ -189,6 +189,7 @@ async def sync_finkit_overdue_cases() -> tuple[int, list[str]]:
                         borrower_zip=claim_zip,
                         borrower_phone=claim_phone or detail.get("borrower_phone_number"),
                         borrower_email=claim_email or detail.get("borrower_email"),
+                        contact_source="finkit_claim_pdf" if claim_address or claim_phone or claim_email else "finkit_investment_detail",
                     )
                 synced += 1
                 await asyncio.sleep(0.05)

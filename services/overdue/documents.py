@@ -58,6 +58,15 @@ def _money(value: float | int | None) -> str:
         return "0.00 BYN"
 
 
+def _number(value) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _parse_date(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -161,6 +170,23 @@ def _parse_case_raw(case: dict) -> dict:
         return json.loads(raw)
     except Exception:
         return {}
+
+
+def _latest_claim(case: dict) -> dict:
+    payload = _parse_case_raw(case)
+    detail = payload.get("detail") or {}
+    claims = detail.get("claims") or payload.get("claims") or []
+    if not claims:
+        return {}
+    return sorted(
+        (claim for claim in claims if isinstance(claim, dict)),
+        key=lambda claim: (
+            str(claim.get("claim_date") or ""),
+            str(claim.get("sent_at") or ""),
+            str(claim.get("id") or ""),
+        ),
+        reverse=True,
+    )[0]
 
 
 def _normalize_address_token(token: str) -> str:
@@ -321,7 +347,7 @@ def build_postal_address_text(case: dict) -> str:
     return "📮 <b>Адрес для отправки через Белпочту</b>\n\n<pre>" + "\n".join(_postal_address_lines(case)) + "</pre>"
 
 
-def build_claim_text(case: dict, creditor: dict) -> str:
+def _build_generic_claim_text(case: dict, creditor: dict) -> str:
     service_name = _sms_service(case)
     debt_calc = (
         f"Сумма займа: {_money(case.get('amount'))} | "
@@ -348,6 +374,68 @@ def build_claim_text(case: dict, creditor: dict) -> str:
         debt_calc,
     ]
     return "\n\n".join(part for part in sections if part).strip()
+
+
+def _build_finkit_claim_text(case: dict, creditor: dict) -> str:
+    del creditor
+    claim = _latest_claim(case)
+    snapshot_date = _date(claim.get("claim_date") or datetime.now().isoformat())
+    deadline = _date(claim.get("expires_at"))
+    amount_total = _money(_number(claim.get("amount")) or case.get("total_due"))
+    debt_lines = [
+        f"сумма невозвращенного в срок займа: {_money(case.get('principal_outstanding'))}",
+        f"проценты за пользование займом: {_money(case.get('accrued_percent'))}",
+        f"пени: {_money(case.get('fine_outstanding'))}",
+        f"ИТОГО: {amount_total}",
+    ]
+    sections = [
+        (
+            f"По договору займа № {_loan_ref(case)} от {_date(case.get('issued_at'))} вам предоставлена сумма займа "
+            f"в размере {_money(case.get('amount'))} с обязательством возврата займа и оплаты процентов за весь срок пользования."
+        ),
+        (
+            f"Установленный договором срок возврата займа и оплаты процентов наступил {_date(case.get('due_at'))}, "
+            "принятые по договору обязательства вами не исполнены."
+        ),
+        f"Ваша задолженность по договору по состоянию на {snapshot_date} составляет:\n" + "\n".join(debt_lines),
+        (
+            f"Требую в кратчайший срок погасить задолженность по договору в общей сумме {amount_total}. "
+            "Задолженность подлежит погашению в сервисе онлайн-заимствования https://finkit.by платежом банковской "
+            "платежной картой, привязанной к вашему личному кабинету."
+        ),
+        (
+            "Направляю настоящую претензию с предложением урегулировать вопрос в досудебном порядке и без обращения в суд. "
+            "Обращаю внимание, что при обращении в суд сумма требований будет увеличена, поскольку проценты и пени "
+            "продолжают начисляться по день фактического исполнения обязательства."
+        ),
+        (
+            "Кроме того, при судебном и последующем принудительном взыскании на должника будут возложены "
+            "государственная пошлина, расходы на представителя, издержки исполнительного производства и иные расходы, "
+            "связанные с принудительным исполнением."
+        ),
+        (
+            f"До {deadline} готов рассмотреть конструктивные предложения по добровольному урегулированию вопроса и погашению задолженности."
+            if deadline != "—"
+            else "Готов рассмотреть конструктивные предложения по добровольному урегулированию вопроса и погашению задолженности."
+        ),
+        (
+            "Настоятельно рекомендую воспользоваться возможностью добровольного урегулирования, поскольку дальнейшее промедление "
+            "повлечет увеличение суммы задолженности и дополнительных расходов, связанных с ее взысканием."
+        ),
+    ]
+    return "\n\n".join(part for part in sections if part).strip()
+
+
+def build_claim_text(case: dict, creditor: dict) -> str:
+    if case.get("service") == "finkit":
+        return _build_finkit_claim_text(case, creditor)
+    return _build_generic_claim_text(case, creditor)
+
+
+def _claim_titles(case: dict) -> tuple[str, str]:
+    if case.get("service") == "finkit":
+        return "ПРЕТЕНЗИЯ", "с предложением о добровольном урегулировании задолженности"
+    return "ПРЕДЛОЖЕНИЕ", "о добровольном урегулировании задолженности"
 
 
 def _set_default_style(doc: Document) -> None:
@@ -408,17 +496,18 @@ def render_claim_docx(case: dict, creditor: dict, signature_path: str) -> tuple[
     _add_block(doc, "От:", creditor_lines)
     doc.add_paragraph().paragraph_format.space_after = Pt(2)
 
+    claim_title, claim_subtitle = _claim_titles(case)
     title = doc.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
     title.paragraph_format.space_after = Pt(1)
-    run = title.add_run("ПРЕДЛОЖЕНИЕ")
+    run = title.add_run(claim_title)
     run.bold = True
     run.font.size = Pt(11.5)
 
     subtitle = doc.add_paragraph()
     subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
     subtitle.paragraph_format.space_after = Pt(4)
-    run = subtitle.add_run("о добровольном урегулировании задолженности")
+    run = subtitle.add_run(claim_subtitle)
     run.bold = True
     run.font.size = Pt(10)
 

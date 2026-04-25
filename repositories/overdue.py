@@ -179,6 +179,43 @@ async def get_overdue_case(case_id: int, chat_id: int) -> dict | None:
         await db.close()
 
 
+async def lookup_latest_borrower_contacts(document_id: str) -> dict | None:
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            """
+            SELECT document_id, full_name, service, borrower_phone, borrower_email, raw_data
+            FROM overdue_cases
+            WHERE document_id = ?
+              AND (NULLIF(TRIM(COALESCE(borrower_phone, '')), '') IS NOT NULL
+                   OR NULLIF(TRIM(COALESCE(borrower_email, '')), '') IS NOT NULL)
+            ORDER BY is_active DESC, updated_at DESC, id DESC
+            LIMIT 1
+            """,
+            (document_id,),
+        )
+        if not rows:
+            return None
+        row = dict(rows[0])
+        source = row.get("service")
+        try:
+            payload = json.loads(row.get("raw_data") or "{}")
+        except Exception:
+            payload = {}
+        if payload.get("contact_source"):
+            source = payload["contact_source"]
+        return {
+            "document_id": row.get("document_id"),
+            "full_name": row.get("full_name"),
+            "service": row.get("service"),
+            "phone": row.get("borrower_phone"),
+            "email": row.get("borrower_email"),
+            "source": source,
+        }
+    finally:
+        await db.close()
+
+
 async def update_overdue_case_contacts(
     case_id: int,
     chat_id: int,
@@ -189,6 +226,7 @@ async def update_overdue_case_contacts(
     borrower_email: str | None = None,
     voluntary_term_days: int | None = None,
     postal_lookup: dict | None = None,
+    contact_source: str | None = None,
 ) -> None:
     db = await get_db()
     try:
@@ -204,6 +242,8 @@ async def update_overdue_case_contacts(
                 raw_payload = {}
         if postal_lookup is not None:
             raw_payload["postal_lookup"] = postal_lookup
+        if contact_source:
+            raw_payload["contact_source"] = contact_source
         await db.execute(
             """
             UPDATE overdue_cases
@@ -604,6 +644,7 @@ __all__ = [
     "get_creditor_profile",
     "get_credential_creditor_profile",
     "get_credential_signature_asset",
+    "lookup_latest_borrower_contacts",
     "get_overdue_case",
     "get_user_signature_asset",
     "list_overdue_cases",

@@ -71,7 +71,7 @@ async def _enrich_finkit_borrower_from_detail(
             return borrower_user_id, False, False
         detail = await resp.json()
 
-    resolved_borrower_user_id = str(detail.get("user") or detail.get("loan") or borrower_user_id or investment_id)
+    resolved_borrower_user_id = str(detail.get("loan") or borrower_user_id or investment_id)
     existing = await lookup_borrower("finkit", resolved_borrower_user_id)
     document_id = existing.get("document_id") if existing else None
     document_enriched = False

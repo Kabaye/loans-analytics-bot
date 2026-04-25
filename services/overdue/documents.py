@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import json
 import logging
@@ -22,6 +22,7 @@ SERVICE_URLS = {
 }
 
 GENERATED_DOCS_DIR = Path(config.BASE_DIR) / "data" / "generated-docs"
+GENERATED_DOCS_TTL_DAYS = 5
 SMS_MAX_LEN = 140
 SMS_SERVICE_NAMES = {
     "finkit": "ФинКит",
@@ -506,7 +507,7 @@ def _add_block(doc: Document, title: str, lines: list[str]) -> None:
         run.font.size = Pt(12)
 
 
-def _add_body_paragraph(doc: Document, text: str) -> None:
+def _add_body_paragraph(doc: Document, text: str):
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
     p.paragraph_format.first_line_indent = Mm(8)
@@ -514,9 +515,34 @@ def _add_body_paragraph(doc: Document, text: str) -> None:
     p.paragraph_format.line_spacing = 1.15
     run = p.add_run(text)
     run.font.size = Pt(12)
+    return p
+
+
+def _cleanup_generated_docs() -> None:
+    if not GENERATED_DOCS_DIR.exists():
+        return
+    cutoff = datetime.now() - timedelta(days=GENERATED_DOCS_TTL_DAYS)
+    for path in GENERATED_DOCS_DIR.rglob("*"):
+        if not path.is_file():
+            continue
+        modified = datetime.fromtimestamp(path.stat().st_mtime)
+        if modified < cutoff:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    for directory in sorted((path for path in GENERATED_DOCS_DIR.rglob("*") if path.is_dir()), reverse=True):
+        try:
+            next(directory.iterdir())
+        except StopIteration:
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
 
 
 def render_claim_docx(case: dict, creditor: dict, signature_path: str) -> tuple[Path, str]:
+    _cleanup_generated_docs()
     GENERATED_DOCS_DIR.mkdir(parents=True, exist_ok=True)
     case_dir = GENERATED_DOCS_DIR / f"chat_{case['chat_id']}" / f"case_{case['id']}"
     case_dir.mkdir(parents=True, exist_ok=True)
@@ -561,10 +587,17 @@ def render_claim_docx(case: dict, creditor: dict, signature_path: str) -> tuple[
     run.bold = True
     run.font.size = Pt(12)
 
+    body_paragraphs = []
     for paragraph in build_claim_text(case, creditor).split("\n\n"):
-        _add_body_paragraph(doc, paragraph)
+        body_paragraphs.append(_add_body_paragraph(doc, paragraph))
 
-    doc.add_paragraph().paragraph_format.space_after = Pt(6)
+    for paragraph in body_paragraphs[-2:]:
+        paragraph.paragraph_format.keep_with_next = True
+        paragraph.paragraph_format.keep_together = True
+
+    spacer = doc.add_paragraph()
+    spacer.paragraph_format.space_after = Pt(2)
+    spacer.paragraph_format.keep_with_next = True
     footer = doc.add_table(rows=1, cols=3)
     footer.alignment = WD_TABLE_ALIGNMENT.CENTER
     footer.autofit = False

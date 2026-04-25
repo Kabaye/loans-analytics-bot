@@ -78,6 +78,36 @@ async def lookup_borrower_info(document_id: str) -> dict | None:
         await db.close()
 
 
+async def lookup_borrower_contacts(document_id: str) -> dict | None:
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            """
+            SELECT document_id, full_name, borrower_phone, borrower_email, contact_source, source
+            FROM borrower_info
+            WHERE document_id = ?
+              AND (
+                    NULLIF(TRIM(COALESCE(borrower_phone, '')), '') IS NOT NULL
+                 OR NULLIF(TRIM(COALESCE(borrower_email, '')), '') IS NOT NULL
+              )
+            LIMIT 1
+            """,
+            (document_id,),
+        )
+        if not rows:
+            return None
+        row = dict(rows[0])
+        return {
+            "document_id": row.get("document_id"),
+            "full_name": row.get("full_name"),
+            "phone": row.get("borrower_phone"),
+            "email": row.get("borrower_email"),
+            "source": row.get("contact_source") or row.get("source"),
+        }
+    finally:
+        await db.close()
+
+
 async def search_borrower_info(query: str, limit: int = 10) -> list[dict]:
     db = await get_db()
     try:
@@ -187,6 +217,47 @@ async def upsert_borrower_info(
         await db.close()
 
 
+async def upsert_borrower_contacts(
+    document_id: str,
+    *,
+    full_name: str | None = None,
+    borrower_phone: str | None = None,
+    borrower_email: str | None = None,
+    source: str = "manual",
+) -> None:
+    if full_name:
+        full_name = full_name.upper()
+    borrower_phone = (borrower_phone or "").strip() or None
+    borrower_email = (borrower_email or "").strip() or None
+    db = await get_db()
+    try:
+        await db.execute(
+            f"""
+            INSERT INTO borrower_info
+                (document_id, full_name, borrower_phone, borrower_email, contact_source, source)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(document_id) DO UPDATE SET
+                full_name = {_BORROWER_INFO_FULL_NAME_SQL},
+                borrower_phone = COALESCE(excluded.borrower_phone, borrower_info.borrower_phone),
+                borrower_email = COALESCE(excluded.borrower_email, borrower_info.borrower_email),
+                contact_source = COALESCE(excluded.contact_source, borrower_info.contact_source),
+                source = {_BORROWER_INFO_SOURCE_SQL},
+                updated_at = datetime('now')
+            """,
+            (
+                document_id,
+                full_name,
+                borrower_phone,
+                borrower_email,
+                source,
+                source,
+            ),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
 async def upsert_borrower_from_investment(
     service: str,
     borrower_user_id: str,
@@ -228,6 +299,33 @@ async def upsert_borrower_from_investment(
             ),
         )
         await db.commit()
+    finally:
+        await db.close()
+
+
+async def list_borrower_mappings_by_document_ids(document_ids: list[str], service: str | None = None) -> list[dict]:
+    if not document_ids:
+        return []
+    db = await get_db()
+    try:
+        placeholders = ",".join("?" for _ in document_ids)
+        where = f"b.document_id IN ({placeholders})"
+        params: list[object] = [*document_ids]
+        if service:
+            where += " AND b.service = ?"
+            params.append(service)
+        rows = await db.execute_fetchall(
+            f"""
+            SELECT b.service, b.borrower_user_id, b.document_id,
+                   COALESCE(b.full_name, bi.full_name) AS full_name
+            FROM borrowers b
+            LEFT JOIN borrower_info bi ON bi.document_id = b.document_id
+            WHERE {where}
+            ORDER BY b.last_seen DESC
+            """,
+            params,
+        )
+        return [dict(row) for row in rows]
     finally:
         await db.close()
 
@@ -290,9 +388,12 @@ __all__ = [
     "get_borrowers_stats",
     "list_borrower_name_map",
     "lookup_borrower",
+    "lookup_borrower_contacts",
     "lookup_borrower_info",
+    "list_borrower_mappings_by_document_ids",
     "search_borrower_info",
     "upsert_borrower",
+    "upsert_borrower_contacts",
     "upsert_borrower_from_investment",
     "upsert_borrower_info",
 ]

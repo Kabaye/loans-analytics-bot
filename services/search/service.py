@@ -4,11 +4,15 @@ import re
 
 from bot.integrations.opi_client import OPIChecker
 from bot.repositories.borrowers import (
+    list_borrower_mappings_by_document_ids,
+    lookup_borrower_contacts,
     lookup_borrower_info,
     search_borrower_info,
+    upsert_borrower_contacts,
     upsert_borrower_info,
 )
 from bot.repositories.overdue import lookup_latest_borrower_contacts
+from bot.services.base.providers import ensure_finkit_parser, list_service_credentials
 from bot.services.borrowers.source_labels import humanize_borrower_source
 
 SERVICE_NAMES = {
@@ -93,13 +97,106 @@ def format_contact_card(document_id: str, payload: dict) -> str:
 
 
 async def lookup_borrower_contact_info(document_id: str) -> dict | None:
-    return await lookup_latest_borrower_contacts(document_id)
+    payload = await lookup_borrower_contacts(document_id)
+    overdue_payload = await lookup_latest_borrower_contacts(document_id)
+    if payload and overdue_payload:
+        return {
+            "document_id": document_id,
+            "full_name": payload.get("full_name") or overdue_payload.get("full_name"),
+            "service": overdue_payload.get("service"),
+            "phone": payload.get("phone") or overdue_payload.get("phone"),
+            "email": payload.get("email") or overdue_payload.get("email"),
+            "source": payload.get("source") or overdue_payload.get("source"),
+        }
+    return payload or overdue_payload
+
+
+def _normalize_name(value: str | None) -> str:
+    return (value or "").strip().upper().replace("Ё", "Е")
+
+
+async def _backfill_finkit_contacts(document_ids: list[str]) -> None:
+    mappings = await list_borrower_mappings_by_document_ids(document_ids, service="finkit")
+    if not mappings:
+        return
+    docs_by_name: dict[str, set[str]] = {}
+    for row in mappings:
+        name_key = _normalize_name(row.get("full_name"))
+        if not name_key:
+            continue
+        docs_by_name.setdefault(name_key, set()).add(str(row["document_id"]))
+    if not docs_by_name:
+        return
+
+    creds = await list_service_credentials("finkit")
+    remaining = set(document_ids)
+    for cred in creds:
+        parser = await ensure_finkit_parser(cred)
+        if parser is None:
+            continue
+        try:
+            items = await parser.fetch_investments()
+            if parser.needs_reauth:
+                parser = await ensure_finkit_parser(cred, force_login=True)
+                if parser is None:
+                    continue
+                items = await parser.fetch_investments()
+
+            for item in items:
+                name_key = _normalize_name(item.get("borrower_full_name"))
+                if name_key not in docs_by_name:
+                    continue
+                investment_id = str(item.get("id") or "").strip()
+                if not investment_id:
+                    continue
+                detail = await parser.fetch_investment_detail(investment_id) or {}
+                phone = (detail.get("borrower_phone_number") or "").strip()
+                email = (detail.get("borrower_email") or "").strip()
+                if not phone and not email:
+                    continue
+
+                matched_doc_ids: set[str] = set()
+                contract_url = detail.get("latest_contract_url")
+                if contract_url:
+                    contract_pdf = await parser.fetch_contract_pdf(str(contract_url))
+                    if contract_pdf:
+                        _, parsed_document_id = parser.parse_borrower_from_contract_pdf(contract_pdf)
+                        if parsed_document_id and parsed_document_id in docs_by_name.get(name_key, set()):
+                            matched_doc_ids.add(parsed_document_id)
+
+                if not matched_doc_ids and len(docs_by_name.get(name_key, set())) == 1:
+                    matched_doc_ids.update(docs_by_name[name_key])
+
+                for document_id in matched_doc_ids:
+                    await upsert_borrower_contacts(
+                        document_id,
+                        full_name=detail.get("borrower_full_name") or item.get("borrower_full_name"),
+                        borrower_phone=phone or None,
+                        borrower_email=email or None,
+                        source="finkit_investment_detail",
+                    )
+                    remaining.discard(document_id)
+
+                if not remaining:
+                    return
+        finally:
+            await parser.close()
+
+
+async def ensure_borrower_contact_info(document_ids: list[str]) -> None:
+    missing: list[str] = []
+    for document_id in document_ids:
+        if not await lookup_borrower_contact_info(document_id):
+            missing.append(document_id)
+    if missing:
+        await _backfill_finkit_contacts(missing)
 
 
 async def run_opi_batch(doc_ids: list[str]) -> str:
     checker = OPIChecker()
     lines = ["🆔 <b>Проверка по ИН</b>", ""]
     try:
+        await ensure_borrower_contact_info(doc_ids)
         for idx, doc_id in enumerate(doc_ids, start=1):
             info = await lookup_borrower_info(doc_id)
             contacts = await lookup_borrower_contact_info(doc_id)
@@ -164,6 +261,7 @@ async def add_borrower_and_refresh_opi(
 
 __all__ = [
     "add_borrower_and_refresh_opi",
+    "ensure_borrower_contact_info",
     "extract_document_ids",
     "force_refresh_opi_card",
     "format_contact_card",

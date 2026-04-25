@@ -16,6 +16,7 @@ from bot.repositories.borrowers import (
     list_borrower_name_map,
     lookup_borrower,
     lookup_borrower_contacts,
+    lookup_unique_document_id_by_full_name,
     upsert_borrower,
     upsert_borrower_contacts,
     upsert_borrower_from_investment,
@@ -90,6 +91,19 @@ async def _enrich_finkit_borrower_from_detail(
                 source=f"finkit_archive_{user_tag}",
             )
             log.info("Finkit midnight PDF: %s → ИН %s", borrower_name, document_id)
+            document_enriched = True
+
+    if not document_id:
+        document_id = await lookup_unique_document_id_by_full_name(borrower_name)
+        if document_id:
+            await upsert_borrower(
+                service="finkit",
+                borrower_user_id=resolved_borrower_user_id,
+                full_name=borrower_name,
+                document_id=document_id,
+                source=f"finkit_name_match_{user_tag}",
+            )
+            log.info("Finkit midnight name-match: %s → ИН %s", borrower_name, document_id)
             document_enriched = True
 
     contacts_updated = False

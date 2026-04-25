@@ -78,6 +78,29 @@ async def lookup_borrower_info(document_id: str) -> dict | None:
         await db.close()
 
 
+async def lookup_unique_document_id_by_full_name(full_name: str) -> str | None:
+    normalized = (full_name or "").strip().upper()
+    if not normalized:
+        return None
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            """
+            SELECT DISTINCT document_id
+            FROM borrower_info
+            WHERE full_name = ?
+              AND NULLIF(TRIM(COALESCE(document_id, '')), '') IS NOT NULL
+            LIMIT 2
+            """,
+            (normalized,),
+        )
+        if len(rows) != 1:
+            return None
+        return rows[0]["document_id"]
+    finally:
+        await db.close()
+
+
 async def lookup_borrower_contacts(document_id: str) -> dict | None:
     db = await get_db()
     try:
@@ -390,6 +413,7 @@ __all__ = [
     "lookup_borrower",
     "lookup_borrower_contacts",
     "lookup_borrower_info",
+    "lookup_unique_document_id_by_full_name",
     "list_borrower_mappings_by_document_ids",
     "search_borrower_info",
     "upsert_borrower",

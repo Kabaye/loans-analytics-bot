@@ -173,25 +173,28 @@ async def refresh_finkit_case_for_claim(case: dict, *, create_pretrial_claim: bo
     if parser is None:
         return case, get_latest_finkit_claim(case)
 
-    payload = _parse_case_payload(case)
-    detail = await parser.fetch_investment_detail(str(case.get("external_id") or "")) or payload.get("detail") or {}
+    try:
+        payload = _parse_case_payload(case)
+        detail = await parser.fetch_investment_detail(str(case.get("external_id") or "")) or payload.get("detail") or {}
 
-    if create_pretrial_claim and detail.get("can_generate_claim") is not False:
-        claims = await parser.create_pretrial_claims(str(case.get("external_id") or ""))
-        refreshed_detail = await parser.fetch_investment_detail(str(case.get("external_id") or ""))
-        if refreshed_detail:
-            detail = refreshed_detail
-        elif claims:
-            detail["claims"] = claims
+        if create_pretrial_claim and detail.get("can_generate_claim") is not False:
+            claims = await parser.create_pretrial_claims(str(case.get("external_id") or ""))
+            refreshed_detail = await parser.fetch_investment_detail(str(case.get("external_id") or ""))
+            if refreshed_detail:
+                detail = refreshed_detail
+            elif claims:
+                detail["claims"] = claims
 
-    await _persist_finkit_detail(case, payload, detail)
-    refreshed = await get_overdue_case(int(case["id"]), int(case["chat_id"])) or case
+        await _persist_finkit_detail(case, payload, detail)
+        refreshed = await get_overdue_case(int(case["id"]), int(case["chat_id"])) or case
 
-    await _refresh_finkit_contacts(refreshed, parser, detail)
-    await _refresh_finkit_document_id(refreshed, parser, payload, detail)
+        await _refresh_finkit_contacts(refreshed, parser, detail)
+        await _refresh_finkit_document_id(refreshed, parser, payload, detail)
 
-    refreshed = await get_overdue_case(int(case["id"]), int(case["chat_id"])) or refreshed
-    return refreshed, get_latest_finkit_claim(refreshed)
+        refreshed = await get_overdue_case(int(case["id"]), int(case["chat_id"])) or refreshed
+        return refreshed, get_latest_finkit_claim(refreshed)
+    finally:
+        await parser.close()
 
 
 async def enrich_finkit_case_from_claims(case: dict) -> dict:
@@ -211,9 +214,12 @@ async def send_finkit_pretrial_claim(case: dict, claim_id: str) -> tuple[bool, d
     if parser is None:
         return False, case
 
-    result = await parser.send_pretrial_claim(claim_id)
-    if not result:
-        return False, case
+    try:
+        result = await parser.send_pretrial_claim(claim_id)
+        if not result:
+            return False, case
+    finally:
+        await parser.close()
 
     refreshed, _ = await refresh_finkit_case_for_claim(case, create_pretrial_claim=False)
     return True, refreshed

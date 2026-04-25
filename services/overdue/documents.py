@@ -348,30 +348,43 @@ def build_postal_address_text(case: dict) -> str:
 
 
 def _build_generic_claim_text(case: dict, creditor: dict) -> str:
+    del creditor
     service_name = _sms_service(case)
-    debt_calc = (
-        f"Сумма займа: {_money(case.get('amount'))} | "
-        f"Проценты: {_money(case.get('accrued_percent'))} | "
-        f"Пени за просрочку: {_money(case.get('fine_outstanding'))}\n"
-        f"ИТОГО к оплате: {_money(case.get('total_due'))} на дату отправки данного предложения."
-    )
+    debt_calc = "\n".join([
+        f"Ваша задолженность по состоянию на {_date(datetime.now().isoformat())} составляет:",
+        f"- сумма займа: {_money(case.get('amount'))}",
+        f"- проценты за пользование займом: {_money(case.get('accrued_percent'))}",
+        f"- пени за просрочку: {_money(case.get('fine_outstanding'))}",
+        f"- ИТОГО к оплате: {_money(case.get('total_due'))}",
+    ])
     sections = [
         (
             f"Направляю настоящее письмо-предложение по договору займа {_loan_ref(case)} "
             f"от {_date(case.get('issued_at'))} через сервис {service_name}, "
             "с целью урегулирования задолженности в добровольном досудебном порядке."
         ),
-        (
-            "Убедительно прошу Вас погасить задолженность в полном объеме в кратчайший срок. "
-            "Это позволит избежать судебного разбирательства и дополнительных расходов."
-        ),
-        (
-            "При обращении в суд сумма требований увеличится за счет дальнейшего начисления процентов, "
-            "пени, государственной пошлины и иных расходов. После вынесения решения задолженность может "
-            "взыскиваться принудительно, включая арест имущества и другие меры исполнения."
-        ),
-        "Готов урегулировать вопрос добровольно без обращения в суд.",
         debt_calc,
+        (
+            "Прошу в кратчайший срок погасить задолженность в полном объеме. "
+            "Это позволит урегулировать вопрос добровольно и без обращения в суд."
+        ),
+        (
+            "Обращаю внимание, что при обращении в суд сумма требований будет увеличена, поскольку проценты "
+            "и пени продолжают начисляться по день фактического исполнения обязательства."
+        ),
+        (
+            "Кроме того, при судебном и последующем принудительном взыскании на должника будут возложены "
+            "государственная пошлина, расходы на представителя и иные издержки, связанные с рассмотрением дела "
+            "и принудительным исполнением."
+        ),
+        (
+            "В пределах срока добровольного урегулирования готов рассмотреть конструктивные предложения "
+            "по погашению задолженности."
+        ),
+        (
+            "При отсутствии оплаты либо приемлемых предложений задолженность будет взыскана в судебном и "
+            "последующем принудительном порядке."
+        ),
     ]
     return "\n\n".join(part for part in sections if part).strip()
 
@@ -382,12 +395,20 @@ def _build_finkit_claim_text(case: dict, creditor: dict) -> str:
     snapshot_date = _date(claim.get("claim_date") or datetime.now().isoformat())
     deadline = _date(claim.get("expires_at"))
     amount_total = _money(_number(claim.get("amount")) or case.get("total_due"))
-    debt_lines = [
-        f"сумма невозвращенного в срок займа: {_money(case.get('principal_outstanding'))}",
-        f"проценты за пользование займом: {_money(case.get('accrued_percent'))}",
-        f"пени: {_money(case.get('fine_outstanding'))}",
-        f"ИТОГО: {amount_total}",
-    ]
+    debt_lines = "\n".join([
+        f"- сумма невозвращенного в срок займа: {_money(case.get('principal_outstanding'))}",
+        f"- проценты за пользование займом: {_money(case.get('accrued_percent'))}",
+        f"- пени: {_money(case.get('fine_outstanding'))}",
+        f"- ИТОГО: {amount_total}",
+    ])
+    consequences = "\n".join([
+        "- возложение на вас судебных расходов по уплате государственной пошлины, юридической помощи и иных издержек;",
+        "- дальнейшее увеличение суммы долга за счет начисления процентов и пеней по день фактической оплаты;",
+        "- взыскание принудительного сбора и иных расходов исполнительного производства;",
+        "- арест имущества, ограничение права на выезд и иные меры принудительного исполнения;",
+        "- обращение взыскания на имущество, заработную плату и иные доходы;",
+        "- ухудшение кредитной истории и сложности с получением новых займов и кредитов.",
+    ])
     sections = [
         (
             f"По договору займа № {_loan_ref(case)} от {_date(case.get('issued_at'))} вам предоставлена сумма займа "
@@ -397,26 +418,46 @@ def _build_finkit_claim_text(case: dict, creditor: dict) -> str:
             f"Установленный договором срок возврата займа и оплаты процентов наступил {_date(case.get('due_at'))}, "
             "принятые по договору обязательства вами не исполнены."
         ),
-        f"Ваша задолженность по договору по состоянию на {snapshot_date} составляет:\n" + "\n".join(debt_lines),
+        f"Ваша задолженность по договору по состоянию на {snapshot_date} составляет:\n{debt_lines}",
+        (
+            "На основании условий договора займа, пункта 22 Положения, утвержденного Указом Президента Республики Беларусь "
+            "от 25.05.2021 № 196, а также статей 290, 311, 760 и 762 Гражданского кодекса Республики Беларусь требую "
+            "добровольно погасить образовавшуюся задолженность."
+        ),
         (
             f"Требую в кратчайший срок погасить задолженность по договору в общей сумме {amount_total}. "
             "Задолженность подлежит погашению в сервисе онлайн-заимствования https://finkit.by платежом банковской "
             "платежной картой, привязанной к вашему личному кабинету."
         ),
         (
-            "Направляю настоящую претензию с предложением урегулировать вопрос в досудебном порядке и без обращения в суд. "
-            "Обращаю внимание, что при обращении в суд сумма требований будет увеличена, поскольку проценты и пени "
-            "продолжают начисляться по день фактического исполнения обязательства."
+            "Направляю настоящую претензию в дополнение к уведомлениям, ранее доступным через сервис FinKit, "
+            "с предложением урегулировать вопрос в досудебном порядке и без обращения в суд."
         ),
         (
-            "Кроме того, при судебном и последующем принудительном взыскании на должника будут возложены "
-            "государственная пошлина, расходы на представителя, издержки исполнительного производства и иные расходы, "
-            "связанные с принудительным исполнением."
+            "Обращаю внимание, что при обращении в суд сумма требований будет увеличена, поскольку проценты и пени "
+            "продолжают начисляться по день фактического исполнения обязательства. Соответственно, на дату подачи искового "
+            "заявления размер задолженности будет выше, чем на дату направления настоящей претензии."
+        ),
+        (
+            "Кроме того, при судебном и последующем принудительном взыскании на должника будут возложены дополнительные "
+            "расходы, связанные с рассмотрением дела судом и принудительным исполнением."
+        ),
+        (
+            "В случае дальнейшего уклонения от оплаты задолженность будет взыскана в судебном и последующем "
+            f"принудительном порядке, что повлечет для вас следующие последствия:\n{consequences}"
         ),
         (
             f"До {deadline} готов рассмотреть конструктивные предложения по добровольному урегулированию вопроса и погашению задолженности."
             if deadline != "—"
             else "Готов рассмотреть конструктивные предложения по добровольному урегулированию вопроса и погашению задолженности."
+        ),
+        (
+            "При добровольном и полном погашении долга в пределах срока, указанного в претензии, возможно обсуждение "
+            "уменьшения отдельных начислений."
+        ),
+        (
+            "По истечении указанного срока при отсутствии оплаты либо приемлемых предложений задолженность будет взыскана "
+            "в судебном и последующем принудительном порядке с увеличением суммы требований и взысканием дополнительных расходов."
         ),
         (
             "Настоятельно рекомендую воспользоваться возможностью добровольного урегулирования, поскольку дальнейшее промедление "
@@ -441,36 +482,37 @@ def _claim_titles(case: dict) -> tuple[str, str]:
 def _set_default_style(doc: Document) -> None:
     style = doc.styles["Normal"]
     style.font.name = "Times New Roman"
-    style.font.size = Pt(10)
+    style.font.size = Pt(12)
     section = doc.sections[0]
-    section.top_margin = Mm(8)
-    section.bottom_margin = Mm(8)
-    section.left_margin = Mm(10)
-    section.right_margin = Mm(10)
+    section.top_margin = Mm(18)
+    section.bottom_margin = Mm(18)
+    section.left_margin = Mm(20)
+    section.right_margin = Mm(15)
 
 
 def _add_block(doc: Document, title: str, lines: list[str]) -> None:
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    p.paragraph_format.space_after = Pt(1)
+    p.paragraph_format.space_after = Pt(3)
     run = p.add_run(title)
     run.bold = True
-    run.font.size = Pt(10.5)
+    run.font.size = Pt(12)
     for line in lines:
         p = doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        p.paragraph_format.space_after = Pt(0)
+        p.paragraph_format.space_after = Pt(1)
         run = p.add_run(line)
-        run.font.size = Pt(10)
+        run.font.size = Pt(12)
 
 
 def _add_body_paragraph(doc: Document, text: str) -> None:
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-    p.paragraph_format.first_line_indent = Mm(4)
-    p.paragraph_format.space_after = Pt(2)
+    p.paragraph_format.first_line_indent = Mm(8)
+    p.paragraph_format.space_after = Pt(5)
+    p.paragraph_format.line_spacing = 1.15
     run = p.add_run(text)
-    run.font.size = Pt(10)
+    run.font.size = Pt(12)
 
 
 def render_claim_docx(case: dict, creditor: dict, signature_path: str) -> tuple[Path, str]:
@@ -492,43 +534,50 @@ def render_claim_docx(case: dict, creditor: dict, signature_path: str) -> tuple[
     )
 
     _add_block(doc, "Кому:", debtor_lines)
-    doc.add_paragraph().paragraph_format.space_after = Pt(1)
+    doc.add_paragraph().paragraph_format.space_after = Pt(3)
     _add_block(doc, "От:", creditor_lines)
-    doc.add_paragraph().paragraph_format.space_after = Pt(2)
+    doc.add_paragraph().paragraph_format.space_after = Pt(6)
 
     claim_title, claim_subtitle = _claim_titles(case)
     title = doc.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    title.paragraph_format.space_after = Pt(1)
+    title.paragraph_format.space_after = Pt(2)
     run = title.add_run(claim_title)
     run.bold = True
-    run.font.size = Pt(11.5)
+    run.font.size = Pt(14)
 
     subtitle = doc.add_paragraph()
     subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    subtitle.paragraph_format.space_after = Pt(4)
+    subtitle.paragraph_format.space_after = Pt(2)
     run = subtitle.add_run(claim_subtitle)
     run.bold = True
-    run.font.size = Pt(10)
+    run.font.size = Pt(12)
+
+    subject = doc.add_paragraph()
+    subject.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    subject.paragraph_format.space_after = Pt(8)
+    run = subject.add_run(f"по договору займа № {_loan_ref(case)} от {_date(case.get('issued_at'))}")
+    run.bold = True
+    run.font.size = Pt(12)
 
     for paragraph in build_claim_text(case, creditor).split("\n\n"):
         _add_body_paragraph(doc, paragraph)
 
-    doc.add_paragraph().paragraph_format.space_after = Pt(2)
+    doc.add_paragraph().paragraph_format.space_after = Pt(6)
     footer = doc.add_table(rows=1, cols=3)
     footer.alignment = WD_TABLE_ALIGNMENT.CENTER
     footer.autofit = False
     left_cell, sign_cell, right_cell = footer.rows[0].cells
-    left_cell.width = Mm(30)
-    sign_cell.width = Mm(130)
-    right_cell.width = Mm(30)
+    left_cell.width = Mm(25)
+    sign_cell.width = Mm(125)
+    right_cell.width = Mm(25)
     for cell in (left_cell, sign_cell, right_cell):
         cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
 
     left_par = left_cell.paragraphs[0]
     left_par.alignment = WD_ALIGN_PARAGRAPH.LEFT
     left_run = left_par.add_run(datetime.now().strftime("%d.%m.%Y"))
-    left_run.font.size = Pt(10)
+    left_run.font.size = Pt(12)
 
     sign_par = sign_cell.paragraphs[0]
     sign_par.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -538,7 +587,7 @@ def render_claim_docx(case: dict, creditor: dict, signature_path: str) -> tuple[
     right_par = right_cell.paragraphs[0]
     right_par.alignment = WD_ALIGN_PARAGRAPH.RIGHT
     right_run = right_par.add_run(creditor.get("full_name") or "")
-    right_run.font.size = Pt(10)
+    right_run.font.size = Pt(12)
 
     doc.save(out_path)
     claim_text = build_claim_text(case, creditor)

@@ -176,9 +176,12 @@ async def refresh_finkit_case_for_claim(case: dict, *, create_pretrial_claim: bo
     payload = _parse_case_payload(case)
     detail = await parser.fetch_investment_detail(str(case.get("external_id") or "")) or payload.get("detail") or {}
 
-    if create_pretrial_claim and detail.get("status") != "settled":
+    if create_pretrial_claim and detail.get("can_generate_claim") is not False:
         claims = await parser.create_pretrial_claims(str(case.get("external_id") or ""))
-        if claims:
+        refreshed_detail = await parser.fetch_investment_detail(str(case.get("external_id") or ""))
+        if refreshed_detail:
+            detail = refreshed_detail
+        elif claims:
             detail["claims"] = claims
 
     await _persist_finkit_detail(case, payload, detail)

@@ -22,5 +22,5 @@ FINKIT_INTERVAL: int = int(os.getenv("FINKIT_INTERVAL", "60"))
 ZAIMIS_INTERVAL: int = int(os.getenv("ZAIMIS_INTERVAL", "60"))
 
 DB_PATH: str = _resolve_path(BASE_DIR, os.getenv("DB_PATH", "data/loans.db"))
-APP_VERSION: str = os.getenv("APP_VERSION", "2.0.0")
+APP_VERSION: str = os.getenv("APP_VERSION", "2.0.1")
 PATCH_NOTES_DIR: str = _resolve_path(BOT_DIR, os.getenv("PATCH_NOTES_DIR", "patchnotes"))

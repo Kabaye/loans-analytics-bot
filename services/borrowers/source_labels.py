@@ -18,6 +18,7 @@ def humanize_borrower_source(source: str | None) -> str | None:
         "finkit_claim_pdf": "претензия FinKit",
         "finkit_contract_pdf": "договор FinKit",
         "finkit_investment_detail": "детали займа FinKit",
+        "finkit_name_match": "точное ФИО из базы + FinKit",
         "zaimis_contract_pdf": "договор ЗАЙМись",
     }
     if value in direct:

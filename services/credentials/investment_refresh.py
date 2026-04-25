@@ -39,6 +39,10 @@ _last_investment_refresh: datetime | None = None
 INVESTMENT_REFRESH_INTERVAL_DAYS = 3
 
 
+def _normalize_name(value: str | None) -> str:
+    return (value or "").strip().upper().replace("Ё", "Е")
+
+
 def _cookie_headers(parser) -> dict[str, str]:
     cookie_str = "; ".join(f"{key}={value}" for key, value in parser._session_cookies.items())
     return {"Accept": "application/json", "Referer": "https://finkit.by/", "Cookie": cookie_str}
@@ -54,6 +58,23 @@ def _extract_document_id_from_pdf(pdf_bytes: bytes) -> str | None:
                 if len(document_id) == 14:
                     return document_id
     return None
+
+
+async def _lookup_finkit_enrichment_state(
+    borrower_name: str,
+    borrower_user_id: str | None,
+) -> tuple[str | None, bool]:
+    if not borrower_user_id:
+        return None, False
+    existing = await lookup_borrower("finkit", borrower_user_id)
+    if not existing:
+        return None, False
+    if _normalize_name(existing.get("full_name")) and _normalize_name(existing.get("full_name")) != _normalize_name(borrower_name):
+        return None, False
+    document_id = existing.get("document_id")
+    if not document_id:
+        return None, False
+    return document_id, await lookup_borrower_contacts(document_id) is not None
 
 
 async def _enrich_finkit_borrower_from_detail(
@@ -101,7 +122,7 @@ async def _enrich_finkit_borrower_from_detail(
                 borrower_user_id=resolved_borrower_user_id,
                 full_name=borrower_name,
                 document_id=document_id,
-                source=f"finkit_name_match_{user_tag}",
+                source="finkit_name_match",
             )
             log.info("Finkit midnight name-match: %s → ИН %s", borrower_name, document_id)
             document_enriched = True
@@ -113,7 +134,7 @@ async def _enrich_finkit_borrower_from_detail(
             full_name=borrower_name,
             borrower_phone=detail.get("borrower_phone_number"),
             borrower_email=detail.get("borrower_email"),
-            source=f"finkit_investment_detail_{user_tag}",
+            source="finkit_investment_detail",
         )
         contacts_updated = True
 
@@ -227,34 +248,42 @@ async def refresh_investments(bot) -> None:
                 contacts_enriched = 0
                 for borrower_name, stats in name_stats.items():
                     borrower_user_id = name_to_borrower_id.get(borrower_name)
-                    if name_to_inv_ids.get(borrower_name):
-                        investment_id = name_to_inv_ids[borrower_name][0]
-                        enrichment_needed = not borrower_user_id
-                        if borrower_user_id and not enrichment_needed:
-                            existing = await lookup_borrower("finkit", borrower_user_id)
-                            document_id = existing.get("document_id") if existing else None
-                            enrichment_needed = not document_id
-                            if document_id and not enrichment_needed:
-                                enrichment_needed = await lookup_borrower_contacts(document_id) is None
-
+                    investment_ids = name_to_inv_ids.get(borrower_name) or []
+                    if investment_ids:
+                        document_id, has_contacts = await _lookup_finkit_enrichment_state(
+                            borrower_name,
+                            borrower_user_id,
+                        )
+                        enrichment_needed = not document_id or not has_contacts
                         try:
                             if enrichment_needed:
-                                previous_user_id = borrower_user_id
-                                borrower_user_id, document_enriched, contacts_updated = await _enrich_finkit_borrower_from_detail(
-                                    session,
-                                    headers,
-                                    user_tag=user_tag,
-                                    borrower_name=borrower_name,
-                                    investment_id=investment_id,
-                                    borrower_user_id=borrower_user_id,
-                                )
-                                if borrower_user_id and borrower_user_id != previous_user_id:
-                                    name_to_borrower_id[borrower_name] = borrower_user_id
-                                if document_enriched:
+                                borrower_pdf_enriched = False
+                                borrower_contacts_enriched = False
+                                for investment_id in investment_ids:
+                                    previous_user_id = borrower_user_id
+                                    borrower_user_id, document_enriched, contacts_updated = await _enrich_finkit_borrower_from_detail(
+                                        session,
+                                        headers,
+                                        user_tag=user_tag,
+                                        borrower_name=borrower_name,
+                                        investment_id=investment_id,
+                                        borrower_user_id=borrower_user_id,
+                                    )
+                                    if borrower_user_id and borrower_user_id != previous_user_id:
+                                        name_to_borrower_id[borrower_name] = borrower_user_id
+                                    borrower_pdf_enriched = borrower_pdf_enriched or document_enriched
+                                    borrower_contacts_enriched = borrower_contacts_enriched or contacts_updated
+                                    document_id, has_contacts = await _lookup_finkit_enrichment_state(
+                                        borrower_name,
+                                        borrower_user_id,
+                                    )
+                                    await asyncio.sleep(0.2)
+                                    if document_id and has_contacts:
+                                        break
+                                if borrower_pdf_enriched:
                                     pdf_enriched += 1
-                                if contacts_updated:
+                                if borrower_contacts_enriched:
                                     contacts_enriched += 1
-                            await asyncio.sleep(0.2)
                         except Exception as exc:
                             log.warning("Finkit detail fetch error for %s: %s", borrower_name, exc)
 

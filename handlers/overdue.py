@@ -4,8 +4,6 @@ import json
 import logging
 from pathlib import Path
 from html import escape
-from urllib.parse import quote
-
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -1086,21 +1084,11 @@ async def cb_overdue_sms(callback: CallbackQuery):
         text_content=sms_text,
         payload=serialize_case_payload(case, None),
     )
-    sms_deeplink = None
+    message_text = f"✉️ <b>SMS</b>\n\n<pre>{escape(sms_text)}</pre>"
     if case.get("borrower_phone"):
-        sms_deeplink = f"sms:{case['borrower_phone']}?body={quote(sms_text)}"
+        message_text += f"\n\n<b>Номер:</b> <code>{escape(str(case['borrower_phone']))}</code>"
     await callback.message.edit_text(
-        f"✉️ <b>SMS</b>\n\n<pre>{escape(sms_text)}</pre>"
-        + (
-            f"\n\n<b>Номер:</b> <code>{escape(str(case['borrower_phone']))}</code>"
-            if case.get("borrower_phone")
-            else ""
-        ),
-        + (
-            f"\n<b>Deeplink:</b> <code>{escape(sms_deeplink)}</code>"
-            if sms_deeplink
-            else ""
-        ),
+        message_text,
         reply_markup=_sms_result_kb(case, sms_text),
         parse_mode="HTML",
     )

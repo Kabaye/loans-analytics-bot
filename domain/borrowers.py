@@ -30,6 +30,7 @@ class BorrowEntry:
     full_name: Optional[str] = None
     document_id: Optional[str] = None
     display_name: Optional[str] = None
+    display_names: list[str] = field(default_factory=list)
 
     is_income_confirmed: Optional[bool] = None
     is_employed: Optional[bool] = None
@@ -62,9 +63,11 @@ class BorrowEntry:
     kb_total_invested: Optional[float] = None
 
     bi_loan_status: Optional[str] = None
+    bi_loan_status_details_json: Optional[str] = None
     bi_sum_category: Optional[str] = None
     bi_rating: Optional[float] = None
     enrichment_source: Optional[str] = None
+    source_account_tag: Optional[str] = None
 
     loan_url: Optional[str] = None
     raw_data: Optional[dict] = field(default=None, repr=False)
@@ -90,6 +93,8 @@ class BorrowEntry:
             "full_name": self.full_name,
             "document_id": self.document_id,
             "display_name": self.display_name,
+            "display_names": self.display_names,
+            "current_display_name": self.display_name or (self.display_names[-1] if self.display_names else None),
             "is_income_confirmed": self.is_income_confirmed,
             "is_employed": self.is_employed,
             "has_active_loan": self.has_active_loan,
@@ -113,7 +118,9 @@ class BorrowEntry:
             "kb_avg_rating": self.kb_avg_rating,
             "kb_last_rating": self.kb_last_rating,
             "kb_total_invested": self.kb_total_invested,
+            "loan_status_details_json": self.bi_loan_status_details_json,
             "enrichment_source": self.enrichment_source,
+            "source_account_tag": self.source_account_tag,
             "loan_url": self.loan_url,
         }
         if self.raw_data:

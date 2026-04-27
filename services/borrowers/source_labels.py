@@ -9,19 +9,20 @@ def humanize_borrower_source(source: str | None) -> str | None:
         return None
 
     direct = {
-        "added": "добавлено вручную",
+        "added": "поиск",
+        "search": "поиск / проверка ОПИ",
         "manual": "введено вручную",
         "sheets": "таблица / импорт",
-        "opi": "ОПИ",
+        "opi": "поиск / проверка ОПИ",
         "finkit": "текущий кейс FinKit",
         "zaimis": "текущий кейс ЗАЙМись",
         "kapusta": "текущий кейс Kapusta",
         "finkit_borrow": "архив FinKit",
         "zaimis_borrow": "архив ЗАЙМись",
         "kapusta_borrow": "архив Kapusta",
-        "finkit_claim_pdf": "претензия FinKit",
         "finkit_contract_pdf": "договор FinKit",
         "finkit_investment_detail": "детали займа FinKit",
+        "zaimis_investment_detail": "детали займа ЗАЙМись",
         "finkit_name_match": "точное ФИО из базы + архив FinKit",
         "zaimis_contract_pdf": "договор ЗАЙМись",
     }
@@ -30,6 +31,8 @@ def humanize_borrower_source(source: str | None) -> str | None:
 
     if value.startswith("finkit_investment_detail"):
         return "детали займа FinKit"
+    if value.startswith("zaimis_investment_detail"):
+        return "детали займа ЗАЙМись"
     if value.startswith("finkit_name_match"):
         return "точное ФИО из базы + архив FinKit"
     if value.startswith("finkit_archive_"):
@@ -38,8 +41,10 @@ def humanize_borrower_source(source: str | None) -> str | None:
         return "архив ЗАЙМись"
     if value.startswith("kapusta_archive_"):
         return "архив Kapusta"
+    if value.startswith("finkit_claim_pdf"):
+        return "детали займа FinKit"
     if value.startswith("finkit_overdue_pdf_"):
-        return "документы FinKit"
+        return "детали займа FinKit"
     if value.startswith("finkit_"):
         return "FinKit"
     if value.startswith("zaimis_"):

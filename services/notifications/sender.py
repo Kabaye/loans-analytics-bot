@@ -232,8 +232,9 @@ def _format_finkit_borrower(entry: BorrowEntry) -> list[str]:
 def _format_zaimis_borrower(entry: BorrowEntry) -> list[str]:
     """Format borrower section for Zaimis notifications."""
     lines = []
-    if entry.display_name:
-        lines.append(f"\n<b>{entry.display_name}</b>")
+    current_display_name = entry.display_name or (entry.display_names[-1] if entry.display_names else None)
+    if current_display_name:
+        lines.append(f"\n<b>{current_display_name}</b>")
 
     # Employment
     if entry.is_employed is not None:
@@ -282,6 +283,8 @@ def _format_enrichment_section(entry: BorrowEntry) -> list[str]:
         if entry.document_id:
             enriched_doc_id = entry.document_id
             has_enrichment = True
+        if entry.display_names:
+            has_enrichment = True
 
     # OPI data for non-finkit (comes from enrichment)
     if entry.service != "finkit" and entry.opi_checked:
@@ -303,6 +306,10 @@ def _format_enrichment_section(entry: BorrowEntry) -> list[str]:
         lines.append(f"<b>{enriched_name}</b>")
     if enriched_doc_id:
         lines.append(f"🆔 ИН: {enriched_doc_id}")
+    if entry.service == "zaimis" and entry.display_names:
+        labels = [str(item) for item in entry.display_names if str(item).strip()]
+        if labels:
+            lines.append("Ники: " + ", ".join(labels[:-1] + [f"<b>{labels[-1]}</b>"]))
     if enriched_opi:
         lines.append(enriched_opi)
 

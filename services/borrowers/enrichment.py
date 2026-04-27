@@ -7,6 +7,10 @@ from bot.repositories.borrowers import lookup_borrower, upsert_borrower
 def _apply_cached_borrower(entry: BorrowEntry, cached: dict) -> None:
     if not entry.full_name and cached.get("full_name"):
         entry.full_name = cached["full_name"]
+    if not entry.display_name and cached.get("current_display_name"):
+        entry.display_name = cached["current_display_name"]
+    if cached.get("display_names"):
+        entry.display_names = list(cached["display_names"])
     if not entry.document_id and cached.get("document_id"):
         entry.document_id = cached["document_id"]
 
@@ -27,12 +31,16 @@ def _apply_cached_borrower(entry: BorrowEntry, cached: dict) -> None:
 
     if cached.get("loan_status"):
         entry.bi_loan_status = cached["loan_status"]
+    if cached.get("loan_status_details_json"):
+        entry.bi_loan_status_details_json = cached["loan_status_details_json"]
     if cached.get("sum_category"):
         entry.bi_sum_category = cached["sum_category"]
     if cached.get("bi_rating") is not None:
         entry.bi_rating = cached["bi_rating"]
     if cached.get("info_source") or cached.get("source"):
         entry.enrichment_source = cached.get("info_source") or cached.get("source")
+    if cached.get("source_account_tag"):
+        entry.source_account_tag = cached["source_account_tag"]
 
 
 async def enrich_entry_from_borrowers(entry: BorrowEntry) -> bool:
@@ -75,7 +83,7 @@ async def enrich_from_borrower_cache(
 
 
 def _persistable_name(entry: BorrowEntry) -> str | None:
-    return (entry.full_name or entry.display_name or "").strip() or None
+    return (entry.full_name or "").strip() or None
 
 
 async def persist_borrower_entries(entries: list[BorrowEntry], *, source: str) -> None:
@@ -83,7 +91,8 @@ async def persist_borrower_entries(entries: list[BorrowEntry], *, source: str) -
         if not entry.borrower_user_id:
             continue
         full_name = _persistable_name(entry)
-        if not full_name and not entry.document_id:
+        display_name = (entry.display_name or "").strip() or None
+        if not full_name and not display_name and not entry.document_id:
             continue
         await upsert_borrower(
             service=entry.service,
@@ -91,6 +100,8 @@ async def persist_borrower_entries(entries: list[BorrowEntry], *, source: str) -
             full_name=full_name,
             document_id=entry.document_id,
             source=source,
+            display_name=display_name,
+            display_names=entry.display_names,
         )
 
 

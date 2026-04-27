@@ -162,7 +162,7 @@ async def msg_search_query(message: Message, state: FSMContext):
     lines = [f"🔍 Найдено <b>{len(results)}</b> результатов:\n"]
     buttons = []
     for i, row in enumerate(results):
-        name = row.get("full_name") or "—"
+        name = row.get("full_name") or row.get("current_display_name") or "—"
         doc = row["document_id"]
         status = row.get("loan_status") or ""
         lines.append(f"{i+1}. {name} / <code>{doc}</code> {status}")

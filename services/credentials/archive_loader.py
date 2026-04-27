@@ -25,7 +25,8 @@ async def load_zaimis_investments(credential_id: int, login: str, password: str)
                 continue
             if buid not in stats:
                 stats[buid] = {
-                    "full_name": owner.get("displayName", ""),
+                    "full_name": None,
+                    "display_name": owner.get("displayName", ""),
                     "total": 0,
                     "settled": 0,
                     "overdue": 0,
@@ -60,6 +61,7 @@ async def load_zaimis_investments(credential_id: int, login: str, password: str)
                 service="zaimis",
                 borrower_user_id=buid,
                 full_name=borrower["full_name"] or None,
+                display_name=borrower["display_name"] or None,
                 total_loans=borrower["total"],
                 settled_loans=borrower["settled"],
                 overdue_loans=borrower["overdue"],
@@ -113,9 +115,9 @@ async def load_finkit_investments(credential_id: int, login: str, password: str)
                 borrower = borrower_stats[buid]
                 borrower["total"] += 1
                 status = inv.get("status")
-                if status == "settled":
+                if inv.get("closed") is True:
                     borrower["settled"] += 1
-                if inv.get("is_overdue"):
+                if inv.get("is_overdue") and not inv.get("closed"):
                     borrower["overdue"] += 1
                 try:
                     borrower["invested"] += float(inv.get("amount", 0))

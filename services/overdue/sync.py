@@ -5,7 +5,12 @@ import logging
 from datetime import datetime, timezone
 
 from bot.integrations.geolocation_client import lookup_belarus_zip
-from bot.repositories.borrowers import lookup_borrower, upsert_borrower
+from bot.repositories.borrowers import (
+    lookup_borrower,
+    refresh_borrower_statuses,
+    upsert_borrower,
+    upsert_borrower_contacts,
+)
 from bot.repositories.overdue import (
     clear_finkit_suspect_address,
     deactivate_missing_overdue_cases,
@@ -88,6 +93,7 @@ async def sync_finkit_overdue_cases() -> tuple[int, list[str]]:
                 items = await parser.fetch_investments()
 
             credential_seen: set[str] = set()
+            touched_document_ids: set[str] = set()
             for item in items:
                 if not item.get("is_overdue"):
                     continue
@@ -136,8 +142,10 @@ async def sync_finkit_overdue_cases() -> tuple[int, list[str]]:
                                 borrower_user_id=borrower_user_id,
                                 full_name=pdf_full_name,
                                 document_id=pdf_document_id,
-                                source=f"finkit_overdue_pdf_{telegram_user_tag(cred)}",
+                                source=f"finkit_archive_{telegram_user_tag(cred)}",
                             )
+                            if pdf_document_id:
+                                touched_document_ids.add(pdf_document_id)
                 claim_address = None
                 claim_zip = None
                 claim_phone = None
@@ -182,6 +190,7 @@ async def sync_finkit_overdue_cases() -> tuple[int, list[str]]:
                 )
                 await clear_finkit_suspect_address(case_id, address, zip_code)
                 if claim_address or claim_zip or claim_phone or claim_email or detail.get("borrower_phone_number") or detail.get("borrower_email"):
+                    resolved_document_id = (cached or {}).get("document_id") or pdf_document_id
                     await update_overdue_case_contacts(
                         case_id,
                         cred.chat_id,
@@ -189,8 +198,19 @@ async def sync_finkit_overdue_cases() -> tuple[int, list[str]]:
                         borrower_zip=claim_zip,
                         borrower_phone=claim_phone or detail.get("borrower_phone_number"),
                         borrower_email=claim_email or detail.get("borrower_email"),
-                        contact_source="finkit_claim_pdf" if claim_address or claim_phone or claim_email else "finkit_investment_detail",
+                        contact_source="finkit_investment_detail",
                     )
+                    if resolved_document_id:
+                        touched_document_ids.add(resolved_document_id)
+                        await upsert_borrower_contacts(
+                            resolved_document_id,
+                            full_name=(cached or {}).get("full_name") or pdf_full_name or _coalesce(detail.get("borrower_full_name"), item.get("borrower_full_name")),
+                            borrower_phone=claim_phone or detail.get("borrower_phone_number"),
+                            borrower_email=claim_email or detail.get("borrower_email"),
+                            borrower_address=claim_address,
+                            borrower_zip=claim_zip,
+                            source=f"finkit_investment_detail_{telegram_user_tag(cred)}",
+                        )
                 synced += 1
                 await asyncio.sleep(0.05)
             await deactivate_missing_overdue_cases(
@@ -199,6 +219,7 @@ async def sync_finkit_overdue_cases() -> tuple[int, list[str]]:
                 sorted(credential_seen),
                 credential_id=cred.id,
             )
+            await refresh_borrower_statuses(touched_document_ids)
         except Exception as exc:
             errors.append(f"Finkit overdue {cred.login}: {exc}")
 
@@ -226,6 +247,7 @@ async def sync_zaimis_overdue_cases() -> tuple[int, list[str]]:
                 orders = await parser.fetch_investments()
 
             credential_seen: set[str] = set()
+            touched_document_ids: set[str] = set()
             for order in orders:
                 state = order.get("state")
                 if state not in (4, "4", "overdue") and not order.get("isOverdue"):
@@ -266,7 +288,7 @@ async def sync_zaimis_overdue_cases() -> tuple[int, list[str]]:
                     account_label=cred.login,
                     borrower_user_id=borrower_user_id or None,
                     document_id=(cached or {}).get("document_id"),
-                    full_name=(cached or {}).get("full_name") or cp.get("fullName") or cp.get("displayName"),
+                    full_name=(cached or {}).get("full_name") or cp.get("fullName"),
                     display_name=cp.get("displayName"),
                     issued_at=_coalesce(detail.get("createdAt"), order.get("createdAt"), offer.get("createdAt")),
                     due_at=due_at,
@@ -282,6 +304,8 @@ async def sync_zaimis_overdue_cases() -> tuple[int, list[str]]:
                     loan_url=None,
                     raw_data={"order": order, "detail": detail},
                 )
+                if (cached or {}).get("document_id"):
+                    touched_document_ids.add(str((cached or {}).get("document_id")))
                 synced += 1
                 await asyncio.sleep(0.05)
             await deactivate_missing_overdue_cases(
@@ -290,6 +314,7 @@ async def sync_zaimis_overdue_cases() -> tuple[int, list[str]]:
                 sorted(credential_seen),
                 credential_id=cred.id,
             )
+            await refresh_borrower_statuses(touched_document_ids)
         except Exception as exc:
             errors.append(f"Zaimis overdue {cred.login}: {exc}")
 

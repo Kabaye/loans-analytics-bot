@@ -1,12 +1,58 @@
 from __future__ import annotations
 
+import json
 import logging
+import re
 
 import aiosqlite
 
 from bot.config import DB_PATH
 
 log = logging.getLogger(__name__)
+
+_LEGAL_FULL_NAME_RE = re.compile(r"^[A-ZА-ЯЁ]+(?:[-'][A-ZА-ЯЁ]+)?(?:\s+[A-ZА-ЯЁ]+(?:[-'][A-ZА-ЯЁ]+)?){2,}$")
+
+
+def _normalize_compare(value: str | None) -> str:
+    return (value or "").strip().upper().replace("Ё", "Е")
+
+
+def _is_probable_legal_full_name(value: str | None) -> bool:
+    normalized = (value or "").strip().upper()
+    if not normalized or any(char.isdigit() for char in normalized):
+        return False
+    return bool(_LEGAL_FULL_NAME_RE.fullmatch(normalized))
+
+
+def _parse_display_names(value: str | None) -> list[str]:
+    if not value:
+        return []
+    try:
+        raw = json.loads(value)
+    except json.JSONDecodeError:
+        raw = [value]
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in raw if isinstance(raw, list) else [value]:
+        text = str(item or "").strip()
+        key = _normalize_compare(text)
+        if not text or not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+    return result
+
+
+def _merge_display_names(existing: str | None, incoming: str | None) -> str | None:
+    items = _parse_display_names(existing)
+    seen = {_normalize_compare(item) for item in items}
+    text = str(incoming or "").strip()
+    key = _normalize_compare(text)
+    if text and key:
+        if key in seen:
+            items = [item for item in items if _normalize_compare(item) != key]
+        items.append(text)
+    return json.dumps(items, ensure_ascii=False) if items else None
 
 
 async def get_db() -> aiosqlite.Connection:
@@ -71,6 +117,7 @@ async def init_db() -> None:
             borrower_user_id    TEXT NOT NULL,
             document_id         TEXT,
             full_name           TEXT,
+            display_names       TEXT,
             total_loans         INTEGER DEFAULT 0,
             settled_loans       INTEGER DEFAULT 0,
             overdue_loans       INTEGER DEFAULT 0,
@@ -87,6 +134,7 @@ async def init_db() -> None:
             document_id         TEXT PRIMARY KEY,
             full_name           TEXT,
             loan_status         TEXT,
+            loan_status_details_json TEXT,
             sum_category        TEXT,
             rating              REAL,
             notes               TEXT,
@@ -98,6 +146,10 @@ async def init_db() -> None:
             opi_full_name       TEXT,
             total_invested      REAL,
             source              TEXT DEFAULT 'auto',
+            source_account_tag  TEXT,
+            borrower_address    TEXT,
+            borrower_zip        TEXT,
+            contact_source      TEXT,
             created_at          TEXT DEFAULT (datetime('now')),
             updated_at          TEXT DEFAULT (datetime('now'))
         );
@@ -260,9 +312,15 @@ async def init_db() -> None:
         for definition in (
             "borrower_phone TEXT",
             "borrower_email TEXT",
+            "borrower_address TEXT",
+            "borrower_zip TEXT",
             "contact_source TEXT",
+            "loan_status_details_json TEXT",
+            "source_account_tag TEXT",
         ):
             await _try_add_column(db, "borrower_info", definition)
+
+        await _try_add_column(db, "borrowers", "display_names TEXT")
 
         for definition in ("require_employed INTEGER", "require_income_confirmed INTEGER"):
             await _try_add_column(db, "subscriptions", definition)
@@ -319,7 +377,8 @@ async def init_db() -> None:
         ):
             await db.execute(f"DROP TABLE IF EXISTS {table_name}")
 
-        await db.execute("UPDATE borrower_info SET source = 'added' WHERE source = 'manual'")
+        await db.execute("UPDATE borrower_info SET source = 'search' WHERE source IN ('added', 'opi')")
+        await db.execute("UPDATE borrower_info SET contact_source = 'manual' WHERE contact_source = 'added'")
 
         await db.execute("""
             UPDATE borrower_info
@@ -344,6 +403,47 @@ async def init_db() -> None:
                     GROUP BY document_id
                     HAVING COUNT(DISTINCT service) = 1 AND MAX(service) = 'zaimis'
               )
+        """)
+
+        await db.execute("""
+            UPDATE borrower_info
+            SET source_account_tag = substr(source, length('finkit_archive_') + 1),
+                source = 'finkit_borrow'
+            WHERE source LIKE 'finkit_archive_%'
+        """)
+        await db.execute("""
+            UPDATE borrower_info
+            SET source_account_tag = substr(source, length('zaimis_archive_') + 1),
+                source = 'zaimis_borrow'
+            WHERE source LIKE 'zaimis_archive_%'
+        """)
+        await db.execute("""
+            UPDATE borrower_info
+            SET source_account_tag = substr(source, length('finkit_overdue_pdf_') + 1),
+                source = 'finkit_investment_detail'
+            WHERE source LIKE 'finkit_overdue_pdf_%'
+        """)
+        await db.execute("""
+            UPDATE borrower_info
+            SET source_account_tag = substr(source, length('finkit_investment_detail_') + 1),
+                source = 'finkit_investment_detail'
+            WHERE source LIKE 'finkit_investment_detail_%'
+        """)
+        await db.execute("""
+            UPDATE borrower_info
+            SET source = 'finkit_investment_detail'
+            WHERE source = 'finkit_claim_pdf'
+        """)
+        await db.execute("""
+            UPDATE borrower_info
+            SET source_account_tag = substr(contact_source, length('finkit_investment_detail_') + 1),
+                contact_source = 'finkit_investment_detail'
+            WHERE contact_source LIKE 'finkit_investment_detail_%'
+        """)
+        await db.execute("""
+            UPDATE borrower_info
+            SET contact_source = 'finkit_investment_detail'
+            WHERE contact_source = 'finkit_claim_pdf'
         """)
 
         try:
@@ -392,6 +492,7 @@ async def init_db() -> None:
                     borrower_user_id    TEXT NOT NULL,
                     document_id         TEXT,
                     full_name           TEXT,
+                    display_names       TEXT,
                     total_loans         INTEGER DEFAULT 0,
                     settled_loans       INTEGER DEFAULT 0,
                     overdue_loans       INTEGER DEFAULT 0,
@@ -404,10 +505,10 @@ async def init_db() -> None:
             """)
             await db.execute("""
                 INSERT OR IGNORE INTO borrowers_new
-                    (id, service, borrower_user_id, document_id, full_name,
+                    (id, service, borrower_user_id, document_id, full_name, display_names,
                      total_loans, settled_loans, overdue_loans, avg_rating, total_invested,
                      first_seen, last_seen)
-                SELECT id, service, borrower_user_id, document_id, full_name,
+                SELECT id, service, borrower_user_id, document_id, full_name, display_names,
                        total_loans, settled_loans, overdue_loans, avg_rating, total_invested,
                        first_seen, last_seen
                 FROM borrowers
@@ -418,6 +519,35 @@ async def init_db() -> None:
             log.info("Migrated %d borrowers -> borrower_info, dropped OPI columns from borrowers", migrated)
         except aiosqlite.OperationalError:
             pass
+
+        rows = await db.execute_fetchall(
+            """
+            SELECT id, service, document_id, full_name, display_names
+            FROM borrowers
+            WHERE service = 'zaimis'
+            """
+        )
+        migrated_display_names = 0
+        for row in rows:
+            full_name = str(row["full_name"] or "").strip()
+            if not full_name or _is_probable_legal_full_name(full_name):
+                continue
+            merged = _merge_display_names(row["display_names"], full_name)
+            await db.execute(
+                """
+                UPDATE borrowers
+                SET display_names = ?,
+                    full_name = CASE
+                        WHEN document_id IS NULL OR TRIM(document_id) = '' THEN NULL
+                        ELSE full_name
+                    END
+                WHERE id = ?
+                """,
+                (merged, row["id"]),
+            )
+            migrated_display_names += 1
+        if migrated_display_names:
+            log.info("Backfilled display_names for %d Zaimis borrowers", migrated_display_names)
 
         for service, enabled, interval, hour_start, hour_end in [
             ("kapusta", 1, 600, 8, 23),

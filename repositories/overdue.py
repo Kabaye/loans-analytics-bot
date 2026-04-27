@@ -184,11 +184,12 @@ async def lookup_latest_borrower_contacts(document_id: str) -> dict | None:
     try:
         rows = await db.execute_fetchall(
             """
-            SELECT document_id, full_name, service, borrower_phone, borrower_email, raw_data
+            SELECT document_id, full_name, display_name, service, borrower_phone, borrower_email, borrower_address, borrower_zip, raw_data
             FROM overdue_cases
             WHERE document_id = ?
               AND (NULLIF(TRIM(COALESCE(borrower_phone, '')), '') IS NOT NULL
-                   OR NULLIF(TRIM(COALESCE(borrower_email, '')), '') IS NOT NULL)
+                   OR NULLIF(TRIM(COALESCE(borrower_email, '')), '') IS NOT NULL
+                   OR NULLIF(TRIM(COALESCE(borrower_address, '')), '') IS NOT NULL)
             ORDER BY is_active DESC, updated_at DESC, id DESC
             LIMIT 1
             """,
@@ -207,9 +208,12 @@ async def lookup_latest_borrower_contacts(document_id: str) -> dict | None:
         return {
             "document_id": row.get("document_id"),
             "full_name": row.get("full_name"),
+            "current_display_name": row.get("display_name"),
             "service": row.get("service"),
             "phone": row.get("borrower_phone"),
             "email": row.get("borrower_email"),
+            "address": row.get("borrower_address"),
+            "zip": row.get("borrower_zip"),
             "source": source,
         }
     finally:

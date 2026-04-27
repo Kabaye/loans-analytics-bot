@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 
 from bot.integrations.opi_client import OPIChecker
@@ -38,15 +39,33 @@ def format_borrower_card(info: dict) -> str:
     lines.append(f"\n<b>ИН:</b> <code>{info['document_id']}</code>")
     if info.get("full_name"):
         lines.append(f"<b>ФИО:</b> {info['full_name']}")
+    elif info.get("current_display_name"):
+        lines.append(f"<b>Текущий ник:</b> {info['current_display_name']}")
+    if info.get("display_names"):
+        names = [str(item) for item in info["display_names"] if str(item).strip()]
+        if names:
+            highlighted = ", ".join(names[:-1] + [f"<b>{names[-1]}</b>"])
+            lines.append(f"<b>Ники:</b> {highlighted}")
 
     if info.get("loan_status"):
         status_icon = {
             "в срок": "✅",
-            "просрочка до 20 дней": "⚠️",
-            "просрочка > 20 дней": "🔶",
-            "все плохо": "🔴",
+            "текущий": "ℹ️",
+            "просрочка до 5 дней": "⚠️",
+            "просрочка 6-30 дней": "🔶",
+            "просрочка > 30 дней": "🔴",
+            "закрыт, были просрочки": "⚠️",
         }.get(info["loan_status"], "📋")
         lines.append(f"<b>Статус:</b> {status_icon} {info['loan_status']}")
+    if info.get("loan_status_details_json"):
+        try:
+            details = info["loan_status_details_json"]
+            if isinstance(details, str):
+                details = json.loads(details)
+        except Exception:
+            details = None
+        if isinstance(details, list) and details:
+            lines.append("<b>Детали:</b> " + " → ".join(str(item) for item in details if str(item).strip()))
 
     if info.get("sum_category"):
         lines.append(f"<b>Категория сумм:</b> {info['sum_category']}")
@@ -84,10 +103,18 @@ def format_contact_card(document_id: str, payload: dict) -> str:
     lines.append(f"<b>ИН:</b> <code>{document_id}</code>")
     if payload.get("full_name"):
         lines.append(payload["full_name"])
+    elif payload.get("current_display_name"):
+        lines.append(payload["current_display_name"])
+    if payload.get("display_names"):
+        names = [str(item) for item in payload["display_names"] if str(item).strip()]
+        if names:
+            lines.append("<b>Ники:</b> " + ", ".join(names[:-1] + [f"<b>{names[-1]}</b>"]))
     if payload.get("phone"):
         lines.append(f"<b>Телефон:</b> <code>{payload['phone']}</code>")
     if payload.get("email"):
         lines.append(f"<b>Email:</b> <code>{payload['email']}</code>")
+    if payload.get("address"):
+        lines.append(f"<b>Адрес:</b> {payload['address']}")
     if payload.get("service"):
         lines.append(f"<b>Сервис:</b> {SERVICE_NAMES.get(str(payload['service']), str(payload['service']))}")
     source_label = humanize_borrower_source(payload.get("source"))
@@ -103,9 +130,12 @@ async def lookup_borrower_contact_info(document_id: str) -> dict | None:
         return {
             "document_id": document_id,
             "full_name": payload.get("full_name") or overdue_payload.get("full_name"),
+            "display_names": payload.get("display_names") or overdue_payload.get("display_names") or [],
+            "current_display_name": payload.get("current_display_name") or overdue_payload.get("current_display_name"),
             "service": overdue_payload.get("service"),
             "phone": payload.get("phone") or overdue_payload.get("phone"),
             "email": payload.get("email") or overdue_payload.get("email"),
+            "address": payload.get("address") or overdue_payload.get("address"),
             "source": payload.get("source") or overdue_payload.get("source"),
         }
     return payload or overdue_payload
@@ -186,7 +216,8 @@ async def _backfill_finkit_contacts(document_ids: list[str]) -> None:
 async def ensure_borrower_contact_info(document_ids: list[str]) -> None:
     missing: list[str] = []
     for document_id in document_ids:
-        if not await lookup_borrower_contact_info(document_id):
+        payload = await lookup_borrower_contact_info(document_id)
+        if not payload or (not payload.get("phone") and not payload.get("email")):
             missing.append(document_id)
     if missing:
         await _backfill_finkit_contacts(missing)
@@ -201,9 +232,16 @@ async def run_opi_batch(doc_ids: list[str]) -> str:
             info = await lookup_borrower_info(doc_id)
             contacts = await lookup_borrower_contact_info(doc_id)
             result = await checker.check(doc_id)
+            if not info or not info.get("source"):
+                await upsert_borrower_info(
+                    document_id=doc_id,
+                    full_name=result.full_name,
+                    source="search",
+                )
+                info = await lookup_borrower_info(doc_id)
 
             lines.append(f"{idx}. <code>{doc_id}</code>")
-            full_name = (info or {}).get("full_name") or result.full_name
+            full_name = (info or {}).get("full_name") or result.full_name or (info or {}).get("current_display_name")
             if full_name:
                 lines.append(full_name)
             if info and info.get("loan_status"):
@@ -252,7 +290,7 @@ async def add_borrower_and_refresh_opi(
         full_name=full_name,
         loan_status=loan_status,
         sum_category=sum_category,
-        source="added",
+        source="search",
     )
     checker = OPIChecker()
     try:

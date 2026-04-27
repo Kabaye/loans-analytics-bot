@@ -223,9 +223,9 @@ async def refresh_investments(bot) -> None:
                         name_to_inv_ids[borrower_name] = []
                     stats = name_stats[borrower_name]
                     stats["total"] += 1
-                    if investment.get("status") == "settled" and investment.get("closed", False):
+                    if investment.get("closed", False):
                         stats["settled"] += 1
-                    if investment.get("is_overdue"):
+                    if investment.get("is_overdue") and not investment.get("closed", False):
                         stats["overdue"] += 1
                     try:
                         stats["invested"] += float(investment.get("amount", 0))
@@ -350,7 +350,8 @@ async def refresh_investments(bot) -> None:
                     offer = order.get("offer", {}) or {}
                     if borrower_user_id not in zaimis_stats:
                         zaimis_stats[borrower_user_id] = {
-                            "full_name": counterparty.get("displayName", ""),
+                            "full_name": None,
+                            "display_name": counterparty.get("displayName", ""),
                             "total": 0,
                             "settled": 0,
                             "overdue": 0,
@@ -383,6 +384,7 @@ async def refresh_investments(bot) -> None:
                         service="zaimis",
                         borrower_user_id=borrower_user_id,
                         full_name=stats["full_name"] or None,
+                        display_name=stats["display_name"] or None,
                         total_loans=stats["total"],
                         settled_loans=stats["settled"],
                         overdue_loans=stats["overdue"],

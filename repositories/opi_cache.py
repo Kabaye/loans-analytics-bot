@@ -2,10 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from bot.repositories.borrower_info_sql import (
-    _BORROWER_INFO_FULL_NAME_SQL,
-    _BORROWER_INFO_SOURCE_SQL,
-)
+from bot.repositories.borrower_info_sql import _BORROWER_INFO_FULL_NAME_SQL
 from bot.repositories.db import get_db
 
 
@@ -36,11 +33,10 @@ async def save_opi_result(
     try:
         await db.execute(
             f"""
-            INSERT INTO borrower_info (document_id, full_name, source)
-            VALUES (?, ?, 'opi')
+            INSERT INTO borrower_info (document_id, full_name)
+            VALUES (?, ?)
             ON CONFLICT(document_id) DO UPDATE SET
                 full_name = {_BORROWER_INFO_FULL_NAME_SQL},
-                source = {_BORROWER_INFO_SOURCE_SQL},
                 updated_at = datetime('now')
             """,
             (document_id, full_name),

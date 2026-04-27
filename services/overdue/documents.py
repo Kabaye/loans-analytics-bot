@@ -25,6 +25,7 @@ GENERATED_DOCS_DIR = Path(config.BASE_DIR) / "data" / "generated-docs"
 GENERATED_DOCS_TTL_DAYS = 5
 SMS_MAX_LEN = 140
 CLAIM_VOLUNTARY_TERM_DAYS = 7
+CLAIM_FONT_SIZE_PT = 13
 SMS_SERVICE_NAMES = {
     "finkit": "ФинКит",
     "zaimis": "ЗАЙМись",
@@ -395,6 +396,7 @@ def _claim_blocks(case: dict, creditor: dict) -> list[dict]:
         "взыскание с вас принудительного сбора в бюджет судебным исполнителем на стадии принудительного исполнения исполнительного документа, а также иных расходов по исполнению исполнительного документа;",
         "наложение ареста на ваше имущество, ограничение права на выезд из Республики Беларусь, ограничение права управления транспортным средством и иные меры, необходимые для обеспечения исполнения решения суда;",
         "обращение взыскания на ваше имущество, заработную плату и иные доходы, а также направление исполнительного документа по месту работы для удержаний;",
+        "обращение взыскания на денежные средства на ваших банковских счетах и электронных кошельках, а также списание средств в счет погашения задолженности в рамках исполнительного производства;",
         "ухудшение вашей кредитной истории и, как следствие, сложности с получением в будущем кредита, займа или лизинга.",
     ]
     payment_sentence = (
@@ -408,6 +410,14 @@ def _claim_blocks(case: dict, creditor: dict) -> list[dict]:
             "text": (
                 f"Направляю настоящую претензию по договору займа № {_loan_ref(case)} от {_date(case.get('issued_at'))}, "
                 f"оформленному через сервис {service_name}, с требованием добровольно погасить задолженность в досудебном порядке."
+            ),
+        },
+        {
+            "type": "paragraph",
+            "text": (
+                "**Настоящая претензия является последней возможностью урегулировать вопрос без подачи иска в суд.** "
+                "После передачи материалов в суд сумма требований будет определяться уже на дату обращения в суд, "
+                "а размер ваших расходов возрастет."
             ),
         },
         {
@@ -440,6 +450,14 @@ def _claim_blocks(case: dict, creditor: dict) -> list[dict]:
         {
             "type": "paragraph",
             "text": (
+                "**Добровольное исполнение требований до обращения в суд является для вас финансово наиболее выгодным вариантом.** "
+                "После начала судебного и исполнительного производства возможность урегулировать вопрос на более мягких условиях "
+                "может быть утрачена."
+            ),
+        },
+        {
+            "type": "paragraph",
+            "text": (
                 "**В случае неисполнения** требований в добровольном порядке задолженность будет предъявлена "
                 "к **судебному** и последующему **принудительному взысканию**."
             ),
@@ -467,9 +485,18 @@ def _claim_blocks(case: dict, creditor: dict) -> list[dict]:
         {
             "type": "paragraph",
             "text": (
+                "**Дополнительно предупреждаю:** при дальнейшем уклонении от исполнения обязательств информация о вашей "
+                "платежной дисциплине и наличии судебного взыскания будет объективно свидетельствовать о высокой степени "
+                "риска при последующей оценке вашей кредитоспособности."
+            ),
+        },
+        {
+            "type": "paragraph",
+            "text": (
                 f"**ИТОГОВАЯ СУММА К ОПЛАТЕ НА {snapshot_date}: {amount_total}. "
-                "ПРИ НЕОПЛАТЕ Я БУДУ ВЫНУЖДЕН ОБРАТИТЬСЯ В СУД ЗА ВЗЫСКАНИЕМ ДОЛГА, ГОСПОШЛИНЫ, "
-                "РАСХОДОВ НА ПРЕДСТАВИТЕЛЯ И ИНЫХ ИЗДЕРЖЕК.**"
+                "ПРИ НЕОПЛАТЕ Я БУДУ ВЫНУЖДЕН НЕЗАМЕДЛИТЕЛЬНО ОБРАТИТЬСЯ В СУД ЗА ВЗЫСКАНИЕМ ДОЛГА, "
+                "ГОСПОШЛИНЫ, РАСХОДОВ НА ПРЕДСТАВИТЕЛЯ И ИНЫХ ИЗДЕРЖЕК, А ТАКЖЕ ИНИЦИИРОВАТЬ "
+                "ПОСЛЕДУЮЩЕЕ ПРИНУДИТЕЛЬНОЕ ИСПОЛНЕНИЕ.**"
             ),
         },
     ]
@@ -495,7 +522,7 @@ def _claim_titles(case: dict) -> tuple[str, str]:
 def _set_default_style(doc: Document) -> None:
     style = doc.styles["Normal"]
     style.font.name = "Times New Roman"
-    style.font.size = Pt(12)
+    style.font.size = Pt(CLAIM_FONT_SIZE_PT)
     section = doc.sections[0]
     section.top_margin = Mm(18)
     section.bottom_margin = Mm(18)
@@ -509,13 +536,13 @@ def _add_block(doc: Document, title: str, lines: list[str]) -> None:
     p.paragraph_format.space_after = Pt(3)
     run = p.add_run(title)
     run.bold = True
-    run.font.size = Pt(12)
+    run.font.size = Pt(CLAIM_FONT_SIZE_PT)
     for line in lines:
         p = doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
         p.paragraph_format.space_after = Pt(1)
         run = p.add_run(line)
-        run.font.size = Pt(12)
+        run.font.size = Pt(CLAIM_FONT_SIZE_PT)
 
 
 def _add_body_paragraph(doc: Document, text: str):
@@ -531,7 +558,7 @@ def _add_body_paragraph(doc: Document, text: str):
         is_bold = part.startswith("**") and part.endswith("**") and len(part) >= 4
         content = part[2:-2] if is_bold else part
         run = p.add_run(content)
-        run.font.size = Pt(12)
+        run.font.size = Pt(CLAIM_FONT_SIZE_PT)
         run.bold = is_bold
     return p
 
@@ -544,7 +571,7 @@ def _add_bullet_paragraph(doc: Document, text: str):
     p.paragraph_format.space_after = Pt(3)
     p.paragraph_format.line_spacing = 1.1
     bullet = p.add_run("- ")
-    bullet.font.size = Pt(12)
+    bullet.font.size = Pt(CLAIM_FONT_SIZE_PT)
     parts = re.split(r"(\*\*.*?\*\*)", text)
     for part in parts:
         if not part:
@@ -552,7 +579,7 @@ def _add_bullet_paragraph(doc: Document, text: str):
         is_bold = part.startswith("**") and part.endswith("**") and len(part) >= 4
         content = part[2:-2] if is_bold else part
         run = p.add_run(content)
-        run.font.size = Pt(12)
+        run.font.size = Pt(CLAIM_FONT_SIZE_PT)
         run.bold = is_bold
     return p
 
@@ -572,7 +599,7 @@ def _add_debt_table(doc: Document, rows: list[tuple[str, str, bool]]):
         left_run = left_par.add_run(label)
         right_run = right_par.add_run(value)
         for run in (left_run, right_run):
-            run.font.size = Pt(12)
+            run.font.size = Pt(CLAIM_FONT_SIZE_PT)
             run.bold = is_total
     return table
 
@@ -630,21 +657,21 @@ def render_claim_docx(case: dict, creditor: dict, signature_path: str) -> tuple[
     title.paragraph_format.space_after = Pt(2)
     run = title.add_run(claim_title)
     run.bold = True
-    run.font.size = Pt(14)
+    run.font.size = Pt(15)
 
     subtitle = doc.add_paragraph()
     subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
     subtitle.paragraph_format.space_after = Pt(2)
     run = subtitle.add_run(claim_subtitle)
     run.bold = True
-    run.font.size = Pt(12)
+    run.font.size = Pt(CLAIM_FONT_SIZE_PT)
 
     subject = doc.add_paragraph()
     subject.alignment = WD_ALIGN_PARAGRAPH.CENTER
     subject.paragraph_format.space_after = Pt(8)
     run = subject.add_run(f"по договору займа № {_loan_ref(case)} от {_date(case.get('issued_at'))}")
     run.bold = True
-    run.font.size = Pt(12)
+    run.font.size = Pt(CLAIM_FONT_SIZE_PT)
 
     body_paragraphs = []
     for block in _claim_blocks(case, creditor):
@@ -676,7 +703,7 @@ def render_claim_docx(case: dict, creditor: dict, signature_path: str) -> tuple[
     left_par = left_cell.paragraphs[0]
     left_par.alignment = WD_ALIGN_PARAGRAPH.LEFT
     left_run = left_par.add_run(datetime.now().strftime("%d.%m.%Y"))
-    left_run.font.size = Pt(12)
+    left_run.font.size = Pt(CLAIM_FONT_SIZE_PT)
 
     sign_par = sign_cell.paragraphs[0]
     sign_par.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -686,7 +713,7 @@ def render_claim_docx(case: dict, creditor: dict, signature_path: str) -> tuple[
     right_par = right_cell.paragraphs[0]
     right_par.alignment = WD_ALIGN_PARAGRAPH.RIGHT
     right_run = right_par.add_run(creditor.get("full_name") or "")
-    right_run.font.size = Pt(12)
+    right_run.font.size = Pt(CLAIM_FONT_SIZE_PT)
 
     doc.save(out_path)
     claim_text = build_claim_text(case, creditor)

@@ -214,13 +214,16 @@ async def run_opi_batch(doc_ids: list[str]) -> str:
                 lines.append(f"❌ ОПИ: долг {result.debt_amount:.2f} BYN")
             else:
                 lines.append("✅ ОПИ: нет задолженности")
+            info_source_label = humanize_borrower_source((info or {}).get("source"))
+            if info_source_label:
+                lines.append(f"ℹ️ Данные: {info_source_label}")
             if contacts:
                 if contacts.get("phone"):
                     lines.append(f"📞 Телефон: <code>{contacts['phone']}</code>")
                 if contacts.get("email"):
                     lines.append(f"✉️ Email: <code>{contacts['email']}</code>")
                 source_label = humanize_borrower_source(contacts.get("source"))
-                if source_label:
+                if source_label and source_label != info_source_label:
                     lines.append(f"ℹ️ Контакты: {source_label}")
             lines.append("")
     finally:

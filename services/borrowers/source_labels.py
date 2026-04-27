@@ -11,19 +11,27 @@ def humanize_borrower_source(source: str | None) -> str | None:
     direct = {
         "added": "добавлено вручную",
         "manual": "введено вручную",
+        "sheets": "таблица / импорт",
         "opi": "ОПИ",
-        "finkit_borrow": "FinKit",
-        "zaimis_borrow": "ЗАЙМись",
-        "kapusta_borrow": "Kapusta",
+        "finkit": "текущий кейс FinKit",
+        "zaimis": "текущий кейс ЗАЙМись",
+        "kapusta": "текущий кейс Kapusta",
+        "finkit_borrow": "архив FinKit",
+        "zaimis_borrow": "архив ЗАЙМись",
+        "kapusta_borrow": "архив Kapusta",
         "finkit_claim_pdf": "претензия FinKit",
         "finkit_contract_pdf": "договор FinKit",
         "finkit_investment_detail": "детали займа FinKit",
-        "finkit_name_match": "точное ФИО из базы + FinKit",
+        "finkit_name_match": "точное ФИО из базы + архив FinKit",
         "zaimis_contract_pdf": "договор ЗАЙМись",
     }
     if value in direct:
         return direct[value]
 
+    if value.startswith("finkit_investment_detail"):
+        return "детали займа FinKit"
+    if value.startswith("finkit_name_match"):
+        return "точное ФИО из базы + архив FinKit"
     if value.startswith("finkit_archive_"):
         return "архив FinKit"
     if value.startswith("zaimis_archive_"):

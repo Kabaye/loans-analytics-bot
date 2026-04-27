@@ -122,7 +122,10 @@ def _case_list_kb(cases: list[dict], page: int) -> InlineKeyboardMarkup:
 def _case_actions_kb(case_id: int, credential_id: int | None = None) -> InlineKeyboardMarkup:
     del credential_id
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✉️ Сформировать SMS", callback_data=f"overdue_sms_{case_id}")],
+        [
+            InlineKeyboardButton(text="✉️ SMS", callback_data=f"overdue_sms_soft_{case_id}"),
+            InlineKeyboardButton(text="⚠️ Жесткое SMS", callback_data=f"overdue_sms_hard_{case_id}"),
+        ],
         [InlineKeyboardButton(text="📄 Сформировать претензию", callback_data=f"overdue_claim_{case_id}")],
         [InlineKeyboardButton(text="🧾 Данные API", callback_data=f"overdue_raw_{case_id}")],
         [InlineKeyboardButton(text="↩ К списку просрочек", callback_data="overdue_cases")],
@@ -1062,7 +1065,15 @@ async def msg_overdue_contacts(message: Message, state: FSMContext):
 async def cb_overdue_sms(callback: CallbackQuery):
     if not await is_allowed(callback.message.chat.id):
         return
-    case_id = int(callback.data.replace("overdue_sms_", ""))
+    payload = callback.data.replace("overdue_sms_", "")
+    variant = "soft"
+    if payload.startswith("soft_"):
+        case_id = int(payload.replace("soft_", "", 1))
+    elif payload.startswith("hard_"):
+        variant = "hard"
+        case_id = int(payload.replace("hard_", "", 1))
+    else:
+        case_id = int(payload)
     case = await get_overdue_case(case_id, callback.message.chat.id)
     if not case:
         await callback.answer("Кейс не найден", show_alert=True)
@@ -1076,15 +1087,16 @@ async def cb_overdue_sms(callback: CallbackQuery):
             parse_mode="HTML",
         )
         return
-    sms_text = build_sms_text(case, {})
+    sms_text = build_sms_text(case, {}, variant=variant)
     await save_generated_document(
         case_id,
         callback.message.chat.id,
-        doc_type="sms",
+        doc_type="sms_hard" if variant == "hard" else "sms",
         text_content=sms_text,
         payload=serialize_case_payload(case, None),
     )
-    message_text = f"✉️ <b>SMS</b>\n\n<pre>{escape(sms_text)}</pre>"
+    title = "⚠️ <b>Жесткое SMS</b>" if variant == "hard" else "✉️ <b>SMS</b>"
+    message_text = f"{title}\n\n<pre>{escape(sms_text)}</pre>"
     if case.get("borrower_phone"):
         message_text += f"\n\n<b>Номер:</b> <code>{escape(str(case['borrower_phone']))}</code>"
     await callback.message.edit_text(

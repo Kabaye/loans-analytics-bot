@@ -24,6 +24,7 @@ SERVICE_URLS = {
 GENERATED_DOCS_DIR = Path(config.BASE_DIR) / "data" / "generated-docs"
 GENERATED_DOCS_TTL_DAYS = 5
 SMS_MAX_LEN = 140
+CLAIM_VOLUNTARY_TERM_DAYS = 7
 SMS_SERVICE_NAMES = {
     "finkit": "ФинКит",
     "zaimis": "ЗАЙМись",
@@ -97,6 +98,10 @@ def _loan_ref(case: dict) -> str:
 def _voluntary_term(case: dict) -> str:
     days = case.get("voluntary_term_days")
     return str(days) if days else "—"
+
+
+def _claim_deadline_date() -> str:
+    return (datetime.now() + timedelta(days=CLAIM_VOLUNTARY_TERM_DAYS)).strftime("%d.%m.%Y")
 
 
 def _sms_name(full_name: str | None) -> str:
@@ -330,161 +335,161 @@ def _join_non_empty(parts: list[str | None]) -> str:
     return ", ".join(part for part in parts if part)
 
 
-def build_sms_text(case: dict, creditor: dict) -> str:
+def build_sms_text(case: dict, creditor: dict, variant: str = "soft") -> str:
     del creditor
-    text = f"{_sms_name(case.get('full_name'))}, {_sms_service(case)} от {_sms_date(case)}, долг {_sms_amount(case)}."
-    optional_parts = [
-        f" Займ {_sms_ref(case)}.",
-        " Прошу оплатить добровольно.",
-        " Иначе обращусь в суд с взысканием расходов.",
+    prefix = f"{_sms_name(case.get('full_name'))}, {_sms_service(case)} займ {_sms_ref(case)} от {_sms_date(case)}, долг {_sms_amount(case)}."
+    soft_options = [
+        " Оплатите добровольно, иначе последует обращение в суд с взысканием расходов.",
+        " Оплатите добровольно, иначе обращусь в суд с взысканием расходов.",
+        " Оплатите добровольно, иначе последует суд и взыскание расходов.",
     ]
-    for part in optional_parts:
-        if len(text + part) <= SMS_MAX_LEN:
-            text = text + part
-    return _fit_sms(text)
+    hard_options = [
+        " При неоплате в течение недели обращаюсь в суд для взыскания. Последнее предупреждение.",
+        " При неоплате за неделю обращаюсь в суд для взыскания. Последнее предупреждение.",
+        " Неделя на оплату, далее обращаюсь в суд. Последнее предупреждение.",
+        " Неделя на оплату, далее суд. Последнее предупреждение.",
+    ]
+    options = hard_options if variant == "hard" else soft_options
+    for suffix in options:
+        text = _fit_sms(prefix + suffix)
+        if len(text) <= SMS_MAX_LEN:
+            return text
+    return _fit_sms(prefix)
 
 
 def build_postal_address_text(case: dict) -> str:
     return "📮 <b>Адрес для отправки через Белпочту</b>\n\n<pre>" + "\n".join(_postal_address_lines(case)) + "</pre>"
 
 
-def _build_generic_claim_text(case: dict, creditor: dict) -> str:
-    del creditor
-    service_name = _sms_service(case)
-    debt_calc = "\n".join([
-        f"Ваша задолженность по состоянию на {_date(datetime.now().isoformat())} составляет:",
-        f"- сумма займа: {_money(case.get('amount'))}",
-        f"- проценты за пользование займом: {_money(case.get('accrued_percent'))}",
-        f"- пени за просрочку: {_money(case.get('fine_outstanding'))}",
-        f"- ИТОГО к оплате: {_money(case.get('total_due'))}",
-    ])
-    sections = [
-        (
-            f"Направляю настоящее письмо-предложение по договору займа {_loan_ref(case)} "
-            f"от {_date(case.get('issued_at'))} через сервис {service_name}, "
-            "с целью урегулирования задолженности в добровольном досудебном порядке."
-        ),
-        debt_calc,
-        (
-            "Прошу в кратчайший срок погасить задолженность в полном объеме. "
-            "Это позволит урегулировать вопрос добровольно и **без обращения в суд**."
-        ),
-        (
-            "**Обращаю внимание:** при обращении в суд сумма требований будет увеличена, поскольку проценты "
-            "и пени продолжают начисляться по день фактического исполнения обязательства."
-        ),
-        (
-            "Кроме того, при **судебном** и последующем **принудительном взыскании** на должника будут возложены "
-            "государственная пошлина, расходы на представителя и иные издержки, связанные с рассмотрением дела "
-            "и принудительным исполнением."
-        ),
-        (
-            "В пределах срока добровольного урегулирования готов рассмотреть конструктивные предложения "
-            "по погашению задолженности."
-        ),
-        (
-            "При отсутствии оплаты либо приемлемых предложений задолженность будет взыскана в **судебном** и "
-            "**последующем принудительном порядке**."
-        ),
-        (
-            f"**ИТОГОВОЕ ТРЕБОВАНИЕ К ОПЛАТЕ: {_money(case.get('total_due'))}. "
-            "ПРИ НЕОПЛАТЕ БУДУ ВЫНУЖДЕН ОБРАТИТЬСЯ В СУД И ВЗЫСКИВАТЬ ДОПОЛНИТЕЛЬНЫЕ РАСХОДЫ.**"
-        ),
-    ]
-    return "\n\n".join(part for part in sections if part).strip()
-
-
-def _build_finkit_claim_text(case: dict, creditor: dict) -> str:
-    del creditor
+def _claim_amount_rows(case: dict) -> tuple[str, list[tuple[str, str, bool]]]:
     claim = _latest_claim(case)
     snapshot_date = _date(claim.get("claim_date") or datetime.now().isoformat())
-    deadline = _date(claim.get("expires_at"))
-    amount_total = _money(_number(claim.get("amount")) or case.get("total_due"))
-    debt_lines = "\n".join([
-        f"сумма невозвращенного в срок займа: {_money(case.get('principal_outstanding'))}",
-        f"проценты за пользование займом: {_money(case.get('accrued_percent'))}",
-        f"пени: {_money(case.get('fine_outstanding'))}",
-        f"ИТОГО: {amount_total}",
-    ])
-    consequences_intro = "**Обращаю ваше внимание:** предъявление вашего долга к принудительному взысканию повлечет для вас:"
-    consequences = "\n".join([
-        "- возложение судом на вас обязанности возместить мои судебные расходы по оплате государственной пошлины, адвокатской помощи и иные издержки, связанные с рассмотрением дела в суде;",
-        "- увеличение суммы долга по процентам за пользование займом и пеням, начисленным и подлежащим оплате за весь фактический период вашей просрочки возврата займа до дня возврата всей суммы займа включительно;",
-        "- взыскание с вас принудительного сбора в бюджет судебным исполнителем на стадии принудительного исполнения исполнительного документа, а также иных расходов по исполнению исполнительного документа;",
-        "- наложение ареста на ваше имущество, ограничение права на выезд из Республики Беларусь, ограничение права управления транспортным средством и иные меры, необходимые для обеспечения исполнения решения суда;",
-        "- обращение взыскания на ваше имущество, заработную плату и иные доходы, а также направление исполнительного документа по месту работы для удержаний;",
-        "- ухудшение вашей кредитной истории и, как следствие, сложности с получением в будущем кредита, займа или лизинга.",
-    ])
-    companion_offer = (
-        "Направляю претензию по договору займа в дополнение к ранее направленной через сервис онлайн-заимствования "
-        "https://finkit.by, с предложением урегулировать вопрос в досудебном порядке и в кратчайший срок исполнить "
-        "обязательства по возврату суммы займа, процентов и пени."
-    )
-    companion_costs = (
-        "**Обращаю внимание:** при обращении в суд сумма требований будет увеличена, поскольку проценты за пользование займом "
-        "и пеня продолжают начисляться по день фактического исполнения обязательства. Соответственно, на дату подачи искового "
-        "заявления размер задолженности будет выше, чем на дату направления настоящего письма. Кроме того, при судебном и "
-        "последующем принудительном взыскании на должника будут возложены дополнительные расходы, связанные с рассмотрением "
-        "дела судом, взысканием задолженности в принудительном порядке, а также совершением исполнительных действий."
-    )
-    companion_proposals = (
-        f"В пределах срока, указанного в претензии{f' (до {deadline})' if deadline != '—' else ''}, возможно рассмотрение "
-        "ваших конструктивных предложений по добровольному урегулированию вопроса и погашению задолженности, в том числе "
-        "с возможностью обсуждения уменьшения отдельных начислений при добровольном и полном погашении долга."
-    )
-    companion_expiry = (
-        "По истечении указанного срока при отсутствии оплаты либо поступления приемлемых предложений задолженность будет "
-        "взыскана в судебном и последующем принудительном порядке с увеличением суммы требований и взысканием с должника "
-        "дополнительных расходов, в том числе государственной пошлины, расходов на юридическую помощь и иных издержек."
-    )
-    sections = [
-        companion_offer,
-        (
-            f"По договору займа № {_loan_ref(case)} от {_date(case.get('issued_at'))} вам предоставлена сумма займа "
-            f"в размере {_money(case.get('amount'))} с обязательством возврата займа и оплаты процентов за весь срок пользования."
-        ),
-        (
-            f"Установленный договором срок возврата займа и оплаты процентов наступил {_date(case.get('due_at'))}, "
-            "принятые по договору обязательства вами не исполнены."
-        ),
-        f"Ваша задолженность по договору по состоянию на {snapshot_date} составляет:\n{debt_lines}",
-        (
-            "На основании условий договора займа, пункта 22 Положения, утвержденного Указом Президента Республики Беларусь "
-            "от 25.05.2021 № 196, а также статей 290, 311, 760 и 762 Гражданского кодекса Республики Беларусь требую "
-            "добровольно погасить образовавшуюся задолженность."
-        ),
-        (
-            f"Требую в кратчайший срок погасить задолженность по договору в общей сумме {amount_total}. "
-            "Задолженность подлежит погашению в сервисе онлайн-заимствования https://finkit.by платежом банковской "
-            "платежной картой, привязанной к вашему личному кабинету."
-        ),
-        "**В случае неисполнения** вами заявленных требований задолженность будет предъявлена к **принудительному взысканию**.",
-        f"{consequences_intro}\n{consequences}",
-        (
-            "Для осуществления платежей по погашению долга вам необходимо использовать личный кабинет "
-            "в сервисе онлайн-заимствования https://finkit.by."
-        ),
-        companion_costs,
-        "**В случае дальнейшего уклонения от оплаты** задолженность будет взыскана в **судебном** и последующем **принудительном порядке**, что повлечет для вас дополнительные финансовые потери и иные неблагоприятные последствия, подробно указанные в претензии.",
-        companion_proposals,
-        companion_expiry,
-        "Настоятельно рекомендую воспользоваться возможностью урегулировать вопрос в добровольном порядке, поскольку дальнейшее промедление повлечет увеличение суммы задолженности и расходов, связанных с ее взысканием.",
-        f"**ИТОГОВАЯ СУММА К ОПЛАТЕ НА {snapshot_date}: {amount_total}. "
-        "ПРИ НЕОПЛАТЕ Я БУДУ ВЫНУЖДЕН ОБРАТИТЬСЯ В СУД ЗА ВЗЫСКАНИЕМ ДОЛГА, ГОСПОШЛИНЫ, РАСХОДОВ НА ПРЕДСТАВИТЕЛЯ И ИНЫХ ИЗДЕРЖЕК.**",
+    principal = _number(case.get("principal_outstanding"))
+    if principal is None:
+        principal = _number(case.get("amount")) or 0.0
+    percent = _number(case.get("accrued_percent")) or 0.0
+    fine = _number(case.get("fine_outstanding")) or 0.0
+    total_value = _number(claim.get("amount"))
+    if total_value is None:
+        total_value = _number(case.get("total_due"))
+    if total_value is None:
+        total_value = principal + percent + fine
+    return snapshot_date, [
+        ("сумма невозвращенного в срок займа", _money(principal), False),
+        ("проценты за пользование займом", _money(percent), False),
+        ("пени", _money(fine), False),
+        ("ИТОГО", _money(total_value), True),
     ]
-    return "\n\n".join(part for part in sections if part).strip()
+
+
+def _claim_blocks(case: dict, creditor: dict) -> list[dict]:
+    del creditor
+    service_name = _sms_service(case)
+    service_url = _service_url(case)
+    deadline = _claim_deadline_date()
+    snapshot_date, debt_rows = _claim_amount_rows(case)
+    amount_total = debt_rows[-1][1]
+    consequence_items = [
+        "возложение судом на вас обязанности возместить мои судебные расходы по оплате государственной пошлины, адвокатской помощи и иные издержки, связанные с рассмотрением дела в суде;",
+        "увеличение суммы долга по процентам за пользование займом и пеням, начисленным и подлежащим оплате за весь фактический период вашей просрочки возврата займа до дня возврата всей суммы займа включительно;",
+        "взыскание с вас принудительного сбора в бюджет судебным исполнителем на стадии принудительного исполнения исполнительного документа, а также иных расходов по исполнению исполнительного документа;",
+        "наложение ареста на ваше имущество, ограничение права на выезд из Республики Беларусь, ограничение права управления транспортным средством и иные меры, необходимые для обеспечения исполнения решения суда;",
+        "обращение взыскания на ваше имущество, заработную плату и иные доходы, а также направление исполнительного документа по месту работы для удержаний;",
+        "ухудшение вашей кредитной истории и, как следствие, сложности с получением в будущем кредита, займа или лизинга.",
+    ]
+    payment_sentence = (
+        f"Оплатить задолженность возможно через сервис {service_url}."
+        if service_url
+        else "Оплатить задолженность необходимо в добровольном порядке в полном объеме."
+    )
+    return [
+        {
+            "type": "paragraph",
+            "text": (
+                f"Направляю настоящую претензию по договору займа № {_loan_ref(case)} от {_date(case.get('issued_at'))}, "
+                f"оформленному через сервис {service_name}, с требованием добровольно погасить задолженность в досудебном порядке."
+            ),
+        },
+        {
+            "type": "paragraph",
+            "text": (
+                f"По указанному договору вам была предоставлена сумма займа в размере {_money(case.get('amount'))}. "
+                f"Срок возврата займа и оплаты начисленных процентов наступил {_date(case.get('due_at'))}, "
+                "однако обязательства по договору вами не исполнены."
+            ),
+        },
+        {
+            "type": "paragraph",
+            "text": f"Ваша задолженность по договору по состоянию на {snapshot_date} составляет:",
+        },
+        {"type": "debt_table", "rows": debt_rows},
+        {
+            "type": "paragraph",
+            "text": (
+                "На основании условий договора займа, а также статей 290, 311, 760 и 762 "
+                "Гражданского кодекса Республики Беларусь требую добровольно погасить образовавшуюся задолженность."
+            ),
+        },
+        {
+            "type": "paragraph",
+            "text": (
+                f"Требую не позднее {deadline} погасить задолженность по договору в общей сумме {amount_total}. "
+                f"{payment_sentence}"
+            ),
+        },
+        {
+            "type": "paragraph",
+            "text": (
+                "**В случае неисполнения** требований в добровольном порядке задолженность будет предъявлена "
+                "к **судебному** и последующему **принудительному взысканию**."
+            ),
+        },
+        {
+            "type": "paragraph",
+            "text": "**Обращаю ваше внимание:** обращение в суд и к принудительному взысканию повлечет для вас:",
+        },
+        {"type": "bullets", "items": consequence_items},
+        {
+            "type": "paragraph",
+            "text": (
+                f"В пределах срока, указанного в претензии (до {deadline}), готов рассмотреть ваши конструктивные "
+                "предложения по добровольному урегулированию вопроса и полному погашению задолженности."
+            ),
+        },
+        {
+            "type": "paragraph",
+            "text": (
+                f"По истечении указанного срока, то есть после {deadline}, при отсутствии оплаты либо приемлемых "
+                "предложений задолженность будет взыскана в судебном и последующем принудительном порядке "
+                "с увеличением суммы требований и взысканием дополнительных расходов."
+            ),
+        },
+        {
+            "type": "paragraph",
+            "text": (
+                f"**ИТОГОВАЯ СУММА К ОПЛАТЕ НА {snapshot_date}: {amount_total}. "
+                "ПРИ НЕОПЛАТЕ Я БУДУ ВЫНУЖДЕН ОБРАТИТЬСЯ В СУД ЗА ВЗЫСКАНИЕМ ДОЛГА, ГОСПОШЛИНЫ, "
+                "РАСХОДОВ НА ПРЕДСТАВИТЕЛЯ И ИНЫХ ИЗДЕРЖЕК.**"
+            ),
+        },
+    ]
 
 
 def build_claim_text(case: dict, creditor: dict) -> str:
-    if case.get("service") == "finkit":
-        return _build_finkit_claim_text(case, creditor)
-    return _build_generic_claim_text(case, creditor)
+    sections: list[str] = []
+    for block in _claim_blocks(case, creditor):
+        if block["type"] == "paragraph":
+            sections.append(re.sub(r"\*\*(.*?)\*\*", r"\1", block["text"]).strip())
+        elif block["type"] == "debt_table":
+            sections.append("\n".join(f"{label}: {value}" for label, value, _ in block["rows"]))
+        elif block["type"] == "bullets":
+            sections.append("\n".join(f"- {item}" for item in block["items"]))
+    return "\n\n".join(part for part in sections if part).strip()
 
 
 def _claim_titles(case: dict) -> tuple[str, str]:
-    if case.get("service") == "finkit":
-        return "ПРЕТЕНЗИЯ", "с предложением о добровольном урегулировании задолженности"
-    return "ПРЕДЛОЖЕНИЕ", "о добровольном урегулировании задолженности"
+    del case
+    return "ПРЕТЕНЗИЯ", "о добровольном урегулировании задолженности"
 
 
 def _set_default_style(doc: Document) -> None:
@@ -529,6 +534,47 @@ def _add_body_paragraph(doc: Document, text: str):
         run.font.size = Pt(12)
         run.bold = is_bold
     return p
+
+
+def _add_bullet_paragraph(doc: Document, text: str):
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    p.paragraph_format.left_indent = Mm(8)
+    p.paragraph_format.first_line_indent = Mm(-4)
+    p.paragraph_format.space_after = Pt(3)
+    p.paragraph_format.line_spacing = 1.1
+    bullet = p.add_run("- ")
+    bullet.font.size = Pt(12)
+    parts = re.split(r"(\*\*.*?\*\*)", text)
+    for part in parts:
+        if not part:
+            continue
+        is_bold = part.startswith("**") and part.endswith("**") and len(part) >= 4
+        content = part[2:-2] if is_bold else part
+        run = p.add_run(content)
+        run.font.size = Pt(12)
+        run.bold = is_bold
+    return p
+
+
+def _add_debt_table(doc: Document, rows: list[tuple[str, str, bool]]):
+    table = doc.add_table(rows=0, cols=2)
+    table.style = "Table Grid"
+    table.alignment = WD_TABLE_ALIGNMENT.LEFT
+    table.autofit = False
+    for label, value, is_total in rows:
+        cells = table.add_row().cells
+        cells[0].width = Mm(115)
+        cells[1].width = Mm(40)
+        left_par = cells[0].paragraphs[0]
+        right_par = cells[1].paragraphs[0]
+        right_par.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        left_run = left_par.add_run(label)
+        right_run = right_par.add_run(value)
+        for run in (left_run, right_run):
+            run.font.size = Pt(12)
+            run.bold = is_total
+    return table
 
 
 def _cleanup_generated_docs() -> None:
@@ -601,8 +647,14 @@ def render_claim_docx(case: dict, creditor: dict, signature_path: str) -> tuple[
     run.font.size = Pt(12)
 
     body_paragraphs = []
-    for paragraph in build_claim_text(case, creditor).split("\n\n"):
-        body_paragraphs.append(_add_body_paragraph(doc, paragraph))
+    for block in _claim_blocks(case, creditor):
+        if block["type"] == "paragraph":
+            body_paragraphs.append(_add_body_paragraph(doc, block["text"]))
+        elif block["type"] == "debt_table":
+            _add_debt_table(doc, block["rows"])
+        elif block["type"] == "bullets":
+            for item in block["items"]:
+                body_paragraphs.append(_add_bullet_paragraph(doc, item))
 
     for paragraph in body_paragraphs[-2:]:
         paragraph.paragraph_format.keep_with_next = True

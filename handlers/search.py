@@ -1,4 +1,4 @@
-"""Search borrower handler — search by base or by document ID batch + manual add."""
+"""Unified borrower search handler — DB search, INN batch lookup, and manual add."""
 from __future__ import annotations
 
 import logging
@@ -15,15 +15,14 @@ from aiogram.types import (
 
 from bot.services.search.service import (
     add_borrower_and_refresh_opi,
-    extract_document_ids,
+    extract_document_id_batch,
     format_contact_card,
     force_refresh_opi_card,
     format_borrower_card,
     lookup_borrower_contact_info,
     lookup_borrower_info,
-    run_opi_batch,
+    run_document_lookup_batch,
     search_borrower_info,
-    upsert_borrower_info,
 )
 from bot.services.base.access import is_allowed
 
@@ -53,8 +52,6 @@ BACK_KB = InlineKeyboardMarkup(inline_keyboard=[
 
 def _search_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📚 Поиск по базе", callback_data="search_db")],
-        [InlineKeyboardButton(text="🆔 Поиск по ИН", callback_data="search_opi_batch")],
         [InlineKeyboardButton(text="➕ Добавить заёмщика", callback_data="add_borrower")],
         [InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")],
     ])
@@ -62,8 +59,7 @@ def _search_menu_kb() -> InlineKeyboardMarkup:
 
 def _search_nav_kb(include_add: bool = True) -> InlineKeyboardMarkup:
     buttons = [
-        [InlineKeyboardButton(text="📚 Поиск по базе", callback_data="search_db")],
-        [InlineKeyboardButton(text="🆔 Поиск по ИН", callback_data="search_opi_batch")],
+        [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="search_borrower")],
     ]
     if include_add:
         buttons.append([InlineKeyboardButton(text="➕ Добавить заёмщика", callback_data="add_borrower")])
@@ -75,15 +71,33 @@ def _result_card_kb(doc_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Проверить ОПИ", callback_data=f"opi_check:{doc_id}")],
         [InlineKeyboardButton(text="📇 Телефон / email", callback_data=f"bi_contacts:{doc_id}")],
-        [InlineKeyboardButton(text="📚 Поиск по базе", callback_data="search_db")],
-        [InlineKeyboardButton(text="🆔 Поиск по ИН", callback_data="search_opi_batch")],
+        [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="search_borrower")],
         [InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")],
     ])
 
 
-async def _batch_result_kb(doc_ids: list[str]) -> InlineKeyboardMarkup:
+def _batch_result_kb(doc_ids: list[str]) -> InlineKeyboardMarkup:
     del doc_ids
     return _search_nav_kb(include_add=False)
+
+
+SEARCH_PROMPT_TEXT = (
+    "🔍 <b>Поиск заёмщика</b>\n\n"
+    "Отправьте ФИО, ИН или пачку из 1-10 ИН.\n"
+    "Если пришли только ИН — бот сначала ищет их в локальной базе, а для отсутствующих карточек "
+    "делает проверку ОПИ и сохраняет результат.\n"
+    "Если пришел обычный текст — бот ищет по базе как раньше.\n\n"
+    "После результата можно сразу отправлять следующий запрос."
+)
+
+
+async def _open_search_prompt(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(SearchStates.waiting_query)
+    await callback.message.edit_text(
+        SEARCH_PROMPT_TEXT,
+        reply_markup=_search_menu_kb(),
+        parse_mode="HTML",
+    )
 
 
 # --- Search ---
@@ -93,44 +107,25 @@ async def cb_search_start(callback: CallbackQuery, state: FSMContext):
     if not await is_allowed(callback.message.chat.id):
         return
     await state.clear()
-    await callback.message.edit_text(
-        "🔍 <b>Поиск заёмщика</b>\n\n"
-        "Выберите режим поиска:",
-        reply_markup=_search_menu_kb(),
-        parse_mode="HTML",
-    )
+    await _open_search_prompt(callback, state)
 
 
 @router.callback_query(F.data == "search_db")
 async def cb_search_db(callback: CallbackQuery, state: FSMContext):
     if not await is_allowed(callback.message.chat.id):
         return
-    await state.set_state(SearchStates.waiting_query)
-    await callback.message.edit_text(
-        "📚 <b>Поиск по базе</b>\n\n"
-        "Введите ФИО или ИН.\n"
-        "После результата можно сразу вводить следующий запрос — кнопку нажимать не нужно.",
-        reply_markup=_search_nav_kb(),
-        parse_mode="HTML",
-    )
+    await _open_search_prompt(callback, state)
 
 
 @router.callback_query(F.data == "search_opi_batch")
 async def cb_search_opi_batch(callback: CallbackQuery, state: FSMContext):
     if not await is_allowed(callback.message.chat.id):
         return
-    await state.set_state(SearchStates.waiting_batch_ids)
-    await callback.message.edit_text(
-        "🆔 <b>Поиск по ИН</b>\n\n"
-        "Отправьте от 1 до 10 ИН одним сообщением.\n"
-        "Можно в столбик, через пробел или через запятую.\n"
-        "После результата можно сразу отправлять следующую пачку.",
-        reply_markup=_search_nav_kb(include_add=False),
-        parse_mode="HTML",
-    )
+    await _open_search_prompt(callback, state)
 
 
 @router.message(SearchStates.waiting_query)
+@router.message(SearchStates.waiting_batch_ids)
 async def msg_search_query(message: Message, state: FSMContext):
     if not await is_allowed(message.chat.id):
         return
@@ -138,6 +133,23 @@ async def msg_search_query(message: Message, state: FSMContext):
     query = message.text.strip() if message.text else ""
     if not query or len(query) < 2:
         await message.answer("❌ Слишком короткий запрос. Минимум 2 символа.")
+        return
+
+    batch_doc_ids = extract_document_id_batch(query)
+    if batch_doc_ids:
+        if len(batch_doc_ids) > 10:
+            await message.answer(
+                "❌ Слишком много ИН за раз. Отправьте не больше 10.",
+                reply_markup=_search_nav_kb(include_add=False),
+                parse_mode="HTML",
+            )
+            return
+        await state.set_state(SearchStates.waiting_query)
+        await message.answer(
+            await run_document_lookup_batch(batch_doc_ids),
+            reply_markup=_batch_result_kb(batch_doc_ids),
+            parse_mode="HTML",
+        )
         return
 
     results = await search_borrower_info(query, limit=10)
@@ -173,40 +185,11 @@ async def msg_search_query(message: Message, state: FSMContext):
             )
         ])
 
-    buttons.append([InlineKeyboardButton(text="📚 Поиск по базе", callback_data="search_db")])
-    buttons.append([InlineKeyboardButton(text="🆔 Поиск по ИН", callback_data="search_opi_batch")])
+    buttons.append([InlineKeyboardButton(text="🔍 Новый поиск", callback_data="search_borrower")])
     buttons.append([InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")])
     await message.answer(
         "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-        parse_mode="HTML",
-    )
-
-
-@router.message(SearchStates.waiting_batch_ids)
-async def msg_search_batch_ids(message: Message, state: FSMContext):
-    if not await is_allowed(message.chat.id):
-        return
-
-    doc_ids = extract_document_ids(message.text or "")
-    if not doc_ids:
-        await message.answer(
-            "❌ Не нашёл ни одного ИН. Отправьте от 1 до 10 ИН по 14 символов.",
-            reply_markup=_search_nav_kb(include_add=False),
-            parse_mode="HTML",
-        )
-        return
-    if len(doc_ids) > 10:
-        await message.answer(
-            "❌ Слишком много ИН за раз. Отправьте не больше 10.",
-            reply_markup=_search_nav_kb(include_add=False),
-            parse_mode="HTML",
-        )
-        return
-
-    await message.answer(
-        await run_opi_batch(doc_ids),
-        reply_markup=await _batch_result_kb(doc_ids),
         parse_mode="HTML",
     )
 
@@ -375,8 +358,7 @@ async def cb_add_sum(callback: CallbackQuery, state: FSMContext):
     text = format_borrower_card(info) if info else f"✅ Заёмщик {doc_id} сохранён"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📚 Поиск по базе", callback_data="search_db")],
-        [InlineKeyboardButton(text="🆔 Поиск по ИН", callback_data="search_opi_batch")],
+        [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="search_borrower")],
         [InlineKeyboardButton(text="➕ Ещё добавить", callback_data="add_borrower")],
         [InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")],
     ])

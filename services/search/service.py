@@ -34,6 +34,16 @@ def extract_document_ids(text: str) -> list[str]:
     return ids
 
 
+def extract_document_id_batch(text: str) -> list[str]:
+    doc_ids = extract_document_ids(text)
+    if not doc_ids:
+        return []
+    stripped = re.sub(r"\b[0-9A-Z]{14}\b", "", text.upper())
+    if re.sub(r"[\s,;]+", "", stripped):
+        return []
+    return doc_ids
+
+
 def format_borrower_card(info: dict) -> str:
     lines = ["<b>📋 Карточка заёмщика</b>"]
     lines.append(f"\n<b>ИН:</b> <code>{info['document_id']}</code>")
@@ -223,50 +233,97 @@ async def ensure_borrower_contact_info(document_ids: list[str]) -> None:
         await _backfill_finkit_contacts(missing)
 
 
-async def run_opi_batch(doc_ids: list[str]) -> str:
-    checker = OPIChecker()
-    lines = ["🆔 <b>Проверка по ИН</b>", ""]
-    try:
-        await ensure_borrower_contact_info(doc_ids)
-        for idx, doc_id in enumerate(doc_ids, start=1):
-            info = await lookup_borrower_info(doc_id)
-            contacts = await lookup_borrower_contact_info(doc_id)
-            result = await checker.check(doc_id)
-            if not info or not info.get("source"):
+def _needs_search_backfill(info: dict | None) -> bool:
+    if not info:
+        return True
+    return not any(
+        (
+            (info.get("source") or "").strip(),
+            (info.get("full_name") or "").strip(),
+            (info.get("current_display_name") or "").strip(),
+            info.get("loan_status"),
+            info.get("notes"),
+            info.get("rating") is not None,
+            info.get("last_loan_date"),
+            info.get("loan_count"),
+            info.get("opi_checked_at"),
+        )
+    )
+
+
+def _append_opi_summary(lines: list[str], info: dict | None, error: str | None) -> None:
+    if info and info.get("opi_checked_at"):
+        if info.get("opi_has_debt"):
+            lines.append(f"❌ ОПИ: долг {float(info.get('opi_debt_amount') or 0):.2f} BYN")
+        else:
+            lines.append("✅ ОПИ: нет задолженности")
+        return
+    if error:
+        lines.append(f"⚠️ ОПИ: {error}")
+        return
+    lines.append("⏳ ОПИ: не проверялось")
+
+
+async def run_document_lookup_batch(doc_ids: list[str]) -> str:
+    lines = ["🆔 <b>Поиск по ИН</b>", ""]
+    await ensure_borrower_contact_info(doc_ids)
+
+    initial_info_map = {doc_id: await lookup_borrower_info(doc_id) for doc_id in doc_ids}
+    missing_doc_ids = [doc_id for doc_id, info in initial_info_map.items() if _needs_search_backfill(info)]
+    opi_errors: dict[str, str | None] = {}
+
+    if missing_doc_ids:
+        checker = OPIChecker()
+        try:
+            for doc_id in missing_doc_ids:
+                existing = initial_info_map.get(doc_id)
+                result = None
+                if not existing or not existing.get("opi_checked_at"):
+                    result = await checker.check(doc_id)
+                    opi_errors[doc_id] = result.error
                 await upsert_borrower_info(
                     document_id=doc_id,
-                    full_name=result.full_name,
+                    full_name=(
+                        (result.full_name if result else None)
+                        or (existing or {}).get("full_name")
+                        or (existing or {}).get("opi_full_name")
+                    ),
                     source="search",
                 )
-                info = await lookup_borrower_info(doc_id)
+        finally:
+            await checker.close()
 
-            lines.append(f"{idx}. <code>{doc_id}</code>")
-            full_name = (info or {}).get("full_name") or result.full_name or (info or {}).get("current_display_name")
-            if full_name:
-                lines.append(full_name)
-            if info and info.get("loan_status"):
-                lines.append(f"Статус: {info['loan_status']}")
-            if result.error:
-                lines.append("⚠️ ОПИ: ошибка проверки")
-            elif result.has_debt:
-                lines.append(f"❌ ОПИ: долг {result.debt_amount:.2f} BYN")
-            else:
-                lines.append("✅ ОПИ: нет задолженности")
-            info_source_label = humanize_borrower_source((info or {}).get("source"))
-            if info_source_label:
-                lines.append(f"ℹ️ Данные: {info_source_label}")
-            if contacts:
-                if contacts.get("phone"):
-                    lines.append(f"📞 Телефон: <code>{contacts['phone']}</code>")
-                if contacts.get("email"):
-                    lines.append(f"✉️ Email: <code>{contacts['email']}</code>")
-                source_label = humanize_borrower_source(contacts.get("source"))
-                if source_label and source_label != info_source_label:
-                    lines.append(f"ℹ️ Контакты: {source_label}")
-            lines.append("")
-    finally:
-        await checker.close()
+    for idx, doc_id in enumerate(doc_ids, start=1):
+        info = await lookup_borrower_info(doc_id)
+        contacts = await lookup_borrower_contact_info(doc_id)
+
+        lines.append(f"{idx}. <code>{doc_id}</code>")
+        full_name = (info or {}).get("full_name") or (info or {}).get("current_display_name")
+        if full_name:
+            lines.append(full_name)
+        if info and info.get("loan_status"):
+            lines.append(f"Статус: {info['loan_status']}")
+
+        _append_opi_summary(lines, info, opi_errors.get(doc_id))
+
+        info_source_label = humanize_borrower_source((info or {}).get("source"))
+        if info_source_label:
+            lines.append(f"ℹ️ Данные: {info_source_label}")
+        if contacts:
+            if contacts.get("phone"):
+                lines.append(f"📞 Телефон: <code>{contacts['phone']}</code>")
+            if contacts.get("email"):
+                lines.append(f"✉️ Email: <code>{contacts['email']}</code>")
+            source_label = humanize_borrower_source(contacts.get("source"))
+            if source_label and source_label != info_source_label:
+                lines.append(f"ℹ️ Контакты: {source_label}")
+        lines.append("")
+
     return "\n".join(lines).strip()
+
+
+async def run_opi_batch(doc_ids: list[str]) -> str:
+    return await run_document_lookup_batch(doc_ids)
 
 
 async def force_refresh_opi_card(doc_id: str) -> tuple[dict | None, str | None]:
@@ -304,11 +361,13 @@ __all__ = [
     "add_borrower_and_refresh_opi",
     "ensure_borrower_contact_info",
     "extract_document_ids",
+    "extract_document_id_batch",
     "force_refresh_opi_card",
     "format_contact_card",
     "format_borrower_card",
     "lookup_borrower_contact_info",
     "lookup_borrower_info",
+    "run_document_lookup_batch",
     "run_opi_batch",
     "search_borrower_info",
     "upsert_borrower_info",

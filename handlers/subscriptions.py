@@ -28,8 +28,8 @@ from bot.services.subscriptions.service import (
     toggle_subscription_flag,
     update_subscription_field,
 )
-from bot.integrations.fsm_guard import set_busy, set_free, drain
 from bot.services.base.access import is_allowed
+from bot.services.base.chat_sessions import drain_queued_notifications, mark_chat_busy, release_chat
 
 log = logging.getLogger(__name__)
 router = Router(name="subscriptions")
@@ -152,8 +152,8 @@ async def cb_subs_menu(callback: CallbackQuery, state: FSMContext):
         return
     await state.clear()
     chat_id = callback.message.chat.id
-    set_free(chat_id)
-    queued = drain(chat_id)
+    release_chat(chat_id)
+    queued = drain_queued_notifications(chat_id)
     await _show_subscriptions(callback.message, chat_id, edit=True)
     if queued:
         for ntf_text, ntf_kb in queued:
@@ -188,7 +188,7 @@ async def sub_night_resume(callback: CallbackQuery):
 
 @router.callback_query(F.data == "sub_new")
 async def sub_new_start(callback: CallbackQuery, state: FSMContext):
-    set_busy(callback.message.chat.id)
+    mark_chat_busy(callback.message.chat.id)
     buttons = [
         [InlineKeyboardButton(text=name, callback_data=f"sub_svc_{key}")]
         for key, name in SERVICES.items()
@@ -403,8 +403,8 @@ async def sub_confirm_yes(callback: CallbackQuery, state: FSMContext):
 async def sub_confirm_no(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     chat_id = callback.message.chat.id
-    set_free(chat_id)
-    queued = drain(chat_id)
+    release_chat(chat_id)
+    queued = drain_queued_notifications(chat_id)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔔 Подписки", callback_data="subs_menu")],
         [InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")],
@@ -431,8 +431,8 @@ async def _save_subscription(target, state: FSMContext, edit: bool = False):
     await create_subscription(chat_id, data)
 
     await state.clear()
-    set_free(chat_id)
-    queued = drain(chat_id)
+    release_chat(chat_id)
+    queued = drain_queued_notifications(chat_id)
     svc = SERVICES.get(data["service"], data["service"])
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔔 Подписки", callback_data="subs_menu")],
@@ -686,8 +686,8 @@ async def sub_toggle(callback: CallbackQuery):
 async def sub_back(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     chat_id = callback.message.chat.id
-    set_free(chat_id)
-    queued = drain(chat_id)
+    release_chat(chat_id)
+    queued = drain_queued_notifications(chat_id)
     await _show_subscriptions(callback.message, chat_id, edit=True)
     if queued:
         for ntf_text, ntf_kb in queued:

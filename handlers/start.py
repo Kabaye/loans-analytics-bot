@@ -14,8 +14,8 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
-from bot.integrations.fsm_guard import set_free, drain
 from bot.services.base.access import is_admin as _is_admin_service, is_allowed as _is_allowed_service
+from bot.services.base.chat_sessions import drain_queued_notifications, release_chat
 from bot.services.start.service import ensure_chat_user
 
 log = logging.getLogger(__name__)
@@ -85,8 +85,8 @@ async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
         return
     await state.clear()
     chat_id = callback.message.chat.id
-    set_free(chat_id)
-    queued = drain(chat_id)
+    release_chat(chat_id)
+    queued = drain_queued_notifications(chat_id)
     for ntf_text, ntf_kb in queued:
         try:
             await callback.bot.send_message(chat_id, ntf_text, parse_mode="HTML",

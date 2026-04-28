@@ -8,6 +8,7 @@ from bot.repositories.db import get_db
 
 _NAME_MASK_CHAR = "*"
 _LEGAL_FULL_NAME_RE = re.compile(r"^[A-ZА-ЯЁ]+(?:[-'][A-ZА-ЯЁ]+)?(?:\s+[A-ZА-ЯЁ]+(?:[-'][A-ZА-ЯЁ]+)?){2,}$")
+_DOCUMENT_ID_RE = re.compile(r"\b[0-9A-Z]{14}\b")
 
 _SOURCE_PRIORITY = {
     "search": 10,
@@ -43,6 +44,14 @@ def _is_probable_legal_full_name(value: str | None) -> bool:
     return bool(_LEGAL_FULL_NAME_RE.fullmatch(normalized))
 
 
+def _normalize_document_id(value: str | None) -> str | None:
+    text = str(value or "").strip().upper()
+    if not text:
+        return None
+    match = _DOCUMENT_ID_RE.search(text)
+    return match.group(0) if match else None
+
+
 def _merge_full_name(existing: str | None, incoming: str | None) -> str | None:
     current = _normalize_upper(existing)
     new_value = _normalize_upper(incoming)
@@ -53,6 +62,24 @@ def _merge_full_name(existing: str | None, incoming: str | None) -> str | None:
     if _NAME_MASK_CHAR in new_value and _NAME_MASK_CHAR not in current:
         return current
     return new_value
+
+
+def _merge_service_identity(
+    service: str,
+    existing_full_name: str | None,
+    incoming_full_name: str | None,
+    merged_display_names: list[str],
+) -> tuple[str | None, list[str]]:
+    current_full_name = _normalize_upper(existing_full_name)
+    new_full_name = _normalize_upper(incoming_full_name)
+    if service == "zaimis":
+        if current_full_name and not _is_probable_legal_full_name(current_full_name):
+            merged_display_names = _merge_display_names(merged_display_names, current_full_name)
+            current_full_name = None
+        if new_full_name and not _is_probable_legal_full_name(new_full_name):
+            merged_display_names = _merge_display_names(merged_display_names, new_full_name)
+            new_full_name = None
+    return _merge_full_name(current_full_name, new_full_name), merged_display_names
 
 
 def _parse_display_names(value: str | list[str] | tuple[str, ...] | None) -> list[str]:
@@ -342,6 +369,7 @@ async def upsert_borrower(
     source_account_tag: str | None = None,
 ) -> None:
     normalized_full_name = _normalize_upper(full_name)
+    normalized_document_id = _normalize_document_id(document_id)
     current_display = (display_name or "").strip() or None
     db = await get_db()
     try:
@@ -351,12 +379,13 @@ async def upsert_borrower(
             display_names,
             current_display,
         )
-        if service == "zaimis" and normalized_full_name and not _is_probable_legal_full_name(normalized_full_name):
-            merged_display_names = _merge_display_names(merged_display_names, normalized_full_name)
-            normalized_full_name = None
-
-        merged_full_name = _merge_full_name((existing or {}).get("full_name"), normalized_full_name)
-        merged_document_id = document_id or (existing or {}).get("document_id")
+        merged_full_name, merged_display_names = _merge_service_identity(
+            service,
+            (existing or {}).get("full_name"),
+            normalized_full_name,
+            merged_display_names,
+        )
+        merged_document_id = normalized_document_id or _normalize_document_id((existing or {}).get("document_id"))
 
         await db.execute(
             """
@@ -389,7 +418,12 @@ async def upsert_borrower(
                 normalized_source,
                 source_account_tag or normalized_tag,
             )
-            info_full_name = _merge_full_name((existing_info or {}).get("full_name"), merged_full_name)
+            info_full_name, _ = _merge_service_identity(
+                service,
+                (existing_info or {}).get("full_name"),
+                merged_full_name,
+                [],
+            )
             await db.execute(
                 """
                 INSERT INTO borrower_info (document_id, full_name, source, source_account_tag, updated_at)
@@ -621,10 +655,13 @@ async def upsert_borrower_info(
     loan_status_details_json=None,
     source_account_tag: str | None = None,
 ) -> None:
+    normalized_document_id = _normalize_document_id(document_id)
+    if not normalized_document_id:
+        raise ValueError(f"Invalid document_id: {document_id!r}")
     normalized_full_name = _normalize_upper(full_name)
     db = await get_db()
     try:
-        existing = await _fetch_borrower_info_row(db, document_id)
+        existing = await _fetch_borrower_info_row(db, normalized_document_id)
         normalized_source, normalized_tag = _normalize_source(source)
         chosen_source = _pick_source((existing or {}).get("source"), normalized_source, _SOURCE_PRIORITY)
         chosen_tag = _merge_account_tag(
@@ -658,7 +695,7 @@ async def upsert_borrower_info(
                 updated_at = datetime('now')
             """,
             (
-                document_id,
+                normalized_document_id,
                 merged_full_name,
                 loan_status,
                 merged_details,
@@ -675,7 +712,7 @@ async def upsert_borrower_info(
                 chosen_tag,
             ),
         )
-        await _refresh_borrower_status(db, document_id)
+        await _refresh_borrower_status(db, normalized_document_id)
         await db.commit()
     finally:
         await db.close()
@@ -692,6 +729,9 @@ async def upsert_borrower_contacts(
     source: str = "manual",
     source_account_tag: str | None = None,
 ) -> None:
+    normalized_document_id = _normalize_document_id(document_id)
+    if not normalized_document_id:
+        raise ValueError(f"Invalid document_id: {document_id!r}")
     normalized_full_name = _normalize_upper(full_name)
     borrower_phone = (borrower_phone or "").strip() or None
     borrower_email = (borrower_email or "").strip() or None
@@ -699,7 +739,7 @@ async def upsert_borrower_contacts(
     borrower_zip = (borrower_zip or "").strip() or None
     db = await get_db()
     try:
-        existing = await _fetch_borrower_info_row(db, document_id)
+        existing = await _fetch_borrower_info_row(db, normalized_document_id)
         normalized_source, normalized_tag = _normalize_source(source)
         normalized_contact_source, contact_tag = _normalize_contact_source(source)
         chosen_source = _pick_source((existing or {}).get("source"), normalized_source, _SOURCE_PRIORITY)
@@ -729,7 +769,7 @@ async def upsert_borrower_contacts(
                 updated_at = datetime('now')
             """,
             (
-                document_id,
+                normalized_document_id,
                 merged_full_name,
                 borrower_phone,
                 borrower_email,
@@ -769,10 +809,12 @@ async def upsert_borrower_from_investment(
             display_names,
             current_display,
         )
-        if service == "zaimis" and normalized_full_name and not _is_probable_legal_full_name(normalized_full_name):
-            merged_display_names = _merge_display_names(merged_display_names, normalized_full_name)
-            normalized_full_name = None
-        merged_full_name = _merge_full_name((existing or {}).get("full_name"), normalized_full_name)
+        merged_full_name, merged_display_names = _merge_service_identity(
+            service,
+            (existing or {}).get("full_name"),
+            normalized_full_name,
+            merged_display_names,
+        )
         await db.execute(
             """
             INSERT INTO borrowers

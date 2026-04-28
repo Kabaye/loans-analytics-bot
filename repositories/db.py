@@ -11,6 +11,8 @@ from bot.config import DB_PATH
 log = logging.getLogger(__name__)
 
 _LEGAL_FULL_NAME_RE = re.compile(r"^[A-ZА-ЯЁ]+(?:[-'][A-ZА-ЯЁ]+)?(?:\s+[A-ZА-ЯЁ]+(?:[-'][A-ZА-ЯЁ]+)?){2,}$")
+_DOCUMENT_ID_RE = re.compile(r"\b[0-9A-Z]{14}\b")
+_EMAIL_RE = re.compile(r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", re.IGNORECASE)
 
 
 def _normalize_compare(value: str | None) -> str:
@@ -22,6 +24,66 @@ def _is_probable_legal_full_name(value: str | None) -> bool:
     if not normalized or any(char.isdigit() for char in normalized):
         return False
     return bool(_LEGAL_FULL_NAME_RE.fullmatch(normalized))
+
+
+def _extract_document_id(value: str | None) -> str | None:
+    text = str(value or "").strip().upper()
+    if not text:
+        return None
+    match = _DOCUMENT_ID_RE.search(text)
+    return match.group(0) if match else None
+
+
+def _extract_email(value: str | None) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    match = _EMAIL_RE.search(text)
+    return match.group(1) if match else None
+
+
+def _extract_registration_address(value: str | None) -> str | None:
+    for raw_line in str(value or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        upper_line = line.upper()
+        if upper_line.startswith("АДРЕС РЕГИСТРАЦИИ:"):
+            return line.split(":", 1)[1].strip() or None
+    return None
+
+
+def _extract_document_notes(value: str | None) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    notes: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        upper_line = line.upper()
+        if _DOCUMENT_ID_RE.fullmatch(upper_line):
+            continue
+        if _EMAIL_RE.search(line):
+            continue
+        if upper_line.startswith("АДРЕС РЕГИСТРАЦИИ:"):
+            continue
+        notes.append(line)
+    return "\n".join(notes) if notes else None
+
+
+def _merge_notes(existing: str | None, incoming: str | None) -> str | None:
+    existing_parts = [part.strip() for part in str(existing or "").splitlines() if part.strip()]
+    merged = list(existing_parts)
+    seen = {_normalize_compare(part) for part in merged}
+    for part in [segment.strip() for segment in str(incoming or "").splitlines() if segment.strip()]:
+        key = _normalize_compare(part)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(part)
+    return "\n".join(merged) if merged else None
 
 
 def _parse_display_names(value: str | None) -> list[str]:
@@ -537,10 +599,7 @@ async def init_db() -> None:
                 """
                 UPDATE borrowers
                 SET display_names = ?,
-                    full_name = CASE
-                        WHEN document_id IS NULL OR TRIM(document_id) = '' THEN NULL
-                        ELSE full_name
-                    END
+                    full_name = NULL
                 WHERE id = ?
                 """,
                 (merged, row["id"]),
@@ -548,6 +607,101 @@ async def init_db() -> None:
             migrated_display_names += 1
         if migrated_display_names:
             log.info("Backfilled display_names for %d Zaimis borrowers", migrated_display_names)
+
+        rows = await db.execute_fetchall(
+            """
+            SELECT *
+            FROM borrower_info
+            WHERE document_id IS NOT NULL
+              AND LENGTH(TRIM(document_id)) != 14
+            """
+        )
+        cleaned_document_ids = 0
+        for row in rows:
+            raw_document_id = str(row["document_id"] or "").strip()
+            clean_document_id = _extract_document_id(raw_document_id)
+            if not clean_document_id:
+                continue
+            existing_rows = await db.execute_fetchall(
+                "SELECT * FROM borrower_info WHERE document_id = ? LIMIT 1",
+                (clean_document_id,),
+            )
+            existing = dict(existing_rows[0]) if existing_rows else None
+            merged_notes = _merge_notes(
+                (existing or {}).get("notes"),
+                row["notes"],
+            )
+            merged_notes = _merge_notes(merged_notes, _extract_document_notes(raw_document_id))
+            merged_email = (existing or {}).get("borrower_email") or _extract_email(raw_document_id)
+            merged_address = (existing or {}).get("borrower_address") or _extract_registration_address(raw_document_id)
+            merged_zip = (existing or {}).get("borrower_zip")
+            if merged_address and not merged_zip:
+                zip_match = re.search(r"\b\d{6}\b", merged_address)
+                if zip_match:
+                    merged_zip = zip_match.group(0)
+            await db.execute(
+                """
+                INSERT INTO borrower_info (
+                    document_id, full_name, loan_status, loan_status_details_json, sum_category, rating,
+                    notes, last_loan_date, loan_count, opi_has_debt, opi_debt_amount, opi_checked_at,
+                    opi_full_name, total_invested, source, source_account_tag, borrower_address,
+                    borrower_zip, contact_source, borrower_email, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                ON CONFLICT(document_id) DO UPDATE SET
+                    full_name = COALESCE(borrower_info.full_name, excluded.full_name),
+                    loan_status = COALESCE(borrower_info.loan_status, excluded.loan_status),
+                    loan_status_details_json = COALESCE(borrower_info.loan_status_details_json, excluded.loan_status_details_json),
+                    sum_category = COALESCE(borrower_info.sum_category, excluded.sum_category),
+                    rating = COALESCE(borrower_info.rating, excluded.rating),
+                    notes = COALESCE(excluded.notes, borrower_info.notes),
+                    last_loan_date = COALESCE(borrower_info.last_loan_date, excluded.last_loan_date),
+                    loan_count = CASE
+                        WHEN borrower_info.loan_count IS NULL OR borrower_info.loan_count = 0 THEN excluded.loan_count
+                        WHEN excluded.loan_count IS NULL THEN borrower_info.loan_count
+                        ELSE MAX(borrower_info.loan_count, excluded.loan_count)
+                    END,
+                    opi_has_debt = COALESCE(borrower_info.opi_has_debt, excluded.opi_has_debt),
+                    opi_debt_amount = COALESCE(borrower_info.opi_debt_amount, excluded.opi_debt_amount),
+                    opi_checked_at = COALESCE(borrower_info.opi_checked_at, excluded.opi_checked_at),
+                    opi_full_name = COALESCE(borrower_info.opi_full_name, excluded.opi_full_name),
+                    total_invested = COALESCE(borrower_info.total_invested, excluded.total_invested),
+                    source = COALESCE(borrower_info.source, excluded.source),
+                    source_account_tag = COALESCE(borrower_info.source_account_tag, excluded.source_account_tag),
+                    borrower_address = COALESCE(borrower_info.borrower_address, excluded.borrower_address),
+                    borrower_zip = COALESCE(borrower_info.borrower_zip, excluded.borrower_zip),
+                    contact_source = COALESCE(borrower_info.contact_source, excluded.contact_source),
+                    borrower_email = COALESCE(borrower_info.borrower_email, excluded.borrower_email),
+                    updated_at = datetime('now')
+                """,
+                (
+                    clean_document_id,
+                    (existing or {}).get("full_name") or row["full_name"],
+                    (existing or {}).get("loan_status") or row["loan_status"],
+                    (existing or {}).get("loan_status_details_json") or row["loan_status_details_json"],
+                    (existing or {}).get("sum_category") or row["sum_category"],
+                    (existing or {}).get("rating") if (existing or {}).get("rating") is not None else row["rating"],
+                    merged_notes,
+                    (existing or {}).get("last_loan_date") or row["last_loan_date"],
+                    max(int((existing or {}).get("loan_count") or 0), int(row["loan_count"] or 0)) or None,
+                    (existing or {}).get("opi_has_debt") if (existing or {}).get("opi_has_debt") is not None else row["opi_has_debt"],
+                    (existing or {}).get("opi_debt_amount") if (existing or {}).get("opi_debt_amount") is not None else row["opi_debt_amount"],
+                    (existing or {}).get("opi_checked_at") or row["opi_checked_at"],
+                    (existing or {}).get("opi_full_name") or row["opi_full_name"],
+                    (existing or {}).get("total_invested") if (existing or {}).get("total_invested") is not None else row["total_invested"],
+                    (existing or {}).get("source") or row["source"],
+                    (existing or {}).get("source_account_tag") or row["source_account_tag"],
+                    merged_address or row["borrower_address"],
+                    merged_zip or row["borrower_zip"],
+                    (existing or {}).get("contact_source") or row["contact_source"],
+                    merged_email or row["borrower_email"],
+                ),
+            )
+            if raw_document_id != clean_document_id:
+                await db.execute("DELETE FROM borrower_info WHERE document_id = ?", (raw_document_id,))
+            cleaned_document_ids += 1
+        if cleaned_document_ids:
+            log.info("Cleaned %d dirty borrower_info document_id rows", cleaned_document_ids)
 
         for service, enabled, interval, hour_start, hour_end in [
             ("kapusta", 1, 600, 8, 23),

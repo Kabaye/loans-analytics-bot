@@ -31,6 +31,10 @@ SMS_SERVICE_NAMES = {
     "zaimis": "ЗАЙМись",
     "kapusta": "Kapusta",
 }
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
 ADDRESS_ABBREVIATIONS = (
     (r"^город\s+", "г. "),
     (r"^г\.?\s+", "г. "),
@@ -92,8 +96,51 @@ def _service_url(case: dict) -> str:
     return SERVICE_URLS.get(case.get("service"), "")
 
 
+def _coalesce_text(*values: object | None) -> str | None:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return None
+
+
+def _zaimis_order_code(case: dict) -> str | None:
+    if str(case.get("service") or "").lower() != "zaimis":
+        return None
+    payload = _parse_case_raw(case)
+    detail = payload.get("detail") or {}
+    order = payload.get("order") or payload.get("list") or {}
+    offer = detail.get("offer") or order.get("offer") or {}
+    code = _coalesce_text(
+        detail.get("code"),
+        order.get("code"),
+        offer.get("code"),
+    )
+    return code
+
+
+def _looks_like_uuid(value: str | None) -> bool:
+    text = str(value or "").strip()
+    return bool(text and _UUID_RE.fullmatch(text))
+
+
 def _loan_ref(case: dict) -> str:
-    return case.get("loan_number") or case.get("loan_id") or case.get("external_id") or "—"
+    loan_number = _coalesce_text(case.get("loan_number"))
+    loan_id = _coalesce_text(case.get("loan_id"))
+    external_id = _coalesce_text(case.get("external_id"))
+    zaimis_code = _zaimis_order_code(case)
+    if zaimis_code and (
+        not loan_number
+        or _looks_like_uuid(loan_number)
+        or loan_number == loan_id
+        or loan_number == external_id
+    ):
+        return zaimis_code
+    return loan_number or loan_id or external_id or "—"
+
+
+def build_case_loan_ref(case: dict) -> str:
+    return _loan_ref(case)
 
 
 def _claim_deadline_date() -> str:

@@ -42,6 +42,7 @@ from bot.services.overdue.cases import (
     send_finkit_pretrial_claim,
 )
 from bot.services.overdue.documents import (
+    build_case_loan_ref,
     CLAIM_VOLUNTARY_TERM_DAYS,
     build_postal_address_text,
     build_sms_text,
@@ -161,7 +162,8 @@ def _short_date(value: object | None) -> str:
 def _borrower_short_label(case: dict) -> str:
     full_name = (case.get("full_name") or case.get("display_name") or "").strip()
     if not full_name:
-        return case.get("loan_number") or case.get("external_id") or f"case#{case['id']}"
+        loan_ref = build_case_loan_ref(case)
+        return loan_ref if loan_ref != "—" else f"case#{case['id']}"
     parts = [part for part in full_name.split() if part]
     if len(parts) == 1:
         return parts[0]
@@ -350,12 +352,13 @@ async def _enrich_finkit_case_from_claims(case: dict) -> dict:
 
 
 def _format_case_text(case: dict) -> str:
+    loan_ref = build_case_loan_ref(case)
     lines = [
         "⚖️ <b>Просроченный кейс</b>",
         "",
         f"<b>Сервис:</b> {_display_html(case.get('service'))}",
         f"<b>Аккаунт:</b> {_display_html(case.get('account_label') or case.get('credential_label') or case.get('credential_login'))}",
-        f"<b>Займ / договор:</b> {_display_html(case.get('loan_number') or case.get('external_id'))}",
+        f"<b>Займ / договор:</b> {_display_html(loan_ref)}",
         f"<b>Дней просрочки:</b> {_display_html(case.get('days_overdue'))}",
         f"<b>Дата выдачи:</b> {_display_html(case.get('issued_at'))}",
         f"<b>Срок возврата:</b> {_display_html(case.get('due_at'))}",

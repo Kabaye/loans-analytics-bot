@@ -13,6 +13,7 @@ import pdfplumber
 
 from bot.domain.borrowers import BorrowEntry
 from bot.integrations.parsers.base import BROWSER_UA, BaseParser
+from bot.utils.borrower_address import sanitize_borrower_address
 
 log = logging.getLogger(__name__)
 
@@ -30,7 +31,7 @@ NAME_ID_FALLBACK_RE = re.compile(
     re.IGNORECASE | re.UNICODE | re.MULTILINE | re.DOTALL,
 )
 CLAIM_DEBTOR_BLOCK_RE = re.compile(
-    r"Должник:\s*(?P<name>[^\n]+)\s*\n"
+    r"Должник:\s*(?P<name>.+?)\s*\n"
     r"\(заемщик по договору займа\)\s*(?P<address>.+?)\s*\n"
     r"тел\.:?\s*(?P<phone>[^\n]+)\s*\n"
     r"(?:эл\.почта|эл\. почта|эл\.почта:|эл\. почта:):?\s*(?P<email>[^\n]+)",
@@ -338,7 +339,7 @@ class FinkitParser(BaseParser):
             if not match:
                 return result
             result["debtor_name"] = " ".join(match.group("name").split()).strip()
-            result["debtor_address"] = " ".join(match.group("address").replace("\n", " ").split()).strip(" ,")
+            result["debtor_address"] = sanitize_borrower_address(match.group("address"), result["debtor_name"])
             result["debtor_phone"] = " ".join(match.group("phone").split()).strip()
             result["debtor_email"] = " ".join(match.group("email").split()).strip()
             return result

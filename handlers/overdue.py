@@ -42,6 +42,7 @@ from bot.services.overdue.cases import (
     send_finkit_pretrial_claim,
 )
 from bot.services.overdue.documents import (
+    CLAIM_VOLUNTARY_TERM_DAYS,
     build_postal_address_text,
     build_sms_text,
     collect_claim_missing_fields,
@@ -349,7 +350,6 @@ async def _enrich_finkit_case_from_claims(case: dict) -> dict:
 
 
 def _format_case_text(case: dict) -> str:
-    voluntary_days = case.get("voluntary_term_days")
     lines = [
         "⚖️ <b>Просроченный кейс</b>",
         "",
@@ -372,7 +372,7 @@ def _format_case_text(case: dict) -> str:
         f"<b>Проценты:</b> {_money(case.get('accrued_percent'))}",
         f"<b>Пеня:</b> {_money(case.get('fine_outstanding'))}",
         f"<b>Итого:</b> {_money(case.get('total_due'))}",
-        f"<b>Срок добровольного погашения:</b> {voluntary_days} дн." if voluntary_days else "<b>Срок добровольного погашения:</b> —",
+        f"<b>Срок добровольного погашения:</b> {CLAIM_VOLUNTARY_TERM_DAYS} дн.",
     ]
     notes = _case_notes(case)
     if notes:
@@ -1012,12 +1012,11 @@ async def cb_overdue_edit(callback: CallbackQuery, state: FSMContext):
     ])
     await callback.message.edit_text(
         "📝 <b>Данные должника</b>\n\n"
-        "Отправьте 5 строк именно по должнику:\n"
+        "Отправьте 4 строки именно по должнику:\n"
         "1. Адрес должника (не ваш)\n"
         "2. ZIP-код (или '-' для автопоиска)\n"
         "3. Телефон (или '-')\n"
-        "4. Email (или '-')\n"
-        "5. Срок добровольного погашения в днях\n\n"
+        "4. Email (или '-')\n\n"
         "Если ZIP не знаете, я попробую найти его автоматически. Кнопка Белпочты оставлена как запасной вариант.",
         reply_markup=kb,
         parse_mode="HTML",
@@ -1031,18 +1030,10 @@ async def msg_overdue_contacts(message: Message, state: FSMContext):
     data = await state.get_data()
     case_id = data.get("case_id")
     parts = [line.strip() for line in (message.text or "").splitlines() if line.strip()]
-    if len(parts) < 5:
-        await message.answer("Нужно 5 строк: адрес, ZIP, телефон, email, срок в днях.")
+    if len(parts) < 4:
+        await message.answer("Нужно 4 строки: адрес, ZIP, телефон, email.")
         return
-    address, zip_code_raw, phone, email, voluntary_days_raw = parts[:5]
-    try:
-        voluntary_days = int(voluntary_days_raw)
-    except ValueError:
-        await message.answer("Срок добровольного погашения должен быть целым числом дней.")
-        return
-    if voluntary_days <= 0:
-        await message.answer("Срок добровольного погашения должен быть больше нуля.")
-        return
+    address, zip_code_raw, phone, email = parts[:4]
     zip_code = None if zip_code_raw == "-" else zip_code_raw
     if not zip_code:
         zip_code = await resolve_belarus_zip(address)
@@ -1053,7 +1044,6 @@ async def msg_overdue_contacts(message: Message, state: FSMContext):
         borrower_zip=zip_code,
         borrower_phone=None if phone == "-" else phone,
         borrower_email=None if email == "-" else email,
-        voluntary_term_days=voluntary_days,
         contact_source="manual",
     )
     await state.clear()

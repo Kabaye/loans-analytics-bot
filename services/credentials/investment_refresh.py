@@ -21,13 +21,12 @@ from bot.repositories.borrowers import (
     upsert_borrower_contacts,
     upsert_borrower_from_investment,
 )
-from bot.services.borrowers.enrichment import list_borrower_ids_with_documents
 from bot.services.base.providers import (
     ensure_finkit_parser,
-    ensure_zaimis_parser,
     list_service_credentials,
     telegram_user_tag,
 )
+from bot.services.zaimis_sync import sync_zaimis_account
 
 log = logging.getLogger(__name__)
 
@@ -299,7 +298,6 @@ async def refresh_investments(bot) -> None:
                         settled_loans=stats["settled"],
                         overdue_loans=stats["overdue"],
                         avg_rating=avg_rating,
-                        total_invested=stats["invested"],
                     )
 
                 if pdf_enriched:
@@ -320,107 +318,19 @@ async def refresh_investments(bot) -> None:
     try:
         creds = await list_service_credentials("zaimis")
         for cred in creds:
-            parser = None
             try:
                 user_tag = telegram_user_tag(cred)
-                parser = await ensure_zaimis_parser(cred)
-                if parser is None:
-                    errors.append(f"Zaimis login failed: {cred.login}")
-                    continue
-
-                orders = await parser.fetch_investments()
-                if parser.needs_reauth:
-                    new_parser = await ensure_zaimis_parser(cred, force_login=True)
-                    if new_parser is None:
-                        errors.append(f"Zaimis re-login failed: {cred.login}")
-                        continue
-                    try:
-                        await parser.close()
-                    except Exception:
-                        pass
-                    parser = new_parser
-                    orders = await parser.fetch_investments()
-
-                zaimis_stats: dict[str, dict] = {}
-                for order in orders:
-                    counterparty = order.get("counterparty", {}) or {}
-                    borrower_user_id = str(counterparty.get("id", ""))
-                    if not borrower_user_id:
-                        continue
-                    offer = order.get("offer", {}) or {}
-                    if borrower_user_id not in zaimis_stats:
-                        zaimis_stats[borrower_user_id] = {
-                            "full_name": None,
-                            "display_name": counterparty.get("displayName", ""),
-                            "total": 0,
-                            "settled": 0,
-                            "overdue": 0,
-                            "ratings": [],
-                            "invested": 0.0,
-                        }
-                    stats = zaimis_stats[borrower_user_id]
-                    stats["total"] += 1
-                    state = order.get("state")
-                    if state == 3:
-                        stats["settled"] += 1
-                    if state == 4:
-                        stats["overdue"] += 1
-                    try:
-                        stats["invested"] += float(order.get("amount", 0))
-                    except (ValueError, TypeError):
-                        pass
-                    score = offer.get("score")
-                    if score is not None:
-                        try:
-                            stats["ratings"].append(float(score))
-                        except (ValueError, TypeError):
-                            pass
-                    total_zaimis += 1
-                    zaimis_by_user[user_tag] = zaimis_by_user.get(user_tag, 0) + 1
-
-                for borrower_user_id, stats in zaimis_stats.items():
-                    avg_rating = sum(stats["ratings"]) / len(stats["ratings"]) if stats["ratings"] else None
-                    await upsert_borrower_from_investment(
-                        service="zaimis",
-                        borrower_user_id=borrower_user_id,
-                        full_name=stats["full_name"] or None,
-                        display_name=stats["display_name"] or None,
-                        total_loans=stats["total"],
-                        settled_loans=stats["settled"],
-                        overdue_loans=stats["overdue"],
-                        avg_rating=avg_rating,
-                        total_invested=stats["invested"],
-                    )
-
-                try:
-                    skip_counterparty_ids = await list_borrower_ids_with_documents(
-                        "zaimis",
-                        list(zaimis_stats.keys()),
-                    )
-                    pdf_results = await parser.enrich_borrowers_from_orders(
-                        orders,
-                        skip_counterparty_ids=skip_counterparty_ids,
-                    )
-                    for borrower_user_id, (full_name, document_id) in pdf_results.items():
-                        await upsert_borrower(
-                            service="zaimis",
-                            borrower_user_id=borrower_user_id,
-                            full_name=full_name,
-                            document_id=document_id,
-                            source=f"zaimis_archive_{user_tag}",
-                        )
-                    if pdf_results:
-                        log.info("Zaimis PDF: saved %d borrowers with ИН", len(pdf_results))
-                except Exception as exc:
-                    errors.append(f"Zaimis PDF enrichment: {exc}")
+                result = await sync_zaimis_account(
+                    cred,
+                    include_pdf=True,
+                    sync_overdue_cases=False,
+                )
+                total_zaimis += result.total_orders
+                zaimis_by_user[user_tag] = zaimis_by_user.get(user_tag, 0) + result.total_orders
+                if result.pdf_enriched:
+                    log.info("Zaimis PDF: saved %d borrowers with ИН", result.pdf_enriched)
             except Exception as exc:
                 errors.append(f"Zaimis {cred.login}: {exc}")
-            finally:
-                if parser is not None:
-                    try:
-                        await parser.close()
-                    except Exception:
-                        pass
     except Exception as exc:
         errors.append(f"Zaimis global: {exc}")
 

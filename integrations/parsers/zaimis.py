@@ -8,6 +8,7 @@ import json
 import logging
 import re
 from datetime import datetime
+from enum import IntEnum
 
 import pdfplumber
 
@@ -20,6 +21,7 @@ log = logging.getLogger(__name__)
 LOGIN_URL = "https://zaimis.by/app/api/auth/login"
 OFFERS_URL = "https://zaimis.by/app/api/offer"
 ORDER_DETAIL_URL = "https://zaimis.by/app/api/order"
+ORDERS_URL = "https://zaimis.by/app/api/user/orders"
 DOCUMENT_URL = "https://zaimis.by/app/api/documents"
 
 # Belarus personal ID: 7 digits + letter + 3 digits + 2 letters + 1 digit
@@ -42,6 +44,35 @@ HEADERS = {
 }
 
 PARALLEL_BATCH = 10  # concurrent page fetches
+
+
+class ZaimisOrderStatus(IntEnum):
+    NOT_SIGNED = 0
+    DRAFT = 1
+    REJECTED = 2
+    ACTIVE = 3
+    EXPIRED = 4
+    CLOSED = 5
+    APPROVAL = 6
+    PAYMENT_AWAITING = 7
+    CLOSED_EXPIRED = 8
+    COURT = 9
+    CLAIM = 10
+
+
+ZAIMIS_STATUS_LABELS: dict[int, str] = {
+    ZaimisOrderStatus.NOT_SIGNED: "Не подписан",
+    ZaimisOrderStatus.DRAFT: "На подписании",
+    ZaimisOrderStatus.REJECTED: "Отклонен",
+    ZaimisOrderStatus.ACTIVE: "Активен",
+    ZaimisOrderStatus.EXPIRED: "Просрочен",
+    ZaimisOrderStatus.CLOSED: "Возвращён",
+    ZaimisOrderStatus.APPROVAL: "Неизвестно",
+    ZaimisOrderStatus.PAYMENT_AWAITING: "Ожидание платежа",
+    ZaimisOrderStatus.CLOSED_EXPIRED: "Возвращён с просрочкой",
+    ZaimisOrderStatus.COURT: "Запрос в суд",
+    ZaimisOrderStatus.CLAIM: "Направлена претензия",
+}
 
 
 def merge_filters(subs: list[Subscription]) -> tuple[dict, dict]:
@@ -72,6 +103,30 @@ def merge_filters(subs: list[Subscription]) -> tuple[dict, dict]:
         query_params["isIncomeConfirmed"] = "true"
 
     return filters, query_params
+
+
+def resolve_order_borrower_identity(order: dict | None, detail: dict | None = None) -> dict:
+    payload = detail or order or {}
+    borrower = payload.get("borrower")
+    if isinstance(borrower, dict) and borrower.get("id"):
+        return borrower
+    type_code = payload.get("type")
+    try:
+        type_code = int(type_code) if type_code is not None else None
+    except (TypeError, ValueError):
+        type_code = None
+    offer = payload.get("offer") or {}
+    offer_owner = payload.get("offerOwner") or offer.get("owner") or {}
+    counterparty = payload.get("counterparty") or {}
+    if type_code == 1 and isinstance(offer_owner, dict) and offer_owner.get("id"):
+        return offer_owner
+    if type_code == 0 and isinstance(counterparty, dict) and counterparty.get("id"):
+        return counterparty
+    if isinstance(offer_owner, dict) and offer_owner.get("id"):
+        return offer_owner
+    if isinstance(counterparty, dict):
+        return counterparty
+    return {}
 
 
 class ZaimisParser(BaseParser):
@@ -117,6 +172,26 @@ class ZaimisParser(BaseParser):
         self._token = token
         self._needs_reauth = False
         return True
+
+    def _auth_headers(self) -> dict[str, str]:
+        return {**HEADERS, "Authorization": f"Bearer {self._token}"}
+
+    async def _fetch_api_json(self, url: str, *, params: dict | None = None) -> dict | None:
+        if not self._token:
+            return None
+        session = await self._get_session()
+        try:
+            async with session.get(url, params=params, headers=self._auth_headers()) as resp:
+                if resp.status == 401:
+                    self._needs_reauth = True
+                    return None
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+        except Exception as e:
+            log.warning("Zaimis API error %s: %s", url, e)
+            return None
+        return data if isinstance(data, dict) else None
 
     async def _fetch_page(self, page: int, filters_json: str,
                           query_params: dict) -> dict:
@@ -270,35 +345,55 @@ class ZaimisParser(BaseParser):
     async def fetch_lends(self) -> list[BorrowEntry]:
         return await self._fetch_offers({"type": {"max": "0"}}, "lend", "lend")
 
-    async def fetch_investments(self, page: int = 1, per_page: int = 100) -> list[dict]:
-        """Fetch user's investment orders (history of funded loans).
-        Returns raw dicts (not BorrowEntry) since these are investments, not borrow requests."""
+    async def list_orders(
+        self,
+        page: int = 1,
+        per_page: int = 100,
+        *,
+        query: str = "",
+        filters: dict | None = None,
+        statuses: list[int] | None = None,
+        sort_by: str | None = None,
+        sort_order: str | None = None,
+    ) -> list[dict]:
+        """Fetch user's order history as raw API rows."""
         if not self._token:
-            log.error("Zaimis: not logged in, cannot fetch investments")
+            log.error("Zaimis: not logged in, cannot fetch orders")
             return []
 
         session = await self._get_session()
-        headers = {**HEADERS, "Authorization": f"Bearer {self._token}"}
         all_orders: list[dict] = []
         current_page = page
 
         while True:
-            params = {"page": str(current_page), "perPage": str(per_page)}
+            params: dict[str, object] = {
+                "query": query,
+                "page": str(current_page),
+                "perPage": str(per_page),
+            }
+            if filters is not None:
+                params["filters"] = json.dumps(filters, ensure_ascii=False)
+            if sort_by:
+                params["sortBy"] = sort_by
+            if sort_order:
+                params["sortOrder"] = sort_order
+            if statuses:
+                params["statuses[]"] = [str(status) for status in statuses]
             try:
                 async with session.get(
-                    "https://zaimis.by/app/api/user/orders",
+                    ORDERS_URL,
                     params=params,
-                    headers=headers,
+                    headers=self._auth_headers(),
                 ) as resp:
                     if resp.status == 401:
                         self._needs_reauth = True
                         break
                     if resp.status != 200:
-                        log.error("Zaimis investments page %d: HTTP %s", current_page, resp.status)
+                        log.error("Zaimis orders page %d: HTTP %s", current_page, resp.status)
                         break
                     data = await resp.json()
             except Exception as e:
-                log.exception("Zaimis investments page %d error: %s", current_page, e)
+                log.exception("Zaimis orders page %d error: %s", current_page, e)
                 break
 
             items = data.get("data", [])
@@ -311,32 +406,41 @@ class ZaimisParser(BaseParser):
                 break
             current_page += 1
 
-        log.info("Zaimis: fetched %d investment orders", len(all_orders))
+        log.info("Zaimis: fetched %d orders", len(all_orders))
         return all_orders
 
-    async def fetch_order_detail(self, order_id: str) -> dict | None:
+    async def fetch_investments(self, page: int = 1, per_page: int = 100) -> list[dict]:
+        """Backward-compatible alias for the historical investments fetch."""
+        return await self.list_orders(page=page, per_page=per_page)
+
+    async def get_order_detail(self, order_id: str) -> dict | None:
         """Fetch single order detail (includes document info)."""
-        if not self._token:
-            return None
-        session = await self._get_session()
-        headers = {**HEADERS, "Authorization": f"Bearer {self._token}"}
         try:
-            async with session.get(
-                f"{ORDER_DETAIL_URL}/{order_id}", headers=headers
-            ) as resp:
-                if resp.status != 200:
-                    return None
-                return await resp.json()
+            return await self._fetch_api_json(f"{ORDER_DETAIL_URL}/{order_id}")
         except Exception as e:
             log.warning("Zaimis order detail error %s: %s", order_id, e)
             return None
 
-    async def fetch_document_pdf(self, document_id: str) -> bytes | None:
+    async def fetch_order_detail(self, order_id: str) -> dict | None:
+        return await self.get_order_detail(order_id)
+
+    async def get_order_expired_info(self, order_id: str) -> dict | None:
+        """Fetch overdue-related borrower/contact payload for one order."""
+        try:
+            return await self._fetch_api_json(f"{ORDER_DETAIL_URL}/{order_id}/expiredInfo")
+        except Exception as e:
+            log.warning("Zaimis expiredInfo error %s: %s", order_id, e)
+            return None
+
+    async def fetch_order_expired_info(self, order_id: str) -> dict | None:
+        return await self.get_order_expired_info(order_id)
+
+    async def get_document_pdf(self, document_id: str) -> bytes | None:
         """Download PDF by documentId (base64 in JSON response)."""
         if not self._token:
             return None
         session = await self._get_session()
-        headers = {**HEADERS, "Authorization": f"Bearer {self._token}"}
+        headers = self._auth_headers()
         try:
             async with session.get(
                 f"{DOCUMENT_URL}/{document_id}/pdf", headers=headers
@@ -351,6 +455,9 @@ class ZaimisParser(BaseParser):
         except Exception as e:
             log.warning("Zaimis document PDF error %s: %s", document_id, e)
             return None
+
+    async def fetch_document_pdf(self, document_id: str) -> bytes | None:
+        return await self.get_document_pdf(document_id)
 
     @staticmethod
     def parse_borrower_from_pdf(pdf_bytes: bytes) -> tuple[str | None, str | None]:
@@ -393,24 +500,23 @@ class ZaimisParser(BaseParser):
         orders: list[dict],
         max_concurrent: int = 4,
         *,
+        skip_borrower_ids: set[str] | None = None,
         skip_counterparty_ids: set[str] | None = None,
     ) -> dict[str, tuple[str | None, str | None]]:
-        """For each unique counterparty, fetch one order detail → PDF → extract ИН.
-        Returns {counterparty_id: (full_name, document_id)}."""
-        skip_counterparty_ids = skip_counterparty_ids or set()
+        """For each unique borrower, fetch one order detail → PDF → extract legal identity."""
+        skip_ids = set(skip_borrower_ids or set()) | set(skip_counterparty_ids or set())
 
-        # Group orders by counterparty, pick one order per borrower (prefer settled)
-        borrower_orders: dict[str, str] = {}  # cp_id → order_id
+        borrower_orders: dict[str, str] = {}
         for order in orders:
-            cp = order.get("counterparty", {}) or {}
-            cp_id = str(cp.get("id", ""))
-            if not cp_id:
+            borrower = resolve_order_borrower_identity(order)
+            borrower_id = str(borrower.get("id", "")).strip()
+            if not borrower_id:
                 continue
-            if cp_id in skip_counterparty_ids:
+            if borrower_id in skip_ids:
                 continue
             state = order.get("state")
-            if cp_id not in borrower_orders or state == 3:
-                borrower_orders[cp_id] = order["id"]
+            if borrower_id not in borrower_orders or state == ZaimisOrderStatus.ACTIVE:
+                borrower_orders[borrower_id] = order["id"]
 
         if not borrower_orders:
             log.info("Zaimis PDF: all borrowers already enriched")
@@ -420,28 +526,28 @@ class ZaimisParser(BaseParser):
         results: dict[str, tuple[str | None, str | None]] = {}
         sem = asyncio.Semaphore(max_concurrent)
 
-        async def _enrich_one(cp_id: str, order_id: str):
+        async def _enrich_one(borrower_id: str, order_id: str):
             async with sem:
-                detail = await self.fetch_order_detail(order_id)
+                detail = await self.get_order_detail(order_id)
                 if not detail:
                     return
                 doc = detail.get("document", {}) or {}
                 doc_file_id = doc.get("documentId")
                 if not doc_file_id:
                     return
-                pdf_bytes = await self.fetch_document_pdf(doc_file_id)
+                pdf_bytes = await self.get_document_pdf(doc_file_id)
                 if not pdf_bytes:
                     return
                 full_name, doc_id = self.parse_borrower_from_pdf(pdf_bytes)
                 if doc_id:
-                    results[cp_id] = (full_name, doc_id)
+                    results[borrower_id] = (full_name, doc_id)
                     log.info(
                         "Zaimis PDF enriched: %s → %s / %s",
-                        cp_id[:8], full_name, doc_id,
+                        borrower_id[:8], full_name, doc_id,
                     )
 
         await asyncio.gather(
-            *[_enrich_one(cp_id, oid) for cp_id, oid in borrower_orders.items()],
+            *[_enrich_one(borrower_id, oid) for borrower_id, oid in borrower_orders.items()],
             return_exceptions=True,
         )
         log.info("Zaimis PDF: enriched %d/%d borrowers", len(results), len(borrower_orders))

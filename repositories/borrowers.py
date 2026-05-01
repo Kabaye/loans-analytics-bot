@@ -5,10 +5,18 @@ import re
 from typing import Iterable
 
 from bot.repositories.db import get_db
+from bot.repositories.settings import save_api_change_alert
+from bot.utils.borrower_address import sanitize_borrower_address
 
 _NAME_MASK_CHAR = "*"
 _LEGAL_FULL_NAME_RE = re.compile(r"^[A-ZА-ЯЁ]+(?:[-'][A-ZА-ЯЁ]+)?(?:\s+[A-ZА-ЯЁ]+(?:[-'][A-ZА-ЯЁ]+)?){2,}$")
 _DOCUMENT_ID_RE = re.compile(r"\b[0-9A-Z]{14}\b")
+_DOCUMENT_ID_KNOWN_FAMILIES: list[tuple[str, re.Pattern[str]]] = [
+    ("belarus-pb", re.compile(r"^[3-7]\d{6}[ABHMCEK]\d{3}PB\d$")),
+    ("special-va", re.compile(r"^[3-7]\d{6}[ABHMCEK]\d{3}VA\d$")),
+    ("special-vf", re.compile(r"^[3-7]\d{6}[ABHMCEK]\d{3}VF\d$")),
+]
+_UNKNOWN_DOCUMENT_ID_ALERTS: set[str] = set()
 
 _SOURCE_PRIORITY = {
     "search": 10,
@@ -45,11 +53,53 @@ def _is_probable_legal_full_name(value: str | None) -> bool:
 
 
 def _normalize_document_id(value: str | None) -> str | None:
+    normalized, _ = _extract_document_id_info(value)
+    return normalized
+
+
+def _extract_document_id_info(value: str | None) -> tuple[str | None, str | None]:
     text = str(value or "").strip().upper()
     if not text:
-        return None
+        return None, None
     match = _DOCUMENT_ID_RE.search(text)
-    return match.group(0) if match else None
+    if not match:
+        return None, None
+    normalized = match.group(0)
+    return normalized, _classify_document_id_family(normalized)
+
+
+def _classify_document_id_family(value: str | None) -> str | None:
+    normalized = str(value or "").strip().upper()
+    if not normalized:
+        return None
+    for family, pattern in _DOCUMENT_ID_KNOWN_FAMILIES:
+        if pattern.fullmatch(normalized):
+            return family
+    return None
+
+
+async def _alert_unknown_document_id(
+    document_id: str | None,
+    *,
+    source: str,
+    context: dict[str, object] | None = None,
+) -> None:
+    normalized = str(document_id or "").strip().upper()
+    if not normalized or _classify_document_id_family(normalized) is not None:
+        return
+    if normalized in _UNKNOWN_DOCUMENT_ID_ALERTS:
+        return
+    _UNKNOWN_DOCUMENT_ID_ALERTS.add(normalized)
+    details = f"Unknown document_id format seen from {source}: {normalized}"
+    sample_payload = {"document_id": normalized, "source": source}
+    if context:
+        sample_payload["context"] = context
+    await save_api_change_alert(
+        service="borrowers",
+        title="Unknown document_id format",
+        details=details,
+        sample_json=json.dumps(sample_payload, ensure_ascii=False, sort_keys=True),
+    )
 
 
 def _merge_full_name(existing: str | None, incoming: str | None) -> str | None:
@@ -62,6 +112,10 @@ def _merge_full_name(existing: str | None, incoming: str | None) -> str | None:
     if _NAME_MASK_CHAR in new_value and _NAME_MASK_CHAR not in current:
         return current
     return new_value
+
+
+def _can_write_borrower_info(existing: dict | None, full_name: str | None) -> bool:
+    return existing is not None or _normalize_upper(full_name) is not None
 
 
 def _merge_service_identity(
@@ -230,6 +284,49 @@ def _serialize_status_details(value) -> str | None:
     return json.dumps(value, ensure_ascii=False)
 
 
+def _parse_status_details(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            raw_items = [text]
+        else:
+            raw_items = parsed if isinstance(parsed, list) else [text]
+    elif isinstance(value, list):
+        raw_items = value
+    else:
+        raw_items = [value]
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def _status_flags(loan_status: str | None, details_value) -> tuple[bool | None, bool | None]:
+    status = str(loan_status or "").strip()
+    details = _parse_status_details(details_value)
+    if not status and not details:
+        return None, None
+    has_active_loan = status == "текущий" or "есть текущий займ" in details
+    has_overdue = (
+        status.startswith("просрочка")
+        or status == "закрыт, были просрочки"
+        or "были просрочки в истории" in details
+        or any(str(item).startswith("активная просрочка") for item in details)
+    )
+    return has_active_loan, has_overdue
+
+
 async def _fetch_borrower_row(db, service: str, borrower_user_id: str) -> dict | None:
     rows = await db.execute_fetchall(
         """
@@ -282,6 +379,31 @@ def _status_from_overdue_days(days: int | None) -> str:
     return "просрочка > 30 дней"
 
 
+def _base_status_from_counts(
+    total_loans: int | None,
+    settled_loans: int | None,
+    overdue_loans: int | None,
+) -> tuple[str | None, list[str]]:
+    total = int(total_loans or 0)
+    settled = int(settled_loans or 0)
+    overdue = int(overdue_loans or 0)
+    active = max(total - settled - overdue, 0)
+    details: list[str] = []
+    if overdue > 0:
+        details.append("были просрочки в истории")
+    if active > 0:
+        details.append("есть текущий займ")
+    if overdue > 0:
+        if active > 0:
+            return "текущий", details
+        return "закрыт, были просрочки", details
+    if active > 0:
+        return "текущий", details
+    if total > 0:
+        return "в срок", ["закрыт без просрочек"]
+    return None, []
+
+
 async def _derive_status_payload(db, document_id: str) -> tuple[str | None, str | None]:
     overdue_rows = await db.execute_fetchall(
         """
@@ -293,48 +415,42 @@ async def _derive_status_payload(db, document_id: str) -> tuple[str | None, str 
         """,
         (document_id,),
     )
-    stats_rows = await db.execute_fetchall(
+    history_rows = await db.execute_fetchall(
         """
         SELECT
-            COALESCE(SUM(total_loans), 0) AS total_loans,
-            COALESCE(SUM(settled_loans), 0) AS settled_loans,
-            COALESCE(SUM(overdue_loans), 0) AS overdue_loans
-        FROM borrowers
+            COUNT(*) AS total_cases,
+            SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END) AS active_cases
+        FROM overdue_cases
         WHERE document_id = ?
         """,
         (document_id,),
     )
-    stats = dict(stats_rows[0]) if stats_rows else {"total_loans": 0, "settled_loans": 0, "overdue_loans": 0}
-    total_loans = int(stats.get("total_loans") or 0)
-    settled_loans = int(stats.get("settled_loans") or 0)
-    overdue_loans = int(stats.get("overdue_loans") or 0)
-    active_loans = max(total_loans - settled_loans - overdue_loans, 0)
-    details: list[str] = []
+    existing = await _fetch_borrower_info_row(db, document_id)
+    current_status = str((existing or {}).get("loan_status") or "").strip() or None
+    current_details = _parse_status_details((existing or {}).get("loan_status_details_json"))
+    total_cases = int((history_rows[0]["total_cases"] or 0) if history_rows else 0)
+    active_cases = int((history_rows[0]["active_cases"] or 0) if history_rows else 0)
+    has_any_overdue = total_cases > 0
+    has_past_overdue = total_cases > active_cases
 
     if overdue_rows:
         max_days = int(overdue_rows[0]["days_overdue"] or 0)
-        details.append(f"активная просрочка {max_days} д.")
-        if overdue_loans > 0:
+        details = [f"активная просрочка {max_days} д."]
+        if has_past_overdue:
             details.append("были просрочки в истории")
-        if active_loans > 0:
+        if current_status == "текущий" or "есть текущий займ" in current_details:
             details.append("есть текущий займ")
         return _status_from_overdue_days(max_days), _serialize_status_details(details)
 
-    if overdue_loans > 0:
-        details.append("были просрочки в истории")
-        if active_loans > 0:
+    if has_any_overdue:
+        details = ["были просрочки в истории"]
+        if current_status == "текущий" or "есть текущий займ" in current_details:
             details.append("есть текущий займ")
             return "текущий", _serialize_status_details(details)
         return "закрыт, были просрочки", _serialize_status_details(details)
 
-    if active_loans > 0:
-        details.append("есть текущий займ")
-        return "текущий", _serialize_status_details(details)
-
-    if total_loans > 0:
-        details.append("закрыт без просрочек")
-        return "в срок", _serialize_status_details(details)
-
+    if current_status or current_details:
+        return current_status, _serialize_status_details(current_details)
     return None, None
 
 
@@ -344,16 +460,18 @@ async def _refresh_borrower_status(db, document_id: str) -> None:
     loan_status, details_json = await _derive_status_payload(db, document_id)
     if loan_status is None and details_json is None:
         return
+    existing = await _fetch_borrower_info_row(db, document_id)
+    if existing is None:
+        return
     await db.execute(
         """
-        INSERT INTO borrower_info (document_id, loan_status, loan_status_details_json, updated_at)
-        VALUES (?, ?, ?, datetime('now'))
-        ON CONFLICT(document_id) DO UPDATE SET
-            loan_status = COALESCE(excluded.loan_status, borrower_info.loan_status),
-            loan_status_details_json = COALESCE(excluded.loan_status_details_json, borrower_info.loan_status_details_json),
+        UPDATE borrower_info
+        SET loan_status = COALESCE(?, loan_status),
+            loan_status_details_json = COALESCE(?, loan_status_details_json),
             updated_at = datetime('now')
+        WHERE document_id = ?
         """,
-        (document_id, loan_status, details_json),
+        (loan_status, details_json, document_id),
     )
 
 
@@ -369,7 +487,7 @@ async def upsert_borrower(
     source_account_tag: str | None = None,
 ) -> None:
     normalized_full_name = _normalize_upper(full_name)
-    normalized_document_id = _normalize_document_id(document_id)
+    normalized_document_id, document_id_family = _extract_document_id_info(document_id)
     current_display = (display_name or "").strip() or None
     db = await get_db()
     try:
@@ -386,13 +504,22 @@ async def upsert_borrower(
             merged_display_names,
         )
         merged_document_id = normalized_document_id or _normalize_document_id((existing or {}).get("document_id"))
+        if not merged_document_id and merged_full_name:
+            merged_display_names = _merge_display_names(merged_display_names, merged_full_name)
+        if not merged_document_id and not merged_display_names:
+            return
+        if normalized_document_id and document_id_family is None:
+            await _alert_unknown_document_id(
+                normalized_document_id,
+                source="upsert_borrower",
+                context={"service": service, "borrower_user_id": borrower_user_id},
+            )
 
         await db.execute(
             """
-            INSERT INTO borrowers (service, borrower_user_id, full_name, display_names, document_id)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO borrowers (service, borrower_user_id, display_names, document_id)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(service, borrower_user_id) DO UPDATE SET
-                full_name = ?,
                 display_names = ?,
                 document_id = COALESCE(excluded.document_id, borrowers.document_id),
                 last_seen = datetime('now')
@@ -400,10 +527,8 @@ async def upsert_borrower(
             (
                 service,
                 borrower_user_id,
-                merged_full_name,
                 _serialize_display_names(merged_display_names),
                 merged_document_id,
-                merged_full_name,
                 _serialize_display_names(merged_display_names),
             ),
         )
@@ -424,27 +549,28 @@ async def upsert_borrower(
                 merged_full_name,
                 [],
             )
-            await db.execute(
-                """
-                INSERT INTO borrower_info (document_id, full_name, source, source_account_tag, updated_at)
-                VALUES (?, ?, ?, ?, datetime('now'))
-                ON CONFLICT(document_id) DO UPDATE SET
-                    full_name = ?,
-                    source = ?,
-                    source_account_tag = ?,
-                    updated_at = datetime('now')
-                """,
-                (
-                    merged_document_id,
-                    info_full_name,
-                    chosen_source,
-                    chosen_tag,
-                    info_full_name,
-                    chosen_source,
-                    chosen_tag,
-                ),
-            )
-            await _refresh_borrower_status(db, merged_document_id)
+            if _can_write_borrower_info(existing_info, info_full_name):
+                await db.execute(
+                    """
+                    INSERT INTO borrower_info (document_id, full_name, source, source_account_tag, updated_at)
+                    VALUES (?, ?, ?, ?, datetime('now'))
+                    ON CONFLICT(document_id) DO UPDATE SET
+                        full_name = ?,
+                        source = ?,
+                        source_account_tag = ?,
+                        updated_at = datetime('now')
+                    """,
+                    (
+                        merged_document_id,
+                        info_full_name,
+                        chosen_source,
+                        chosen_tag,
+                        info_full_name,
+                        chosen_source,
+                        chosen_tag,
+                    ),
+                )
+                await _refresh_borrower_status(db, merged_document_id)
         await db.commit()
     finally:
         await db.close()
@@ -455,9 +581,11 @@ async def lookup_borrower(service: str, borrower_user_id: str) -> dict | None:
     try:
         rows = await db.execute_fetchall(
             """
-            SELECT b.service, b.borrower_user_id, b.document_id, b.full_name, b.display_names,
-                   b.total_loans, b.settled_loans, b.overdue_loans,
-                   b.avg_rating, b.total_invested,
+            SELECT b.service, b.borrower_user_id, b.document_id,
+                   bi.full_name AS full_name,
+                   b.display_names,
+                   bi.loan_count AS total_loans,
+                   bi.rating AS avg_rating,
                    bi.loan_status, bi.loan_status_details_json,
                    bi.sum_category, bi.rating AS bi_rating,
                    bi.notes, bi.last_loan_date, bi.loan_count, bi.source AS info_source,
@@ -475,6 +603,11 @@ async def lookup_borrower(service: str, borrower_user_id: str) -> dict | None:
         row = dict(rows[0])
         row["display_names"] = _parse_display_names(row.get("display_names"))
         row["current_display_name"] = _current_display_name(row.get("display_names"))
+        if not row.get("full_name"):
+            row["full_name"] = row.get("current_display_name")
+        has_active_loan, has_overdue = _status_flags(row.get("loan_status"), row.get("loan_status_details_json"))
+        row["has_active_loan"] = has_active_loan
+        row["has_overdue"] = has_overdue
         row["source"] = row.get("info_source")
         return row
     finally:
@@ -544,6 +677,7 @@ async def lookup_borrower_contacts(document_id: str) -> dict | None:
             return None
         row = dict(rows[0])
         display_names = await _collect_display_names_by_document(db, document_id)
+        clean_address = sanitize_borrower_address(row.get("borrower_address"), row.get("full_name"))
         return {
             "document_id": row.get("document_id"),
             "full_name": row.get("full_name"),
@@ -551,7 +685,7 @@ async def lookup_borrower_contacts(document_id: str) -> dict | None:
             "current_display_name": _current_display_name(display_names),
             "phone": row.get("borrower_phone"),
             "email": row.get("borrower_email"),
-            "address": row.get("borrower_address"),
+            "address": clean_address,
             "zip": row.get("borrower_zip"),
             "source": row.get("contact_source") or row.get("source"),
             "source_account_tag": row.get("source_account_tag"),
@@ -588,13 +722,16 @@ async def search_borrower_info(query: str, limit: int = 10) -> list[dict]:
             seen_docs = {row["document_id"] for row in rows_list if row.get("document_id")}
             extra = await db.execute_fetchall(
                 """
-                SELECT DISTINCT full_name, document_id, service,
-                       total_loans, settled_loans, overdue_loans, display_names
-                FROM borrowers
-                WHERE REPLACE(COALESCE(full_name, ''), 'Ё', 'Е') LIKE ?
-                   OR COALESCE(full_name, '') LIKE ?
-                   OR REPLACE(COALESCE(display_names, ''), 'Ё', 'Е') LIKE ?
-                   OR COALESCE(display_names, '') LIKE ?
+                SELECT DISTINCT bi.full_name AS full_name, b.document_id, b.service,
+                       bi.rating AS rating,
+                       bi.loan_count AS loan_count,
+                       display_names
+                FROM borrowers b
+                JOIN borrower_info bi ON bi.document_id = b.document_id
+                WHERE REPLACE(COALESCE(bi.full_name, ''), 'Ё', 'Е') LIKE ?
+                   OR COALESCE(bi.full_name, '') LIKE ?
+                   OR REPLACE(COALESCE(b.display_names, ''), 'Ё', 'Е') LIKE ?
+                   OR COALESCE(b.display_names, '') LIKE ?
                 LIMIT ?
                 """,
                 (f"%{query_upper}%", f"%{query_value}%", f"%{query_upper}%", f"%{query_value}%", limit),
@@ -613,17 +750,16 @@ async def search_borrower_info(query: str, limit: int = 10) -> list[dict]:
                         "loan_status": None,
                         "loan_status_details_json": None,
                         "sum_category": None,
-                        "rating": None,
+                        "rating": row["rating"],
                         "notes": f"из {row['service']}" if row["service"] else None,
                         "last_loan_date": None,
-                        "loan_count": row["total_loans"],
+                        "loan_count": row["loan_count"],
                         "source": row["service"],
                         "source_account_tag": None,
                         "opi_has_debt": None,
                         "opi_debt_amount": None,
                         "opi_checked_at": None,
                         "opi_full_name": None,
-                        "total_invested": None,
                     }
                 )
                 seen_docs.add(document_id)
@@ -649,18 +785,23 @@ async def upsert_borrower_info(
     notes: str | None = None,
     last_loan_date: str | None = None,
     loan_count: int | None = None,
-    total_invested: float | None = None,
     source: str = "search",
     *,
     loan_status_details_json=None,
     source_account_tag: str | None = None,
 ) -> None:
-    normalized_document_id = _normalize_document_id(document_id)
+    normalized_document_id, document_id_family = _extract_document_id_info(document_id)
     if not normalized_document_id:
         raise ValueError(f"Invalid document_id: {document_id!r}")
     normalized_full_name = _normalize_upper(full_name)
     db = await get_db()
     try:
+        if document_id_family is None:
+            await _alert_unknown_document_id(
+                normalized_document_id,
+                source="upsert_borrower_info",
+                context={"source": source},
+            )
         existing = await _fetch_borrower_info_row(db, normalized_document_id)
         normalized_source, normalized_tag = _normalize_source(source)
         chosen_source = _pick_source((existing or {}).get("source"), normalized_source, _SOURCE_PRIORITY)
@@ -671,13 +812,15 @@ async def upsert_borrower_info(
             source_account_tag or normalized_tag,
         )
         merged_full_name = _merge_full_name((existing or {}).get("full_name"), normalized_full_name)
+        if not _can_write_borrower_info(existing, merged_full_name):
+            return
         merged_details = _serialize_status_details(loan_status_details_json) or (existing or {}).get("loan_status_details_json")
         await db.execute(
             """
             INSERT INTO borrower_info
                 (document_id, full_name, loan_status, loan_status_details_json, sum_category, rating,
-                 notes, last_loan_date, loan_count, total_invested, source, source_account_tag, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                 notes, last_loan_date, loan_count, source, source_account_tag, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
             ON CONFLICT(document_id) DO UPDATE SET
                 full_name = ?,
                 loan_status = COALESCE(excluded.loan_status, borrower_info.loan_status),
@@ -689,7 +832,6 @@ async def upsert_borrower_info(
                 loan_count = CASE WHEN excluded.loan_count IS NOT NULL
                                   THEN excluded.loan_count
                                   ELSE borrower_info.loan_count END,
-                total_invested = COALESCE(excluded.total_invested, borrower_info.total_invested),
                 source = COALESCE(excluded.source, borrower_info.source),
                 source_account_tag = COALESCE(excluded.source_account_tag, borrower_info.source_account_tag),
                 updated_at = datetime('now')
@@ -704,7 +846,6 @@ async def upsert_borrower_info(
                 notes,
                 last_loan_date,
                 loan_count,
-                total_invested,
                 chosen_source,
                 chosen_tag,
                 merged_full_name,
@@ -729,16 +870,21 @@ async def upsert_borrower_contacts(
     source: str = "manual",
     source_account_tag: str | None = None,
 ) -> None:
-    normalized_document_id = _normalize_document_id(document_id)
+    normalized_document_id, document_id_family = _extract_document_id_info(document_id)
     if not normalized_document_id:
         raise ValueError(f"Invalid document_id: {document_id!r}")
     normalized_full_name = _normalize_upper(full_name)
     borrower_phone = (borrower_phone or "").strip() or None
     borrower_email = (borrower_email or "").strip() or None
-    borrower_address = (borrower_address or "").strip() or None
     borrower_zip = (borrower_zip or "").strip() or None
     db = await get_db()
     try:
+        if document_id_family is None:
+            await _alert_unknown_document_id(
+                normalized_document_id,
+                source="upsert_borrower_contacts",
+                context={"source": source},
+            )
         existing = await _fetch_borrower_info_row(db, normalized_document_id)
         normalized_source, normalized_tag = _normalize_source(source)
         normalized_contact_source, contact_tag = _normalize_contact_source(source)
@@ -751,6 +897,12 @@ async def upsert_borrower_contacts(
             source_account_tag or contact_tag or normalized_tag,
         )
         merged_full_name = _merge_full_name((existing or {}).get("full_name"), normalized_full_name)
+        borrower_address = sanitize_borrower_address(
+            borrower_address,
+            merged_full_name or (existing or {}).get("full_name"),
+        )
+        if not _can_write_borrower_info(existing, merged_full_name):
+            return
         await db.execute(
             """
             INSERT INTO borrower_info
@@ -794,7 +946,6 @@ async def upsert_borrower_from_investment(
     settled_loans: int = 0,
     overdue_loans: int = 0,
     avg_rating: float | None = None,
-    total_invested: float | None = None,
     *,
     display_name: str | None = None,
     display_names: list[str] | tuple[str, ...] | None = None,
@@ -815,37 +966,60 @@ async def upsert_borrower_from_investment(
             normalized_full_name,
             merged_display_names,
         )
+        if not (existing or {}).get("document_id") and merged_full_name:
+            merged_display_names = _merge_display_names(merged_display_names, merged_full_name)
+        if not (existing or {}).get("document_id") and not merged_display_names:
+            return
         await db.execute(
             """
             INSERT INTO borrowers
-                   (service, borrower_user_id, full_name, display_names, total_loans, settled_loans,
-                    overdue_loans, avg_rating, total_invested)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(service, borrower_user_id) DO UPDATE SET
-                   full_name = ?,
-                   display_names = ?,
-                   total_loans = excluded.total_loans,
-                   settled_loans = excluded.settled_loans,
-                   overdue_loans = excluded.overdue_loans,
-                   avg_rating = excluded.avg_rating,
-                   total_invested = excluded.total_invested,
-                   last_seen = datetime('now')
+                   (service, borrower_user_id, display_names)
+               VALUES (?, ?, ?)
+                ON CONFLICT(service, borrower_user_id) DO UPDATE SET
+                    display_names = ?,
+                    last_seen = datetime('now')
             """,
             (
                 service,
                 borrower_user_id,
-                merged_full_name,
                 _serialize_display_names(merged_display_names),
-                total_loans,
-                settled_loans,
-                overdue_loans,
-                avg_rating,
-                total_invested,
-                merged_full_name,
                 _serialize_display_names(merged_display_names),
             ),
         )
         effective_document_id = (existing or {}).get("document_id")
+        if effective_document_id:
+            existing_info = await _fetch_borrower_info_row(db, effective_document_id)
+            if _can_write_borrower_info(existing_info, merged_full_name):
+                normalized_source, normalized_tag = _normalize_source(f"{service}_borrow")
+                base_status, base_details = _base_status_from_counts(total_loans, settled_loans, overdue_loans)
+                await db.execute(
+                    """
+                    INSERT INTO borrower_info
+                        (document_id, full_name, loan_status, loan_status_details_json, loan_count, rating, source, source_account_tag, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                    ON CONFLICT(document_id) DO UPDATE SET
+                        full_name = COALESCE(excluded.full_name, borrower_info.full_name),
+                        loan_status = COALESCE(excluded.loan_status, borrower_info.loan_status),
+                        loan_status_details_json = COALESCE(excluded.loan_status_details_json, borrower_info.loan_status_details_json),
+                        loan_count = CASE WHEN excluded.loan_count IS NOT NULL
+                                          THEN excluded.loan_count
+                                          ELSE borrower_info.loan_count END,
+                        rating = COALESCE(excluded.rating, borrower_info.rating),
+                        source = COALESCE(excluded.source, borrower_info.source),
+                        source_account_tag = COALESCE(excluded.source_account_tag, borrower_info.source_account_tag),
+                        updated_at = datetime('now')
+                    """,
+                    (
+                        effective_document_id,
+                        merged_full_name,
+                        base_status,
+                        _serialize_status_details(base_details),
+                        total_loans,
+                        avg_rating,
+                        normalized_source,
+                        normalized_tag,
+                    ),
+                )
         if effective_document_id:
             await _refresh_borrower_status(db, effective_document_id)
         await db.commit()
@@ -867,10 +1041,10 @@ async def list_borrower_mappings_by_document_ids(document_ids: list[str], servic
         rows = await db.execute_fetchall(
             f"""
             SELECT b.service, b.borrower_user_id, b.document_id,
-                   COALESCE(b.full_name, bi.full_name) AS full_name,
+                   bi.full_name AS full_name,
                    b.display_names
             FROM borrowers b
-            LEFT JOIN borrower_info bi ON bi.document_id = b.document_id
+            JOIN borrower_info bi ON bi.document_id = b.document_id
             WHERE {where}
             ORDER BY b.last_seen DESC
             """,
@@ -905,7 +1079,7 @@ async def get_borrowers_stats() -> dict:
                    SUM(CASE WHEN opi_has_debt = 1 THEN 1 ELSE 0 END) as with_debt,
                    SUM(CASE WHEN opi_has_debt = 0 THEN 1 ELSE 0 END) as no_debt,
                    SUM(CASE WHEN opi_checked_at IS NOT NULL THEN 1 ELSE 0 END) as opi_checked,
-                   SUM(CASE WHEN total_invested > 0 THEN 1 ELSE 0 END) as with_investments
+                   SUM(CASE WHEN COALESCE(loan_count, 0) > 0 THEN 1 ELSE 0 END) as with_investments
             FROM borrower_info
             """
         )
@@ -930,13 +1104,25 @@ async def list_borrower_name_map(service: str) -> dict[str, str]:
     try:
         rows = await db.execute_fetchall(
             """
-            SELECT borrower_user_id, full_name
-            FROM borrowers
-            WHERE service = ? AND full_name IS NOT NULL AND full_name != ''
+            SELECT b.borrower_user_id, b.document_id, b.display_names,
+                   bi.full_name AS borrower_info_full_name
+            FROM borrowers b
+            LEFT JOIN borrower_info bi ON bi.document_id = b.document_id
+            WHERE b.service = ?
             """,
             (service,),
         )
-        return {row["full_name"]: row["borrower_user_id"] for row in rows if row["full_name"]}
+        result: dict[str, str] = {}
+        for row in rows:
+            document_id = _normalize_document_id(row["document_id"])
+            if document_id:
+                full_name = _normalize_upper(row["borrower_info_full_name"])
+            else:
+                full_name = _normalize_upper(_current_display_name(row["display_names"]))
+            if not full_name:
+                continue
+            result[full_name] = row["borrower_user_id"]
+        return result
     finally:
         await db.close()
 

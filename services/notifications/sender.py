@@ -315,18 +315,7 @@ def _format_enrichment_section(entry: BorrowEntry) -> list[str]:
 
     if enriched_history:
         total = entry.kb_total_loans or 0
-        settled = entry.kb_settled or 0
-        overdue = entry.kb_overdue or 0
-        not_returned = total - settled - overdue
-        if not_returned < 0:
-            not_returned = 0
         lines.append(f"ℹ️ Брала {total}")
-        if settled > 0:
-            lines.append(f"✅ Вернула {settled}")
-        if not_returned > 0:
-            lines.append(f"⚠️ Текущие {not_returned}")
-        if overdue > 0:
-            lines.append(f"❌ Просрочка {overdue}")
 
     return lines
 

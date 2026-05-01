@@ -50,7 +50,7 @@ class Subscription:
         if self.require_income_confirmed and not entry.is_income_confirmed:
             return False
         if self.min_settled_loans is not None and self.min_settled_loans > 0:
-            settled = entry.loans_count_settled or entry.kb_settled or 0
+            settled = entry.loans_count_settled or 0
             if settled < self.min_settled_loans:
                 return False
         return True

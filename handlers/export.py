@@ -43,8 +43,8 @@ CSV_COLUMNS = [
     "display_name", "current_display_name", "display_names", "is_income_confirmed", "is_employed", "has_active_loan",
     "has_overdue", "note", "status", "loans_count",
     "opi_checked", "opi_has_debt", "opi_debt_amount", "opi_full_name", "opi_error",
-    "kb_known", "kb_total_loans", "kb_settled", "kb_overdue", "kb_cancelled",
-    "kb_has_claims", "kb_avg_rating", "kb_last_rating", "kb_total_invested",
+    "kb_known", "kb_total_loans", "kb_cancelled",
+    "kb_has_claims", "kb_avg_rating", "kb_last_rating",
     "loan_status_details_json", "enrichment_source", "source_account_tag",
 ]
 

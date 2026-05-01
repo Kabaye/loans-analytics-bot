@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from bot.domain.credentials import UserCredentials
 from bot.integrations.parsers.finkit import FinkitParser
 from bot.integrations.parsers.zaimis import ZaimisParser
 from bot.repositories.borrowers import upsert_borrower_from_investment
-from bot.repositories.credentials import save_credential_session
+from bot.repositories.credentials import get_credential_by_id, save_credential_session
+from bot.services.zaimis_sync import sync_zaimis_account
 
 
 async def load_zaimis_investments(credential_id: int, login: str, password: str) -> int:
@@ -14,61 +16,24 @@ async def load_zaimis_investments(credential_id: int, login: str, password: str)
             raise RuntimeError("Login failed")
         if export := zp.export_session():
             await save_credential_session(credential_id, "zaimis", export)
-
-        orders = await zp.fetch_investments()
-        stats: dict[str, dict] = {}
-        for order in orders:
-            offer = order.get("offer", {}) or {}
-            owner = offer.get("owner", {}) or {}
-            buid = str(owner.get("id", ""))
-            if not buid:
-                continue
-            if buid not in stats:
-                stats[buid] = {
-                    "full_name": None,
-                    "display_name": owner.get("displayName", ""),
-                    "total": 0,
-                    "settled": 0,
-                    "overdue": 0,
-                    "ratings": [],
-                    "invested": 0.0,
-                }
-            borrower = stats[buid]
-            borrower["total"] += 1
-            state = order.get("state")
-            if state == 3:
-                borrower["settled"] += 1
-            if state == 4:
-                borrower["overdue"] += 1
-            try:
-                borrower["invested"] += float(order.get("amount", 0))
-            except (ValueError, TypeError):
-                pass
-            score = offer.get("score")
-            if score is not None:
-                try:
-                    borrower["ratings"].append(float(score))
-                except (ValueError, TypeError):
-                    pass
-
-        for buid, borrower in stats.items():
-            avg_rating = (
-                sum(borrower["ratings"]) / len(borrower["ratings"])
-                if borrower["ratings"]
-                else None
-            )
-            await upsert_borrower_from_investment(
-                service="zaimis",
-                borrower_user_id=buid,
-                full_name=borrower["full_name"] or None,
-                display_name=borrower["display_name"] or None,
-                total_loans=borrower["total"],
-                settled_loans=borrower["settled"],
-                overdue_loans=borrower["overdue"],
-                avg_rating=avg_rating,
-                total_invested=borrower["invested"],
-            )
-        return len(orders)
+        cred_row = await get_credential_by_id(credential_id)
+        if not cred_row:
+            raise RuntimeError(f"Credential not found: {credential_id}")
+        cred = UserCredentials(
+            id=int(cred_row["id"]),
+            chat_id=int(cred_row["chat_id"]),
+            service="zaimis",
+            login=str(cred_row["login"]),
+            password=str(cred_row["password"]),
+            username=cred_row.get("label"),
+        )
+        result = await sync_zaimis_account(
+            cred,
+            parser=zp,
+            include_pdf=True,
+            sync_overdue_cases=False,
+        )
+        return result.total_orders
     finally:
         await zp.close()
 
@@ -148,7 +113,6 @@ async def load_finkit_investments(credential_id: int, login: str, password: str)
                 settled_loans=borrower["settled"],
                 overdue_loans=borrower["overdue"],
                 avg_rating=avg_rating,
-                total_invested=borrower["invested"],
             )
         return total
     finally:

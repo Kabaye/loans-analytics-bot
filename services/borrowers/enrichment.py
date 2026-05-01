@@ -21,13 +21,18 @@ def _apply_cached_borrower(entry: BorrowEntry, cached: dict) -> None:
         entry.opi_full_name = cached.get("opi_full_name")
         entry.opi_checked_at = cached.get("opi_checked_at")
 
-    if cached.get("total_loans") and cached["total_loans"] > 0:
+    known_loans = cached.get("loan_count")
+    if known_loans and known_loans > 0:
         entry.kb_known = True
-        entry.kb_total_loans = cached.get("total_loans")
-        entry.kb_settled = cached.get("settled_loans")
-        entry.kb_overdue = cached.get("overdue_loans")
-        entry.kb_avg_rating = cached.get("avg_rating")
-        entry.kb_total_invested = cached.get("total_invested")
+        entry.kb_total_loans = known_loans
+        entry.kb_avg_rating = cached.get("bi_rating")
+
+    if entry.loans_count is None and known_loans is not None:
+        entry.loans_count = known_loans
+    if entry.has_active_loan is None and cached.get("has_active_loan") is not None:
+        entry.has_active_loan = bool(cached.get("has_active_loan"))
+    if entry.has_overdue is None and cached.get("has_overdue") is not None:
+        entry.has_overdue = bool(cached.get("has_overdue"))
 
     if cached.get("loan_status"):
         entry.bi_loan_status = cached["loan_status"]

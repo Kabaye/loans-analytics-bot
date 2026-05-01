@@ -86,6 +86,20 @@ def format_borrower_card(info: dict) -> str:
     if info.get("last_loan_date"):
         lines.append(f"<b>Последний займ:</b> {info['last_loan_date']}")
 
+    if info.get("phone") or info.get("email") or info.get("address") or info.get("zip"):
+        lines.append("\n<b>Контакты:</b>")
+        if info.get("phone"):
+            lines.append(f"📞 <code>{info['phone']}</code>")
+        if info.get("email"):
+            lines.append(f"✉️ <code>{info['email']}</code>")
+        if info.get("address"):
+            address_line = str(info["address"])
+            if info.get("zip"):
+                address_line = f"{address_line} ({info['zip']})"
+            lines.append(f"📍 {address_line}")
+        elif info.get("zip"):
+            lines.append(f"📮 {info['zip']}")
+
     if info.get("opi_checked_at"):
         if info.get("opi_has_debt"):
             lines.append(f"\n❌ <b>ОПИ:</b> должен <b>{info.get('opi_debt_amount', 0):.2f}</b> BYN")
@@ -135,6 +149,8 @@ def format_contact_card(document_id: str, payload: dict) -> str:
 
 async def lookup_borrower_contact_info(document_id: str) -> dict | None:
     payload = await lookup_borrower_contacts(document_id)
+    if payload and payload.get("phone") and payload.get("email") and payload.get("address"):
+        return payload
     overdue_payload = await lookup_latest_borrower_contacts(document_id)
     if payload and overdue_payload:
         return {
@@ -149,6 +165,23 @@ async def lookup_borrower_contact_info(document_id: str) -> dict | None:
             "source": payload.get("source") or overdue_payload.get("source"),
         }
     return payload or overdue_payload
+
+
+async def build_borrower_card_payload(document_id: str) -> dict | None:
+    info = await lookup_borrower_info(document_id)
+    if not info:
+        return None
+    contacts = await lookup_borrower_contact_info(document_id)
+    if not contacts:
+        return info
+    merged = dict(info)
+    merged["phone"] = contacts.get("phone")
+    merged["email"] = contacts.get("email")
+    merged["address"] = contacts.get("address")
+    merged["zip"] = contacts.get("zip")
+    if not merged.get("source"):
+        merged["source"] = contacts.get("source")
+    return merged
 
 
 def _normalize_name(value: str | None) -> str:
@@ -226,7 +259,7 @@ async def _backfill_finkit_contacts(document_ids: list[str]) -> None:
 async def ensure_borrower_contact_info(document_ids: list[str]) -> None:
     missing: list[str] = []
     for document_id in document_ids:
-        payload = await lookup_borrower_contact_info(document_id)
+        payload = await lookup_borrower_contacts(document_id)
         if not payload or (not payload.get("phone") and not payload.get("email")):
             missing.append(document_id)
     if missing:
@@ -251,10 +284,16 @@ def _needs_search_backfill(info: dict | None) -> bool:
     )
 
 
-def _append_opi_summary(lines: list[str], info: dict | None, error: str | None) -> None:
+def _append_opi_summary(lines: list[str], info: dict | None, error: str | None, opi_result=None) -> None:
     if info and info.get("opi_checked_at"):
         if info.get("opi_has_debt"):
             lines.append(f"❌ ОПИ: долг {float(info.get('opi_debt_amount') or 0):.2f} BYN")
+        else:
+            lines.append("✅ ОПИ: нет задолженности")
+        return
+    if opi_result is not None and getattr(opi_result, "has_debt", None) is not None:
+        if getattr(opi_result, "has_debt", None):
+            lines.append(f"❌ ОПИ: долг {float(getattr(opi_result, 'debt_amount', 0) or 0):.2f} BYN")
         else:
             lines.append("✅ ОПИ: нет задолженности")
         return
@@ -271,6 +310,7 @@ async def run_document_lookup_batch(doc_ids: list[str]) -> str:
     initial_info_map = {doc_id: await lookup_borrower_info(doc_id) for doc_id in doc_ids}
     missing_doc_ids = [doc_id for doc_id, info in initial_info_map.items() if _needs_search_backfill(info)]
     opi_errors: dict[str, str | None] = {}
+    opi_results: dict[str, object] = {}
 
     if missing_doc_ids:
         checker = OPIChecker()
@@ -280,6 +320,7 @@ async def run_document_lookup_batch(doc_ids: list[str]) -> str:
                 result = None
                 if not existing or not existing.get("opi_checked_at"):
                     result = await checker.check(doc_id)
+                    opi_results[doc_id] = result
                     opi_errors[doc_id] = result.error
                 await upsert_borrower_info(
                     document_id=doc_id,
@@ -304,7 +345,7 @@ async def run_document_lookup_batch(doc_ids: list[str]) -> str:
         if info and info.get("loan_status"):
             lines.append(f"Статус: {info['loan_status']}")
 
-        _append_opi_summary(lines, info, opi_errors.get(doc_id))
+        _append_opi_summary(lines, info, opi_errors.get(doc_id), opi_results.get(doc_id))
 
         info_source_label = humanize_borrower_source((info or {}).get("source"))
         if info_source_label:
@@ -314,9 +355,11 @@ async def run_document_lookup_batch(doc_ids: list[str]) -> str:
                 lines.append(f"📞 Телефон: <code>{contacts['phone']}</code>")
             if contacts.get("email"):
                 lines.append(f"✉️ Email: <code>{contacts['email']}</code>")
-            source_label = humanize_borrower_source(contacts.get("source"))
-            if source_label and source_label != info_source_label:
-                lines.append(f"ℹ️ Контакты: {source_label}")
+            if contacts.get("address"):
+                address_line = str(contacts["address"])
+                if contacts.get("zip"):
+                    address_line = f"{address_line} ({contacts['zip']})"
+                lines.append(f"📍 Адрес: {address_line}")
         lines.append("")
 
     return "\n".join(lines).strip()
@@ -359,6 +402,7 @@ async def add_borrower_and_refresh_opi(
 
 __all__ = [
     "add_borrower_and_refresh_opi",
+    "build_borrower_card_payload",
     "ensure_borrower_contact_info",
     "extract_document_ids",
     "extract_document_id_batch",

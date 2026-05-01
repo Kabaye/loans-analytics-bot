@@ -5,7 +5,6 @@ from datetime import datetime
 
 from bot.domain.credentials import UserCredentials
 from bot.integrations.geolocation_client import lookup_belarus_zip, lookup_belarus_zip_details
-from bot.repositories.borrowers import upsert_borrower_contacts
 from bot.repositories.credentials import get_credential_by_id
 from bot.repositories.overdue import get_overdue_case, update_overdue_case_contacts, upsert_overdue_case
 from bot.services.base.providers import ensure_finkit_parser
@@ -119,7 +118,6 @@ async def _persist_finkit_detail(case: dict, payload: dict, detail: dict) -> Non
         fine_outstanding=fine,
         total_due=total_due,
         status=str(_coalesce(detail.get("status"), case.get("status")) or "") or None,
-        contract_url=_coalesce(detail.get("latest_contract_url"), case.get("contract_url")),
         raw_data=payload,
     )
 
@@ -127,7 +125,6 @@ async def _persist_finkit_detail(case: dict, payload: dict, detail: dict) -> Non
 async def _refresh_finkit_contacts(case: dict, parser, detail: dict) -> None:
     claims = detail.get("claims") or []
     claim_document_url = next((claim.get("document_url") for claim in claims if claim.get("document_url")), None)
-    document_id = str(case.get("document_id") or "").strip() or None
     if claim_document_url:
         claim_pdf_bytes = await parser.fetch_contract_pdf(claim_document_url)
         if claim_pdf_bytes:
@@ -144,16 +141,6 @@ async def _refresh_finkit_contacts(case: dict, parser, detail: dict) -> None:
                 postal_lookup=postal_lookup,
                 contact_source="finkit_investment_detail",
             )
-            if document_id:
-                await upsert_borrower_contacts(
-                    document_id,
-                    full_name=detail.get("borrower_full_name") or case.get("full_name"),
-                    borrower_phone=claim_data.get("debtor_phone"),
-                    borrower_email=claim_data.get("debtor_email"),
-                    borrower_address=claim_data.get("debtor_address"),
-                    borrower_zip=zipcode,
-                    source="finkit_investment_detail",
-                )
             return
 
     if detail.get("borrower_phone_number") or detail.get("borrower_email"):
@@ -164,38 +151,6 @@ async def _refresh_finkit_contacts(case: dict, parser, detail: dict) -> None:
             borrower_email=detail.get("borrower_email"),
             contact_source="finkit_investment_detail",
         )
-        if document_id:
-            await upsert_borrower_contacts(
-                document_id,
-                full_name=detail.get("borrower_full_name") or case.get("full_name"),
-                borrower_phone=detail.get("borrower_phone_number"),
-                borrower_email=detail.get("borrower_email"),
-                source="finkit_investment_detail",
-            )
-
-
-async def _refresh_finkit_document_id(case: dict, parser, payload: dict, detail: dict) -> None:
-    if case.get("document_id") and case.get("full_name"):
-        return
-    contract_url = _coalesce(detail.get("latest_contract_url"), case.get("contract_url"))
-    if not contract_url:
-        return
-    contract_pdf = await parser.fetch_contract_pdf(str(contract_url))
-    if not contract_pdf:
-        return
-    pdf_full_name, pdf_document_id = parser.parse_borrower_from_contract_pdf(contract_pdf)
-    if not pdf_full_name and not pdf_document_id:
-        return
-    await upsert_overdue_case(
-        chat_id=int(case["chat_id"]),
-        credential_id=int(case["credential_id"]),
-        service="finkit",
-        external_id=str(case["external_id"]),
-        full_name=pdf_full_name,
-        document_id=pdf_document_id,
-        contract_url=str(contract_url),
-        raw_data=payload,
-    )
 
 
 async def refresh_finkit_case_for_claim(case: dict, *, create_pretrial_claim: bool = False) -> tuple[dict, dict | None]:
@@ -223,7 +178,6 @@ async def refresh_finkit_case_for_claim(case: dict, *, create_pretrial_claim: bo
         refreshed = await get_overdue_case(int(case["id"]), int(case["chat_id"])) or case
 
         await _refresh_finkit_contacts(refreshed, parser, detail)
-        await _refresh_finkit_document_id(refreshed, parser, payload, detail)
 
         refreshed = await get_overdue_case(int(case["id"]), int(case["chat_id"])) or refreshed
         return refreshed, get_latest_finkit_claim(refreshed)

@@ -15,11 +15,10 @@ from aiogram.types import (
 
 from bot.services.search.service import (
     add_borrower_and_refresh_opi,
+    build_borrower_card_payload,
     extract_document_id_batch,
-    format_contact_card,
     force_refresh_opi_card,
     format_borrower_card,
-    lookup_borrower_contact_info,
     lookup_borrower_info,
     run_document_lookup_batch,
     search_borrower_info,
@@ -70,7 +69,6 @@ def _search_nav_kb(include_add: bool = True) -> InlineKeyboardMarkup:
 def _result_card_kb(doc_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Проверить ОПИ", callback_data=f"opi_check:{doc_id}")],
-        [InlineKeyboardButton(text="📇 Телефон / email", callback_data=f"bi_contacts:{doc_id}")],
         [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="search_borrower")],
         [InlineKeyboardButton(text="↩ Главное меню", callback_data="main_menu")],
     ])
@@ -163,7 +161,7 @@ async def msg_search_query(message: Message, state: FSMContext):
         return
 
     if len(results) == 1:
-        info = results[0]
+        info = await build_borrower_card_payload(results[0]["document_id"]) or results[0]
         await message.answer(
             format_borrower_card(info),
             reply_markup=_result_card_kb(info["document_id"]),
@@ -199,7 +197,7 @@ async def cb_view_card(callback: CallbackQuery):
     if not await is_allowed(callback.message.chat.id):
         return
     doc_id = callback.data.split(":", 1)[1]
-    info = await lookup_borrower_info(doc_id)
+    info = await build_borrower_card_payload(doc_id)
     if not info:
         await callback.answer("Карточка не найдена", show_alert=True)
         return
@@ -222,6 +220,7 @@ async def cb_opi_check(callback: CallbackQuery):
     if not info:
         await callback.answer("Ошибка: карточка не найдена", show_alert=True)
         return
+    info = await build_borrower_card_payload(doc_id) or info
 
     text = format_borrower_card(info)
     if error:
@@ -232,22 +231,6 @@ async def cb_opi_check(callback: CallbackQuery):
         reply_markup=_result_card_kb(doc_id),
         parse_mode="HTML",
     )
-
-
-@router.callback_query(F.data.startswith("bi_contacts:"))
-async def cb_view_contacts(callback: CallbackQuery):
-    if not await is_allowed(callback.message.chat.id):
-        return
-    doc_id = callback.data.split(":", 1)[1]
-    info = await lookup_borrower_contact_info(doc_id)
-    if not info:
-        await callback.answer("Контакты не найдены", show_alert=True)
-        return
-    await callback.message.answer(
-        format_contact_card(doc_id, info),
-        parse_mode="HTML",
-    )
-    await callback.answer()
 
 
 # --- Add borrower ---
@@ -355,6 +338,8 @@ async def cb_add_sum(callback: CallbackQuery, state: FSMContext):
     except Exception as ex:
         log.warning("OPI check on add failed for %s: %s", doc_id, ex)
         info = await lookup_borrower_info(doc_id)
+    if info:
+        info = await build_borrower_card_payload(doc_id) or info
     text = format_borrower_card(info) if info else f"✅ Заёмщик {doc_id} сохранён"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[

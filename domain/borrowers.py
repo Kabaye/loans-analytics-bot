@@ -54,13 +54,10 @@ class BorrowEntry:
 
     kb_known: bool = False
     kb_total_loans: Optional[int] = None
-    kb_settled: Optional[int] = None
-    kb_overdue: Optional[int] = None
     kb_cancelled: Optional[int] = None
     kb_has_claims: Optional[int] = None
     kb_avg_rating: Optional[float] = None
     kb_last_rating: Optional[float] = None
-    kb_total_invested: Optional[float] = None
 
     bi_loan_status: Optional[str] = None
     bi_loan_status_details_json: Optional[str] = None
@@ -111,13 +108,10 @@ class BorrowEntry:
             "opi_error": self.opi_error,
             "kb_known": self.kb_known,
             "kb_total_loans": self.kb_total_loans,
-            "kb_settled": self.kb_settled,
-            "kb_overdue": self.kb_overdue,
             "kb_cancelled": self.kb_cancelled,
             "kb_has_claims": self.kb_has_claims,
             "kb_avg_rating": self.kb_avg_rating,
             "kb_last_rating": self.kb_last_rating,
-            "kb_total_invested": self.kb_total_invested,
             "loan_status_details_json": self.bi_loan_status_details_json,
             "enrichment_source": self.enrichment_source,
             "source_account_tag": self.source_account_tag,

@@ -9,7 +9,6 @@ from bot.repositories.borrowers import (
     lookup_borrower,
     refresh_borrower_statuses,
     upsert_borrower,
-    upsert_borrower_contacts,
 )
 from bot.repositories.overdue import (
     clear_finkit_suspect_address,
@@ -19,10 +18,10 @@ from bot.repositories.overdue import (
 )
 from bot.services.base.providers import (
     ensure_finkit_parser,
-    ensure_zaimis_parser,
     list_service_credentials,
     telegram_user_tag,
 )
+from bot.services.zaimis_sync import sync_zaimis_account
 
 log = logging.getLogger(__name__)
 
@@ -129,23 +128,6 @@ async def sync_finkit_overdue_cases() -> tuple[int, list[str]]:
                 if isinstance(msi, dict):
                     address = _coalesce(msi.get("formatted_address"))
                     zip_code = _coalesce(msi.get("postal_code"))
-                contract_url = _coalesce(detail.get("latest_contract_url"), item.get("latest_contract_url"))
-                pdf_full_name = None
-                pdf_document_id = None
-                if contract_url:
-                    pdf_bytes = await parser.fetch_contract_pdf(contract_url)
-                    if pdf_bytes:
-                        pdf_full_name, pdf_document_id = parser.parse_borrower_from_contract_pdf(pdf_bytes)
-                        if borrower_user_id and (pdf_full_name or pdf_document_id):
-                            await upsert_borrower(
-                                service="finkit",
-                                borrower_user_id=borrower_user_id,
-                                full_name=pdf_full_name,
-                                document_id=pdf_document_id,
-                                source=f"finkit_archive_{telegram_user_tag(cred)}",
-                            )
-                            if pdf_document_id:
-                                touched_document_ids.add(pdf_document_id)
                 claim_address = None
                 claim_zip = None
                 claim_phone = None
@@ -162,6 +144,19 @@ async def sync_finkit_overdue_cases() -> tuple[int, list[str]]:
                         if claim_address:
                             claim_zip = await lookup_belarus_zip(claim_address)
 
+                resolved_document_id = (cached or {}).get("document_id")
+                sync_full_name = (cached or {}).get("full_name") or _coalesce(detail.get("borrower_full_name"), item.get("borrower_full_name"))
+                sync_display_name = _coalesce(detail.get("borrower_short_name"), item.get("borrower_short_name"))
+                if borrower_user_id and (sync_full_name or sync_display_name or resolved_document_id):
+                    await upsert_borrower(
+                        service="finkit",
+                        borrower_user_id=borrower_user_id,
+                        full_name=sync_full_name,
+                        document_id=resolved_document_id,
+                        source="finkit_borrow",
+                        display_name=sync_display_name,
+                    )
+
                 case_id = await upsert_overdue_case(
                     chat_id=cred.chat_id,
                     credential_id=cred.id,
@@ -171,9 +166,7 @@ async def sync_finkit_overdue_cases() -> tuple[int, list[str]]:
                     loan_number=str(_coalesce(detail.get("loan_number"), item.get("loan_number")) or "") or None,
                     account_label=cred.login,
                     borrower_user_id=borrower_user_id or None,
-                    document_id=(cached or {}).get("document_id") or pdf_document_id,
-                    full_name=(cached or {}).get("full_name") or pdf_full_name or _coalesce(detail.get("borrower_full_name"), item.get("borrower_full_name")),
-                    display_name=_coalesce(detail.get("borrower_short_name"), item.get("borrower_short_name")),
+                    document_id=resolved_document_id,
                     issued_at=_coalesce(detail.get("created"), item.get("created")),
                     due_at=due_at,
                     overdue_started_at=_coalesce(detail.get("overdue_started_at"), due_at, item.get("overdue_started_at")),
@@ -184,13 +177,10 @@ async def sync_finkit_overdue_cases() -> tuple[int, list[str]]:
                     fine_outstanding=fine,
                     total_due=_total_due(principal, accrued, fine, _coalesce(detail.get("total_due"), item.get("total_due"), item.get("amount"))),
                     status=str(_coalesce(detail.get("status"), item.get("status")) or "") or None,
-                    contract_url=contract_url,
-                    loan_url=None,
                     raw_data={"list": item, "detail": detail},
                 )
                 await clear_finkit_suspect_address(case_id, address, zip_code)
                 if claim_address or claim_zip or claim_phone or claim_email or detail.get("borrower_phone_number") or detail.get("borrower_email"):
-                    resolved_document_id = (cached or {}).get("document_id") or pdf_document_id
                     await update_overdue_case_contacts(
                         case_id,
                         cred.chat_id,
@@ -199,18 +189,10 @@ async def sync_finkit_overdue_cases() -> tuple[int, list[str]]:
                         borrower_phone=claim_phone or detail.get("borrower_phone_number"),
                         borrower_email=claim_email or detail.get("borrower_email"),
                         contact_source="finkit_investment_detail",
+                        source=f"finkit_investment_detail_{telegram_user_tag(cred)}",
                     )
                     if resolved_document_id:
                         touched_document_ids.add(resolved_document_id)
-                        await upsert_borrower_contacts(
-                            resolved_document_id,
-                            full_name=(cached or {}).get("full_name") or pdf_full_name or _coalesce(detail.get("borrower_full_name"), item.get("borrower_full_name")),
-                            borrower_phone=claim_phone or detail.get("borrower_phone_number"),
-                            borrower_email=claim_email or detail.get("borrower_email"),
-                            borrower_address=claim_address,
-                            borrower_zip=claim_zip,
-                            source=f"finkit_investment_detail_{telegram_user_tag(cred)}",
-                        )
                 synced += 1
                 await asyncio.sleep(0.05)
             await deactivate_missing_overdue_cases(
@@ -233,88 +215,12 @@ async def sync_zaimis_overdue_cases() -> tuple[int, list[str]]:
 
     for cred in creds:
         try:
-            parser = await ensure_zaimis_parser(cred)
-            if parser is None:
-                errors.append(f"Zaimis login failed: {cred.login}")
-                continue
-
-            orders = await parser.fetch_investments()
-            if parser.needs_reauth:
-                parser = await ensure_zaimis_parser(cred, force_login=True)
-                if parser is None:
-                    errors.append(f"Zaimis re-login failed: {cred.login}")
-                    continue
-                orders = await parser.fetch_investments()
-
-            credential_seen: set[str] = set()
-            touched_document_ids: set[str] = set()
-            for order in orders:
-                state = order.get("state")
-                if state not in (4, "4", "overdue") and not order.get("isOverdue"):
-                    continue
-                external_id = str(order.get("id", "")).strip()
-                if not external_id:
-                    continue
-                credential_seen.add(external_id)
-
-                detail = await parser.fetch_order_detail(external_id) or {}
-                cp = detail.get("counterparty", {}) or order.get("counterparty", {}) or {}
-                offer = detail.get("offer", {}) or order.get("offer", {}) or {}
-                model = detail.get("modelData", {}) or order.get("modelData", {}) or {}
-                borrower_user_id = str(cp.get("id", "")).strip()
-                cached = await lookup_borrower("zaimis", borrower_user_id) if borrower_user_id else None
-
-                principal = _safe_float(_coalesce(detail.get("principalOutstanding"), order.get("principalOutstanding"), detail.get("amount"), order.get("amount"), offer.get("amount")))
-                accrued = _safe_float(_coalesce(detail.get("interestOutstanding"), order.get("interestOutstanding"), model.get("profit"), model.get("interestWithOverdue")))
-                fine = _safe_float(_coalesce(detail.get("penaltyOutstanding"), order.get("penaltyOutstanding"), model.get("penaltyAmount")))
-                due_at = _coalesce(detail.get("returnDate"), order.get("returnDate"), detail.get("deadline"), order.get("deadline"), detail.get("dueAt"), order.get("dueAt"))
-                overdue_started_at = _coalesce(detail.get("expiredDate"), order.get("expiredDate"), detail.get("overdueStartedAt"), order.get("overdueStartedAt"))
-                actual_duration = _safe_int(_coalesce(detail.get("actualDuration"), order.get("actualDuration")))
-                loan_term = _safe_int(_coalesce(detail.get("loanTerm"), order.get("loanTerm")))
-                explicit_days = _safe_int(_coalesce(detail.get("daysOverdue"), order.get("daysOverdue")))
-                duration_days = actual_duration - loan_term if actual_duration is not None and loan_term is not None else None
-                if duration_days is not None and duration_days < 0:
-                    duration_days = 0
-                days_overdue = explicit_days or duration_days or _days_overdue_from_due(overdue_started_at or due_at)
-                total_due = _safe_float(_coalesce(detail.get("totalOutstanding"), order.get("totalOutstanding"), model.get("closeSend"), order.get("returnAmount")))
-
-                await upsert_overdue_case(
-                    chat_id=cred.chat_id,
-                    credential_id=cred.id,
-                    service="zaimis",
-                    external_id=external_id,
-                    loan_id=str(_coalesce(detail.get("id"), offer.get("id"), order.get("offerId")) or "") or None,
-                    loan_number=str(_coalesce(detail.get("number"), offer.get("id"), external_id) or "") or None,
-                    account_label=cred.login,
-                    borrower_user_id=borrower_user_id or None,
-                    document_id=(cached or {}).get("document_id"),
-                    full_name=(cached or {}).get("full_name") or cp.get("fullName"),
-                    display_name=cp.get("displayName"),
-                    issued_at=_coalesce(detail.get("createdAt"), order.get("createdAt"), offer.get("createdAt")),
-                    due_at=due_at,
-                    overdue_started_at=overdue_started_at,
-                    days_overdue=days_overdue,
-                    amount=_safe_float(_coalesce(order.get("amount"), detail.get("amount"), offer.get("amount"))),
-                    principal_outstanding=principal,
-                    accrued_percent=accrued,
-                    fine_outstanding=fine,
-                    total_due=total_due if total_due is not None else _total_due(principal, accrued, fine, _coalesce(order.get("amount"), detail.get("amount"))),
-                    status=str(_coalesce(detail.get("state"), order.get("state")) or "") or None,
-                    contract_url=None,
-                    loan_url=None,
-                    raw_data={"order": order, "detail": detail},
-                )
-                if (cached or {}).get("document_id"):
-                    touched_document_ids.add(str((cached or {}).get("document_id")))
-                synced += 1
-                await asyncio.sleep(0.05)
-            await deactivate_missing_overdue_cases(
-                cred.chat_id,
-                "zaimis",
-                sorted(credential_seen),
-                credential_id=cred.id,
+            result = await sync_zaimis_account(
+                cred,
+                include_pdf=False,
+                sync_overdue_cases=True,
             )
-            await refresh_borrower_statuses(touched_document_ids)
+            synced += result.synced_overdue_cases
         except Exception as exc:
             errors.append(f"Zaimis overdue {cred.login}: {exc}")
 

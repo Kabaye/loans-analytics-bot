@@ -29,8 +29,15 @@ async def save_opi_result(
     full_name: str | None = None,
 ) -> None:
     now = datetime.now(timezone.utc).isoformat()
+    normalized_full_name = (full_name or "").strip() or None
     db = await get_db()
     try:
+        existing_rows = await db.execute_fetchall(
+            "SELECT document_id FROM borrower_info WHERE document_id = ? LIMIT 1",
+            (document_id,),
+        )
+        if not existing_rows and not normalized_full_name:
+            return
         await db.execute(
             f"""
             INSERT INTO borrower_info (document_id, full_name)
@@ -39,7 +46,7 @@ async def save_opi_result(
                 full_name = {_BORROWER_INFO_FULL_NAME_SQL},
                 updated_at = datetime('now')
             """,
-            (document_id, full_name),
+            (document_id, normalized_full_name),
         )
         await db.execute(
             """
@@ -49,7 +56,7 @@ async def save_opi_result(
                 updated_at = datetime('now')
             WHERE document_id = ?
             """,
-            (int(has_debt), debt_amount, now, full_name, document_id),
+            (int(has_debt), debt_amount, now, normalized_full_name, document_id),
         )
         await db.commit()
     finally:
@@ -81,12 +88,11 @@ async def get_missing_opi_candidates(min_age_days: int = 10, limit: int = 200) -
             """
             SELECT
                 b.document_id,
-                MAX(b.full_name) AS full_name,
+                MAX(bi.full_name) AS full_name,
                 GROUP_CONCAT(DISTINCT b.service) AS services,
                 MIN(b.first_seen) AS first_seen,
                 MAX(b.last_seen) AS last_seen,
-                SUM(COALESCE(b.total_loans, 0)) AS total_loans,
-                SUM(COALESCE(b.total_invested, 0)) AS total_invested,
+                MAX(bi.loan_count) AS total_loans,
                 MAX(bi.loan_status) AS loan_status,
                 MAX(bi.source) AS source
             FROM borrowers b

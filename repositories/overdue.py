@@ -1,6 +1,152 @@
 import json
 
 from bot.repositories.db import get_db
+from bot.utils.borrower_address import sanitize_borrower_address
+
+
+def _coalesce_non_empty(*values):
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return None
+
+
+def _parse_raw_payload(value) -> dict:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        return json.loads(value)
+    except Exception:
+        return {}
+
+
+def _raw_borrower_full_name(payload: dict) -> str | None:
+    detail = payload.get("detail") or {}
+    list_payload = payload.get("list") or payload.get("order") or {}
+    counterparty = detail.get("counterparty") or list_payload.get("counterparty") or {}
+    full_name = _coalesce_non_empty(
+        detail.get("borrower_full_name"),
+        list_payload.get("borrower_full_name"),
+        counterparty.get("fullName"),
+    )
+    return full_name.upper() if full_name else None
+
+
+def _raw_borrower_display_name(payload: dict) -> str | None:
+    detail = payload.get("detail") or {}
+    list_payload = payload.get("list") or payload.get("order") or {}
+    counterparty = detail.get("counterparty") or list_payload.get("counterparty") or {}
+    return _coalesce_non_empty(
+        detail.get("borrower_short_name"),
+        list_payload.get("borrower_short_name"),
+        counterparty.get("displayName"),
+    )
+
+
+def _raw_contact_overrides(payload: dict) -> dict[str, str]:
+    value = payload.get("contact_overrides")
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, str] = {}
+    for key in ("borrower_address", "borrower_zip", "borrower_phone", "borrower_email"):
+        normalized = _coalesce_non_empty(value.get(key))
+        if normalized:
+            result[key] = normalized
+    return result
+
+
+def _apply_contact_overrides(
+    payload: dict,
+    *,
+    borrower_address: str | None = None,
+    borrower_zip: str | None = None,
+    borrower_phone: str | None = None,
+    borrower_email: str | None = None,
+) -> None:
+    overrides = _raw_contact_overrides(payload)
+    for key, value in {
+        "borrower_address": borrower_address,
+        "borrower_zip": borrower_zip,
+        "borrower_phone": borrower_phone,
+        "borrower_email": borrower_email,
+    }.items():
+        normalized = _coalesce_non_empty(value)
+        if normalized:
+            overrides[key] = normalized
+    if overrides:
+        payload["contact_overrides"] = overrides
+
+
+def _current_display_name(value) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        items = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            items = [text]
+        else:
+            items = parsed if isinstance(parsed, list) else [text]
+    normalized = [str(item).strip() for item in items if str(item or "").strip()]
+    return normalized[-1] if normalized else None
+
+
+def _display_names(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        raw_items = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            raw_items = [text]
+        else:
+            raw_items = parsed if isinstance(parsed, list) else [text]
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def _apply_borrower_overlay(payload: dict) -> dict:
+    raw_payload = _parse_raw_payload(payload.get("raw_data"))
+    raw_full_name = _raw_borrower_full_name(raw_payload)
+    raw_display_name = _raw_borrower_display_name(raw_payload)
+    contact_overrides = _raw_contact_overrides(raw_payload)
+    mapped_display_name = _current_display_name(payload.get("borrower_display_names"))
+    payload["display_name"] = mapped_display_name or raw_display_name or payload.get("display_name")
+    payload["full_name"] = payload.get("borrower_full_name") or payload.get("display_name") or raw_full_name or payload.get("full_name")
+    payload["borrower_address"] = sanitize_borrower_address(
+        payload.get("effective_borrower_address") or contact_overrides.get("borrower_address") or payload.get("borrower_address"),
+        payload.get("full_name") or raw_full_name,
+    )
+    payload["borrower_zip"] = payload.get("effective_borrower_zip") or contact_overrides.get("borrower_zip") or payload.get("borrower_zip")
+    payload["borrower_phone"] = payload.get("effective_borrower_phone") or contact_overrides.get("borrower_phone") or payload.get("borrower_phone")
+    payload["borrower_email"] = payload.get("effective_borrower_email") or contact_overrides.get("borrower_email") or payload.get("borrower_email")
+    payload.pop("borrower_full_name", None)
+    payload.pop("borrower_display_names", None)
+    payload.pop("effective_borrower_address", None)
+    payload.pop("effective_borrower_zip", None)
+    payload.pop("effective_borrower_phone", None)
+    payload.pop("effective_borrower_email", None)
+    return payload
 
 
 async def upsert_overdue_case(
@@ -14,8 +160,6 @@ async def upsert_overdue_case(
     account_label: str | None = None,
     borrower_user_id: str | None = None,
     document_id: str | None = None,
-    full_name: str | None = None,
-    display_name: str | None = None,
     issued_at: str | None = None,
     due_at: str | None = None,
     overdue_started_at: str | None = None,
@@ -26,23 +170,19 @@ async def upsert_overdue_case(
     fine_outstanding: float | None = None,
     total_due: float | None = None,
     status: str | None = None,
-    contract_url: str | None = None,
-    loan_url: str | None = None,
     raw_data: dict | None = None,
 ) -> int:
-    if full_name:
-        full_name = full_name.upper()
     db = await get_db()
     try:
         await db.execute(
             """
             INSERT INTO overdue_cases (
                 chat_id, credential_id, service, external_id, loan_id, loan_number,
-                account_label, borrower_user_id, document_id, full_name, display_name,
+                account_label, borrower_user_id, document_id,
                 issued_at, due_at, overdue_started_at, days_overdue, amount,
                 principal_outstanding, accrued_percent, fine_outstanding, total_due,
-                status, contract_url, loan_url, raw_data, is_active, last_synced_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'))
+                status, raw_data, is_active, last_synced_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'))
             ON CONFLICT(chat_id, service, external_id) DO UPDATE SET
                 credential_id = excluded.credential_id,
                 loan_id = COALESCE(excluded.loan_id, overdue_cases.loan_id),
@@ -50,8 +190,6 @@ async def upsert_overdue_case(
                 account_label = COALESCE(excluded.account_label, overdue_cases.account_label),
                 borrower_user_id = COALESCE(excluded.borrower_user_id, overdue_cases.borrower_user_id),
                 document_id = COALESCE(excluded.document_id, overdue_cases.document_id),
-                full_name = COALESCE(excluded.full_name, overdue_cases.full_name),
-                display_name = COALESCE(excluded.display_name, overdue_cases.display_name),
                 issued_at = COALESCE(excluded.issued_at, overdue_cases.issued_at),
                 due_at = COALESCE(excluded.due_at, overdue_cases.due_at),
                 overdue_started_at = COALESCE(excluded.overdue_started_at, overdue_cases.overdue_started_at),
@@ -62,8 +200,6 @@ async def upsert_overdue_case(
                 fine_outstanding = COALESCE(excluded.fine_outstanding, overdue_cases.fine_outstanding),
                 total_due = COALESCE(excluded.total_due, overdue_cases.total_due),
                 status = COALESCE(excluded.status, overdue_cases.status),
-                contract_url = COALESCE(excluded.contract_url, overdue_cases.contract_url),
-                loan_url = COALESCE(excluded.loan_url, overdue_cases.loan_url),
                 raw_data = excluded.raw_data,
                 is_active = 1,
                 last_synced_at = datetime('now'),
@@ -79,8 +215,6 @@ async def upsert_overdue_case(
                 account_label,
                 borrower_user_id,
                 document_id,
-                full_name,
-                display_name,
                 issued_at,
                 due_at,
                 overdue_started_at,
@@ -91,8 +225,6 @@ async def upsert_overdue_case(
                 fine_outstanding,
                 total_due,
                 status,
-                contract_url,
-                loan_url,
                 json.dumps(raw_data or {}, ensure_ascii=False),
             ),
         )
@@ -148,16 +280,24 @@ async def list_overdue_cases(chat_id: int, active_only: bool = True, limit: int 
     try:
         rows = await db.execute_fetchall(
             f"""
-            SELECT *
-            FROM overdue_cases
-            WHERE chat_id = ?
+            SELECT oc.*,
+                   NULLIF(TRIM(bi.full_name), '') AS borrower_full_name,
+                   b.display_names AS borrower_display_names,
+                   NULLIF(TRIM(bi.borrower_address), '') AS effective_borrower_address,
+                   NULLIF(TRIM(bi.borrower_zip), '') AS effective_borrower_zip,
+                   NULLIF(TRIM(bi.borrower_phone), '') AS effective_borrower_phone,
+                   NULLIF(TRIM(bi.borrower_email), '') AS effective_borrower_email
+            FROM overdue_cases oc
+            LEFT JOIN borrowers b ON b.service = oc.service AND b.borrower_user_id = oc.borrower_user_id
+            LEFT JOIN borrower_info bi ON bi.document_id = oc.document_id
+            WHERE oc.chat_id = ?
               {'AND is_active = 1' if active_only else ''}
-            ORDER BY COALESCE(days_overdue, 0) DESC, COALESCE(total_due, 0) DESC, updated_at DESC
+            ORDER BY COALESCE(oc.days_overdue, 0) DESC, COALESCE(oc.total_due, 0) DESC, oc.updated_at DESC
             LIMIT ?
             """,
             (chat_id, limit),
         )
-        return [dict(row) for row in rows]
+        return [_apply_borrower_overlay(dict(row)) for row in rows]
     finally:
         await db.close()
 
@@ -167,14 +307,22 @@ async def get_overdue_case(case_id: int, chat_id: int) -> dict | None:
     try:
         rows = await db.execute_fetchall(
             """
-            SELECT oc.*, c.login AS credential_login, c.label AS credential_label
+            SELECT oc.*, c.login AS credential_login, c.label AS credential_label,
+                   NULLIF(TRIM(bi.full_name), '') AS borrower_full_name,
+                   b.display_names AS borrower_display_names,
+                   NULLIF(TRIM(bi.borrower_address), '') AS effective_borrower_address,
+                   NULLIF(TRIM(bi.borrower_zip), '') AS effective_borrower_zip,
+                   NULLIF(TRIM(bi.borrower_phone), '') AS effective_borrower_phone,
+                   NULLIF(TRIM(bi.borrower_email), '') AS effective_borrower_email
             FROM overdue_cases oc
             LEFT JOIN credentials c ON c.id = oc.credential_id
+            LEFT JOIN borrowers b ON b.service = oc.service AND b.borrower_user_id = oc.borrower_user_id
+            LEFT JOIN borrower_info bi ON bi.document_id = oc.document_id
             WHERE oc.id = ? AND oc.chat_id = ?
             """,
             (case_id, chat_id),
         )
-        return dict(rows[0]) if rows else None
+        return _apply_borrower_overlay(dict(rows[0])) if rows else None
     finally:
         await db.close()
 
@@ -184,38 +332,48 @@ async def lookup_latest_borrower_contacts(document_id: str) -> dict | None:
     try:
         rows = await db.execute_fetchall(
             """
-            SELECT document_id, full_name, display_name, service, borrower_phone, borrower_email, borrower_address, borrower_zip, raw_data
-            FROM overdue_cases
-            WHERE document_id = ?
-              AND (NULLIF(TRIM(COALESCE(borrower_phone, '')), '') IS NOT NULL
-                   OR NULLIF(TRIM(COALESCE(borrower_email, '')), '') IS NOT NULL
-                   OR NULLIF(TRIM(COALESCE(borrower_address, '')), '') IS NOT NULL)
-            ORDER BY is_active DESC, updated_at DESC, id DESC
-            LIMIT 1
+            SELECT oc.*,
+                   NULLIF(TRIM(bi.full_name), '') AS full_name,
+                   b.display_names AS borrower_display_names
+            FROM overdue_cases oc
+            LEFT JOIN borrowers b ON b.service = oc.service AND b.borrower_user_id = oc.borrower_user_id
+            LEFT JOIN borrower_info bi ON bi.document_id = oc.document_id
+            WHERE oc.document_id = ?
+            ORDER BY oc.is_active DESC, oc.updated_at DESC, oc.id DESC
             """,
             (document_id,),
         )
         if not rows:
             return None
-        row = dict(rows[0])
-        source = row.get("service")
-        try:
-            payload = json.loads(row.get("raw_data") or "{}")
-        except Exception:
-            payload = {}
-        if payload.get("contact_source"):
-            source = payload["contact_source"]
-        return {
-            "document_id": row.get("document_id"),
-            "full_name": row.get("full_name"),
-            "current_display_name": row.get("display_name"),
-            "service": row.get("service"),
-            "phone": row.get("borrower_phone"),
-            "email": row.get("borrower_email"),
-            "address": row.get("borrower_address"),
-            "zip": row.get("borrower_zip"),
-            "source": source,
-        }
+        for raw_row in rows:
+            row = dict(raw_row)
+            display_names = _display_names(row.get("borrower_display_names"))
+            payload = _parse_raw_payload(row.get("raw_data"))
+            contact_overrides = _raw_contact_overrides(payload)
+            phone = contact_overrides.get("borrower_phone") or row.get("borrower_phone")
+            email = contact_overrides.get("borrower_email") or row.get("borrower_email")
+            full_name = row.get("full_name") or _raw_borrower_full_name(payload)
+            address = sanitize_borrower_address(
+                contact_overrides.get("borrower_address") or row.get("borrower_address"),
+                full_name,
+            )
+            zip_code = contact_overrides.get("borrower_zip") or row.get("borrower_zip")
+            if not any((phone, email, address, zip_code)):
+                continue
+            source = payload.get("contact_source") or row.get("service")
+            return {
+                "document_id": row.get("document_id"),
+                "full_name": full_name,
+                "display_names": display_names,
+                "current_display_name": _current_display_name(display_names) or _raw_borrower_display_name(payload),
+                "service": row.get("service"),
+                "phone": phone,
+                "email": email,
+                "address": address,
+                "zip": zip_code,
+                "source": source,
+            }
+        return None
     finally:
         await db.close()
 
@@ -228,49 +386,100 @@ async def update_overdue_case_contacts(
     borrower_zip: str | None = None,
     borrower_phone: str | None = None,
     borrower_email: str | None = None,
-    voluntary_term_days: int | None = None,
     postal_lookup: dict | None = None,
     contact_source: str | None = None,
+    source: str | None = None,
 ) -> None:
     db = await get_db()
     try:
         rows = await db.execute_fetchall(
-            "SELECT raw_data FROM overdue_cases WHERE id = ? AND chat_id = ?",
+            """
+            SELECT oc.document_id,
+                   oc.raw_data,
+                   NULLIF(TRIM(bi.full_name), '') AS borrower_full_name
+            FROM overdue_cases oc
+            LEFT JOIN borrowers b ON b.service = oc.service AND b.borrower_user_id = oc.borrower_user_id
+            LEFT JOIN borrower_info bi ON bi.document_id = oc.document_id
+            WHERE oc.id = ? AND oc.chat_id = ?
+            """,
             (case_id, chat_id),
         )
-        raw_payload: dict = {}
-        if rows:
-            try:
-                raw_payload = json.loads(rows[0]["raw_data"] or "{}")
-            except Exception:
-                raw_payload = {}
+        if not rows:
+            return
+        document_id = str(rows[0]["document_id"] or "").strip() or None
+        raw_payload = _parse_raw_payload(rows[0]["raw_data"])
+        case_full_name = _coalesce_non_empty(
+            rows[0]["borrower_full_name"],
+            _raw_borrower_full_name(raw_payload),
+        )
+        existing_info = None
+        info_full_name = None
+        persist_in_info = False
+        if document_id:
+            info_rows = await db.execute_fetchall(
+                "SELECT document_id, full_name, source FROM borrower_info WHERE document_id = ? LIMIT 1",
+                (document_id,),
+            )
+            existing_info = dict(info_rows[0]) if info_rows else None
+            info_full_name = str((existing_info or {}).get("full_name") or case_full_name or "").strip() or None
+            persist_in_info = bool(existing_info or info_full_name)
+        borrower_address = sanitize_borrower_address(
+            borrower_address,
+            info_full_name or case_full_name,
+        )
         if postal_lookup is not None:
             raw_payload["postal_lookup"] = postal_lookup
         if contact_source:
             raw_payload["contact_source"] = contact_source
+        _apply_contact_overrides(
+            raw_payload,
+            borrower_address=borrower_address,
+            borrower_zip=borrower_zip,
+            borrower_phone=borrower_phone,
+            borrower_email=borrower_email,
+        )
         await db.execute(
             """
             UPDATE overdue_cases
-            SET borrower_address = COALESCE(?, borrower_address),
-                borrower_zip = COALESCE(?, borrower_zip),
-                borrower_phone = COALESCE(?, borrower_phone),
-                borrower_email = COALESCE(?, borrower_email),
-                voluntary_term_days = COALESCE(?, voluntary_term_days),
-                raw_data = ?,
+            SET raw_data = ?,
                 updated_at = datetime('now')
             WHERE id = ? AND chat_id = ?
             """,
             (
-                borrower_address,
-                borrower_zip,
-                borrower_phone,
-                borrower_email,
-                voluntary_term_days,
                 json.dumps(raw_payload, ensure_ascii=False),
                 case_id,
                 chat_id,
             ),
         )
+        if persist_in_info:
+            await db.execute(
+                """
+                INSERT INTO borrower_info (
+                    document_id, full_name, borrower_address, borrower_zip, borrower_phone, borrower_email,
+                    contact_source, source, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                ON CONFLICT(document_id) DO UPDATE SET
+                    full_name = COALESCE(borrower_info.full_name, excluded.full_name),
+                    borrower_address = COALESCE(excluded.borrower_address, borrower_info.borrower_address),
+                    borrower_zip = COALESCE(excluded.borrower_zip, borrower_info.borrower_zip),
+                    borrower_phone = COALESCE(excluded.borrower_phone, borrower_info.borrower_phone),
+                    borrower_email = COALESCE(excluded.borrower_email, borrower_info.borrower_email),
+                    contact_source = COALESCE(excluded.contact_source, borrower_info.contact_source),
+                    source = COALESCE(excluded.source, borrower_info.source),
+                    updated_at = datetime('now')
+                """,
+                (
+                    document_id,
+                    info_full_name,
+                    borrower_address,
+                    borrower_zip,
+                    borrower_phone,
+                    borrower_email,
+                    contact_source,
+                    (existing_info or {}).get("source") or source or contact_source or "manual",
+                ),
+            )
         await db.commit()
     finally:
         await db.close()
@@ -387,7 +596,6 @@ async def upsert_creditor_profile(
     address: str | None,
     phone: str | None,
     email: str | None,
-    payment_details: str | None = None,
     sms_sender: str | None = None,
 ) -> None:
     db = await get_db()
@@ -395,18 +603,17 @@ async def upsert_creditor_profile(
         await db.execute(
             """
             INSERT INTO creditor_profiles (
-                chat_id, full_name, address, phone, email, payment_details, sms_sender, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                chat_id, full_name, address, phone, email, sms_sender, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
             ON CONFLICT(chat_id) DO UPDATE SET
                 full_name = excluded.full_name,
                 address = excluded.address,
                 phone = excluded.phone,
                 email = excluded.email,
-                payment_details = excluded.payment_details,
                 sms_sender = excluded.sms_sender,
                 updated_at = datetime('now')
             """,
-            (chat_id, full_name, address, phone, email, payment_details, sms_sender),
+            (chat_id, full_name, address, phone, email, sms_sender),
         )
         await db.commit()
     finally:

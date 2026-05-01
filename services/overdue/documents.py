@@ -96,11 +96,6 @@ def _loan_ref(case: dict) -> str:
     return case.get("loan_number") or case.get("loan_id") or case.get("external_id") or "—"
 
 
-def _voluntary_term(case: dict) -> str:
-    days = case.get("voluntary_term_days")
-    return str(days) if days else "—"
-
-
 def _claim_deadline_date() -> str:
     return (datetime.now() + timedelta(days=CLAIM_VOLUNTARY_TERM_DAYS)).strftime("%d.%m.%Y")
 

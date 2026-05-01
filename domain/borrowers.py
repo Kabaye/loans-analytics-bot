@@ -34,6 +34,8 @@ class BorrowEntry:
 
     is_income_confirmed: Optional[bool] = None
     is_employed: Optional[bool] = None
+    scoring_assessed_at: Optional[datetime | str] = None
+    debt_load_score: Optional[float] = None
     has_active_loan: Optional[bool] = None
     has_overdue: Optional[bool] = None
     note: Optional[str] = None
@@ -94,6 +96,8 @@ class BorrowEntry:
             "current_display_name": self.display_name or (self.display_names[-1] if self.display_names else None),
             "is_income_confirmed": self.is_income_confirmed,
             "is_employed": self.is_employed,
+            "scoring_assessed_at": self.scoring_assessed_at.isoformat() if isinstance(self.scoring_assessed_at, datetime) else self.scoring_assessed_at,
+            "debt_load_score": self.debt_load_score,
             "has_active_loan": self.has_active_loan,
             "has_overdue": self.has_overdue,
             "note": self.note,

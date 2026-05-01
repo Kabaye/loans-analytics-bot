@@ -397,6 +397,19 @@ class FinkitParser(BaseParser):
                             created_at = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
                         except Exception:
                             pass
+                    scoring_assessed_at = item.get("borrower_scoring_assessed_at")
+                    if scoring_assessed_at:
+                        try:
+                            scoring_assessed_at = datetime.fromisoformat(str(scoring_assessed_at).replace("Z", "+00:00"))
+                        except Exception:
+                            pass
+                    debt_load_score = None
+                    debt_load_raw = item.get("borrower_debt_load_score")
+                    if debt_load_raw not in (None, ""):
+                        try:
+                            debt_load_score = float(debt_load_raw)
+                        except (TypeError, ValueError):
+                            debt_load_score = None
 
                     loan_id = str(item.get("loan_number", item.get("id", "")))
                     entry = BorrowEntry(
@@ -417,6 +430,9 @@ class FinkitParser(BaseParser):
                         contract_url=item.get("latest_contract_url"),
                         status=item.get("status"),
                         is_employed=_parse_work(item.get("borrower_work")),
+                        is_income_confirmed=item.get("borrower_income_confirmed"),
+                        scoring_assessed_at=scoring_assessed_at,
+                        debt_load_score=debt_load_score,
                         has_active_loan=item.get("borrower_has_active_loan_now"),
                         has_overdue=item.get("borrower_has_overdue_history_gt_1_day"),
                         display_name=BORROWER_WORK_MAP.get(

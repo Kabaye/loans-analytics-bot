@@ -124,6 +124,17 @@ def _format_opi_date(entry: BorrowEntry) -> str | None:
     return dt.strftime("%d.%m") if dt else None
 
 
+def _format_scoring_date(entry: BorrowEntry) -> str | None:
+    dt = _coerce_utc_datetime(entry.scoring_assessed_at)
+    return dt.strftime("%d.%m %H:%M") if dt else None
+
+
+def _format_debt_load(entry: BorrowEntry) -> str | None:
+    if entry.debt_load_score is None:
+        return None
+    return f"{entry.debt_load_score:.2f}"
+
+
 def _calc_commission(amount_return: float, service: str) -> float:
     """Calculate platform commission on the return amount."""
     if service == "finkit":
@@ -209,6 +220,17 @@ def _format_finkit_borrower(entry: BorrowEntry) -> list[str]:
         work_name = entry.display_name or ("Рабочий / служащий" if entry.is_employed else "Безработный")
         icon = "✅" if entry.is_employed else "⚠️"
         lines.append(f"{icon} {work_name}")
+
+    if entry.is_income_confirmed is not None:
+        icon = "✅" if entry.is_income_confirmed else "⚠️"
+        text = "Доход заемщика подтвержден" if entry.is_income_confirmed else "Доход заемщика не подтвержден"
+        lines.append(f"{icon} {text}")
+    scoring_date = _format_scoring_date(entry)
+    if scoring_date:
+        lines.append(f"🕒 Оценка выполнена: {scoring_date}")
+    debt_load = _format_debt_load(entry)
+    if debt_load is not None:
+        lines.append(f"📉 Долговая нагрузка: {debt_load}")
 
     # Settled loans from API
     settled = entry.loans_count_settled

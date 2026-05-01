@@ -104,7 +104,7 @@ async def _show_subscriptions(target, chat_id: int, edit: bool = False):
         except (IndexError, KeyError):
             pass
         try:
-            if row["require_income_confirmed"] and row["service"] == "zaimis":
+            if row["require_income_confirmed"] and row["service"] in ("finkit", "zaimis"):
                 filters.append("💼 доход подтв.")
         except (IndexError, KeyError):
             pass
@@ -238,7 +238,7 @@ def _fields_for_service(service: str) -> list[str]:
     base = ["label", "sum_min", "sum_max", "period_min", "period_max",
             "interest_min", "rating_min"]
     if service == "finkit":
-        base += ["require_employed", "min_settled_loans"]
+        base += ["require_employed", "require_income_confirmed", "min_settled_loans"]
     elif service == "zaimis":
         base += ["require_employed", "require_income_confirmed"]
     return base
@@ -511,7 +511,7 @@ async def sub_edit_show(callback: CallbackQuery):
         # Skip fields irrelevant for certain services
         if field in ("require_employed",) and row["service"] not in ("finkit", "zaimis"):
             continue
-        if field == "require_income_confirmed" and row["service"] != "zaimis":
+        if field == "require_income_confirmed" and row["service"] not in ("finkit", "zaimis"):
             continue
         if field == "min_settled_loans" and row["service"] != "finkit":
             continue

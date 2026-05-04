@@ -356,11 +356,28 @@ def _postal_lookup_meta(case: dict, target: dict[str, str] | None = None) -> dic
     return {"postcode": postcode, "region": region, "locality": locality}
 
 
+def _full_postal_address(case: dict, target: dict[str, str]) -> str | None:
+    lookup = _postal_lookup_meta(case, target)
+    address = str(target.get("address") or "").strip()
+    match_address = str((_parse_case_raw(case).get("postal_lookup") or {}).get("match_address") or "").strip()
+    primary_address = str(case.get("borrower_address") or "").strip()
+    if match_address and address and address == primary_address:
+        address = match_address
+    postcode = str(
+        target.get("zip")
+        or lookup.get("postcode")
+        or case.get("borrower_zip")
+        or ""
+    ).strip()
+    if postcode and address:
+        address = re.sub(rf"^\s*{re.escape(postcode)}\s*,\s*", "", address, count=1).strip()
+    return address or None
+
+
 def _postal_address_lines(case: dict, target: dict[str, str]) -> list[str]:
     address_parts = _split_address(target.get("address"))
     lookup = _postal_lookup_meta(case, target)
-    city = str(address_parts.get("city") or lookup.get("locality") or lookup.get("region") or "").strip() or None
-    street_line = str(address_parts.get("street_line") or "").strip() or None
+    full_address = _full_postal_address(case, target)
     postcode = str(
         target.get("zip")
         or address_parts.get("postcode")
@@ -371,12 +388,8 @@ def _postal_address_lines(case: dict, target: dict[str, str]) -> list[str]:
     lines = [case.get("full_name") or "Получатель не указан"]
     if case.get("borrower_phone"):
         lines.append(f"Тел: {case['borrower_phone']}")
-    if street_line:
-        lines.append(street_line)
-    if city:
-        lines.append(city)
-    if not street_line and not city and str(target.get("address") or "").strip():
-        lines.append(str(target.get("address")).strip())
+    if full_address:
+        lines.append(full_address)
     if postcode:
         lines.append(postcode)
     return lines

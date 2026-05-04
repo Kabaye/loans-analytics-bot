@@ -10,6 +10,7 @@ from html import escape
 import pdfplumber
 
 from bot import config
+from bot.integrations.parsers.finkit import finkit_has_overdue_history, finkit_is_settled_on_time
 from bot.integrations.telegram_admin import send_admin_html_message
 from bot.repositories.borrowers import (
     get_borrowers_count,
@@ -222,9 +223,9 @@ async def refresh_investments(bot) -> None:
                         name_to_inv_ids[borrower_name] = []
                     stats = name_stats[borrower_name]
                     stats["total"] += 1
-                    if investment.get("closed", False):
+                    if finkit_is_settled_on_time(investment):
                         stats["settled"] += 1
-                    if investment.get("is_overdue") and not investment.get("closed", False):
+                    if finkit_has_overdue_history(investment):
                         stats["overdue"] += 1
                     try:
                         stats["invested"] += float(investment.get("amount", 0))

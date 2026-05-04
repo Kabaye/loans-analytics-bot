@@ -314,7 +314,7 @@ async def deactivate_missing_overdue_cases(
     service: str,
     active_external_ids: list[str],
     credential_id: int | None = None,
-) -> None:
+) -> set[str]:
     db = await get_db()
     try:
         where = "WHERE chat_id = ? AND service = ?"
@@ -322,8 +322,28 @@ async def deactivate_missing_overdue_cases(
         if credential_id is not None:
             where += " AND credential_id = ?"
             params.append(credential_id)
+        inactive_filter = ""
+        inactive_params: list[object] = [*params]
         if active_external_ids:
             placeholders = ",".join("?" for _ in active_external_ids)
+            inactive_filter = f" AND external_id NOT IN ({placeholders})"
+            inactive_params.extend(active_external_ids)
+        rows = await db.execute_fetchall(
+            f"""
+            SELECT DISTINCT document_id
+            FROM overdue_cases
+            {where}
+              AND is_active = 1
+              {inactive_filter}
+            """,
+            inactive_params,
+        )
+        deactivated_document_ids = {
+            str(row["document_id"]).strip()
+            for row in rows
+            if str(row["document_id"] or "").strip()
+        }
+        if active_external_ids:
             await db.execute(
                 f"""
                 UPDATE overdue_cases
@@ -342,6 +362,7 @@ async def deactivate_missing_overdue_cases(
                 params,
             )
         await db.commit()
+        return deactivated_document_ids
     finally:
         await db.close()
 

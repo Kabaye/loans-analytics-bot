@@ -543,12 +543,13 @@ async def sync_zaimis_account(
                     result.touched_document_ids.add(str(effective_document_id))
                 result.synced_overdue_cases += 1
 
-            await deactivate_missing_overdue_cases(
+            deactivated_document_ids = await deactivate_missing_overdue_cases(
                 cred.chat_id,
                 "zaimis",
                 sorted(credential_seen),
                 credential_id=cred.id,
             )
+            result.touched_document_ids.update(deactivated_document_ids)
             await refresh_borrower_statuses(result.touched_document_ids)
 
         for aggregate in aggregates.values():

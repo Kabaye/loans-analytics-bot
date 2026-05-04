@@ -156,6 +156,8 @@ async def sync_finkit_overdue_cases() -> tuple[int, list[str]]:
                         source="finkit_borrow",
                         display_name=sync_display_name,
                     )
+                if resolved_document_id:
+                    touched_document_ids.add(str(resolved_document_id))
 
                 case_id = await upsert_overdue_case(
                     chat_id=cred.chat_id,
@@ -191,16 +193,15 @@ async def sync_finkit_overdue_cases() -> tuple[int, list[str]]:
                         contact_source="finkit_investment_detail",
                         source=f"finkit_investment_detail_{telegram_user_tag(cred)}",
                     )
-                    if resolved_document_id:
-                        touched_document_ids.add(resolved_document_id)
                 synced += 1
                 await asyncio.sleep(0.05)
-            await deactivate_missing_overdue_cases(
+            deactivated_document_ids = await deactivate_missing_overdue_cases(
                 cred.chat_id,
                 "finkit",
                 sorted(credential_seen),
                 credential_id=cred.id,
             )
+            touched_document_ids.update(deactivated_document_ids)
             await refresh_borrower_statuses(touched_document_ids)
         except Exception as exc:
             errors.append(f"Finkit overdue {cred.login}: {exc}")

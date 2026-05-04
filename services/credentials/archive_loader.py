@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from bot.domain.credentials import UserCredentials
-from bot.integrations.parsers.finkit import FinkitParser
+from bot.integrations.parsers.finkit import FinkitParser, finkit_has_overdue_history, finkit_is_settled_on_time
 from bot.integrations.parsers.zaimis import ZaimisParser
 from bot.repositories.borrowers import upsert_borrower_from_investment
 from bot.repositories.credentials import get_credential_by_id, save_credential_session
@@ -79,10 +79,9 @@ async def load_finkit_investments(credential_id: int, login: str, password: str)
                     }
                 borrower = borrower_stats[buid]
                 borrower["total"] += 1
-                status = inv.get("status")
-                if inv.get("closed") is True:
+                if finkit_is_settled_on_time(inv):
                     borrower["settled"] += 1
-                if inv.get("is_overdue") and not inv.get("closed"):
+                if finkit_has_overdue_history(inv):
                     borrower["overdue"] += 1
                 try:
                     borrower["invested"] += float(inv.get("amount", 0))

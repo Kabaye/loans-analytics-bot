@@ -54,6 +54,21 @@ BORROWER_WORK_MAP = {
     "pensioner": "Пенсионер",
     "unemployed": "Безработный",
 }
+FINKIT_OVERDUE_HISTORY_STATUSES = {"cancelled_overdue"}
+
+
+def _normalized_investment_status(value: object | None) -> str:
+    return str(value or "").strip().lower()
+
+
+def finkit_has_overdue_history(item: dict | None) -> bool:
+    payload = item or {}
+    return bool(payload.get("is_overdue")) or _normalized_investment_status(payload.get("status")) in FINKIT_OVERDUE_HISTORY_STATUSES
+
+
+def finkit_is_settled_on_time(item: dict | None) -> bool:
+    payload = item or {}
+    return bool(payload.get("closed")) and not finkit_has_overdue_history(payload)
 
 
 class FinkitParser(BaseParser):

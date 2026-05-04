@@ -44,6 +44,40 @@ def _normalize_address_entry(value: Any, *, full_name: str | None = None) -> dic
     return result
 
 
+def _expand_nested_address_item(value: Any) -> list[Any]:
+    if not isinstance(value, dict):
+        return [value]
+    address_value = value.get("address") or value.get("borrower_address")
+    text = str(address_value or "").strip()
+    if not text or text[0] not in "[{":
+        return [value]
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return [value]
+    if not isinstance(parsed, (list, dict)):
+        return [value]
+    fallback_zip = str(value.get("zip") or value.get("borrower_zip") or "").strip() or None
+    label = str(value.get("label") or "").strip() or None
+    expanded: list[Any] = []
+    for item in (parsed if isinstance(parsed, list) else [parsed]):
+        if isinstance(item, dict):
+            payload = dict(item)
+            if fallback_zip and not str(payload.get("zip") or payload.get("borrower_zip") or "").strip():
+                payload["zip"] = fallback_zip
+            if label and not str(payload.get("label") or "").strip():
+                payload["label"] = label
+            expanded.append(payload)
+            continue
+        payload: dict[str, str] = {"address": str(item or "")}
+        if fallback_zip:
+            payload["zip"] = fallback_zip
+        if label:
+            payload["label"] = label
+        expanded.append(payload)
+    return expanded or [value]
+
+
 def normalize_borrower_addresses(
     value: Any,
     *,
@@ -72,14 +106,15 @@ def normalize_borrower_addresses(
     result: list[dict[str, str]] = []
     seen: set[str] = set()
     for item in raw_items:
-        normalized = _normalize_address_entry(item, full_name=full_name)
-        if not normalized:
-            continue
-        key = _address_key(normalized.get("address"))
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        result.append(normalized)
+        for expanded_item in _expand_nested_address_item(item):
+            normalized = _normalize_address_entry(expanded_item, full_name=full_name)
+            if not normalized:
+                continue
+            key = _address_key(normalized.get("address"))
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            result.append(normalized)
     return result
 
 

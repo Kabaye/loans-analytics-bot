@@ -40,13 +40,13 @@ async def save_opi_result(
             return
         await db.execute(
             f"""
-            INSERT INTO borrower_info (document_id, full_name)
-            VALUES (?, ?)
+            INSERT INTO borrower_info (document_id, full_name, source, updated_at)
+            VALUES (?, ?, ?, datetime('now'))
             ON CONFLICT(document_id) DO UPDATE SET
                 full_name = {_BORROWER_INFO_FULL_NAME_SQL},
                 updated_at = datetime('now')
             """,
-            (document_id, normalized_full_name),
+            (document_id, normalized_full_name, "search"),
         )
         await db.execute(
             """

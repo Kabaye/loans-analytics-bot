@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 
-from bot.domain.borrowers import BorrowEntry
+from bot.domain.raw_payloads import RawPayloadCarrier, extract_raw_payload
 from bot.repositories.settings import (
     get_json_schema_state,
     save_api_change_alert,
@@ -45,11 +45,12 @@ def _collect_schema_types(value, path: str, acc: dict[str, set[str]]) -> None:
             _collect_schema_types(item, item_path, acc)
 
 
-def _build_entries_schema(entries: list[BorrowEntry]) -> dict[str, list[str]]:
+def _build_entries_schema(entries: list[RawPayloadCarrier]) -> dict[str, list[str]]:
     acc: dict[str, set[str]] = {}
     for entry in entries:
-        if entry.raw_data is not None:
-            _collect_schema_types(entry.raw_data, "", acc)
+        raw_payload = extract_raw_payload(entry)
+        if raw_payload is not None:
+            _collect_schema_types(raw_payload, "", acc)
     return {path: sorted(types) for path, types in sorted(acc.items()) if path}
 
 
@@ -86,7 +87,7 @@ def _schema_diff(prev: dict[str, list[str]] | None, current: dict[str, list[str]
     return added_paths, changed_types
 
 
-async def notify_json_schema_change(service: str, entries: list[BorrowEntry]) -> None:
+async def notify_json_schema_change(service: str, entries: list[RawPayloadCarrier]) -> None:
     current = _build_entries_schema(entries)
     if not current:
         return
@@ -114,7 +115,7 @@ async def notify_json_schema_change(service: str, entries: list[BorrowEntry]) ->
         lines.append("")
         lines.append("Изменились типы:")
         lines.extend(f"  • {item}" for item in changed_types[:20])
-    sample = next((entry.raw_data for entry in entries if entry.raw_data), None)
+    sample = next((extract_raw_payload(entry) for entry in entries if extract_raw_payload(entry) is not None), None)
     sample_text = json.dumps(sample, ensure_ascii=False, default=str)[:4000] if sample else None
     try:
         await save_api_change_alert(

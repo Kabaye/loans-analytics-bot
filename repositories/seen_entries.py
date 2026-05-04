@@ -8,15 +8,15 @@ def _entry_key(entry: BorrowEntry) -> tuple[str, str]:
     return (str(entry.request_type or "borrow"), str(entry.id))
 
 
-async def load_seen_entry_keys(service: str) -> set[tuple[str, str]]:
+async def load_seen_entry_state(service: str) -> dict[tuple[str, str], str | None]:
     db = await get_db()
     try:
         rows = await db.execute_fetchall(
-            "SELECT request_type, entry_id FROM seen_entries WHERE service = ?",
+            "SELECT request_type, entry_id, fingerprint FROM seen_entries WHERE service = ?",
             (service,),
         )
         return {
-            (str(row["request_type"] or "borrow"), str(row["entry_id"]))
+            (str(row["request_type"] or "borrow"), str(row["entry_id"])): row["fingerprint"]
             for row in rows
             if str(row["entry_id"] or "").strip()
         }
@@ -155,6 +155,6 @@ async def sync_seen_entries(service: str, entries: list[BorrowEntry]) -> None:
 __all__ = [
     "bootstrap_seen_entries",
     "is_seen_service_initialized",
-    "load_seen_entry_keys",
+    "load_seen_entry_state",
     "sync_seen_entries",
 ]

@@ -37,6 +37,7 @@ from bot.services.admin.service import (
     set_user_allowed,
 )
 from bot.config import ADMIN_CHAT_ID
+from bot.domain.borrower_views import NotificationEntryView
 
 log = logging.getLogger(__name__)
 router = Router(name="admin")
@@ -638,7 +639,7 @@ async def _send_test_notification(callback: CallbackQuery, services: list[str]):
                     id=0, chat_id=chat_id, service=svc,
                     label="🧪 Тестовое уведомление",
                 )
-                text = format_notification(entry, dummy_sub)
+                text = format_notification(NotificationEntryView.from_entry(entry), dummy_sub)
                 bot = callback.bot
                 await bot.send_message(
                     chat_id, text, parse_mode="HTML",

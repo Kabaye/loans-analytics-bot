@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from bot import config
 from bot.domain.borrowers import BorrowEntry
+from bot.domain.borrower_views import serialize_polling_cache_entry
 from bot.integrations.parsers.kapusta import KapustaBlockedError
 from bot.integrations.telegram_notifications import notify_users, update_sent_notifications
 from bot.services.base.cache import set_cached_entries
@@ -51,7 +52,7 @@ async def poll_kapusta(bot) -> None:
             return
 
         entries = await parser.fetch_borrows()
-        set_cached_entries("kapusta", [entry.to_dict() for entry in entries])
+        set_cached_entries("kapusta", [serialize_polling_cache_entry(entry) for entry in entries])
         clear_error("kapusta")
         set_kapusta_backoff_until(None)
         if entries:
@@ -109,7 +110,7 @@ async def poll_finkit(bot) -> None:
                 return
             entries = await parser.fetch_borrows()
 
-        set_cached_entries("finkit", [entry.to_dict() for entry in entries])
+        set_cached_entries("finkit", [serialize_polling_cache_entry(entry) for entry in entries])
 
         if entries:
             await notify_json_schema_change("finkit", entries)
@@ -195,7 +196,7 @@ async def poll_zaimis(bot) -> None:
                 return
             all_entries = await parser.fetch_borrows(subscriptions=subs_list)
 
-        set_cached_entries("zaimis", [entry.to_dict() for entry in all_entries])
+        set_cached_entries("zaimis", [serialize_polling_cache_entry(entry) for entry in all_entries])
 
         if all_entries:
             await notify_json_schema_change("zaimis", all_entries)

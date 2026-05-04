@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 from bot.domain.borrowers import BorrowEntry
 from bot.domain.borrower_views import NotificationEntryView
+from bot.domain.raw_payloads import extract_raw_payload
 from bot.domain.subscriptions import Subscription
 from bot.repositories.subscriptions import (
     has_active_subscriptions_for_service,
@@ -52,7 +53,7 @@ class PreparedNotification:
     chat_id: int
     text: str
     matched_subscriptions: list[Subscription]
-    raw_data: dict | None = None
+    raw_payload: dict | None = None
 
 
 def _coerce_utc_datetime(value) -> datetime | None:
@@ -445,7 +446,7 @@ async def prepare_notifications(
                     chat_id=chat_id,
                     text=text,
                     matched_subscriptions=matched_subs,
-                    raw_data=entry.raw_data,
+                    raw_payload=extract_raw_payload(entry),
                 )
             )
 

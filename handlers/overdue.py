@@ -16,6 +16,7 @@ from aiogram.types import (
 )
 
 from bot import config
+from bot.domain.raw_payloads import format_raw_payload_preview
 from bot.services.overdue.service import (
     clone_credential_creditor_profile,
     get_credential_by_id,
@@ -499,13 +500,7 @@ async def cb_overdue_raw(callback: CallbackQuery):
     if not case:
         await callback.answer("Кейс не найден", show_alert=True)
         return
-    raw = case.get("raw_data") or "{}"
-    try:
-        payload = json.loads(raw)
-        pretty = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
-    except Exception:
-        pretty = str(raw)
-    pretty = pretty[:3500]
+    pretty = format_raw_payload_preview(case.get("raw_data"), limit=3500)
     await callback.message.edit_text(
         f"🧾 <b>Данные API</b>\n\n<pre>{escape(pretty)}</pre>",
         reply_markup=_case_actions_kb(case_id, int(case["credential_id"]) if case.get("credential_id") else None),

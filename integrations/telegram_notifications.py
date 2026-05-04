@@ -11,6 +11,8 @@ from aiogram.exceptions import TelegramRetryAfter
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot.domain.borrowers import BorrowEntry
+from bot.domain.borrower_views import NotificationEntryView
+from bot.domain.raw_payloads import extract_raw_payload, format_raw_payload_preview
 from bot.domain.subscriptions import Subscription
 from bot.services.notifications.sender import format_notification, prepare_notifications
 
@@ -54,9 +56,7 @@ async def cb_show_raw_data(callback: CallbackQuery):
 
     import html as html_mod
 
-    text = json.dumps(raw, ensure_ascii=False, indent=2, default=str)
-    if len(text) > 3900:
-        text = text[:3900] + "\n... (обрезано)"
+    text = format_raw_payload_preview(raw, limit=3900)
     escaped = html_mod.escape(text)
     await callback.message.reply(f"<pre>{escaped}</pre>", parse_mode="HTML")
     await callback.answer()
@@ -77,7 +77,7 @@ async def notify_users(
 
     sent_refs: list[SentNotificationRef] = []
     for plan in plans:
-        kb = _build_raw_markup(plan.raw_data)
+        kb = _build_raw_markup(plan.raw_payload)
 
         if is_busy(plan.chat_id):
             enqueue(plan.chat_id, plan.text, kb)
@@ -130,8 +130,9 @@ async def update_sent_notifications(
         if not entry:
             continue
 
-        new_text = format_notification(entry, matched_subs)
-        kb = _build_raw_markup(entry.raw_data)
+        entry_view = NotificationEntryView.from_entry(entry)
+        new_text = format_notification(entry_view, matched_subs)
+        kb = _build_raw_markup(extract_raw_payload(entry))
 
         try:
             await bot.edit_message_text(

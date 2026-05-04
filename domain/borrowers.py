@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime
 import hashlib
 import json
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Optional
 
 
@@ -209,126 +209,6 @@ class BorrowEntry:
         }
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
         return hashlib.sha1(encoded).hexdigest()
-
-    def to_dict(self) -> dict:
-        payload = {
-            "id": self.id,
-            "service": self.service,
-            "request_type": self.request_type,
-            "amount": self.amount,
-            "period_days": self.period_days,
-            "interest_day": self.interest_day,
-            "interest_year": self.interest_year,
-            "penalty_interest": self.penalty_interest,
-            "credit_score": self.credit_score,
-            "created_at": _serialize_datetime(self.created_at),
-            "updated_at": _serialize_datetime(self.updated_at),
-            "profit_gross": self.profit_gross,
-            "profit_net": self.profit_net,
-            "amount_return": self.amount_return,
-            "platform_fee_open": self.platform_fee_open,
-            "platform_fee_close": self.platform_fee_close,
-            "full_name": self.full_name,
-            "document_id": self.document_id,
-            "display_name": self.display_name,
-            "display_names": list(self.display_names),
-            "current_display_name": self.current_display_name,
-            "is_income_confirmed": self.is_income_confirmed,
-            "is_employed": self.is_employed,
-            "scoring_assessed_at": _serialize_datetime(self.scoring_assessed_at),
-            "debt_load_score": self.debt_load_score,
-            "has_active_loan": self.has_active_loan,
-            "has_overdue": self.has_overdue,
-            "note": self.note,
-            "status": self.status,
-            "contract_url": self.contract_url,
-            "loans_count": self.loans_count,
-            "loans_count_settled": self.loans_count_settled,
-            "loans_count_overdue": self.loans_count_overdue,
-            "borrower_user_id": self.borrower_user_id,
-            "opi_checked": self.opi_checked,
-            "opi_has_debt": self.opi_has_debt,
-            "opi_debt_amount": self.opi_debt_amount,
-            "opi_full_name": self.opi_full_name,
-            "opi_checked_at": _serialize_datetime(self.opi_checked_at),
-            "opi_error": self.opi_error,
-            "kb_known": self.kb_known,
-            "kb_total_loans": self.kb_total_loans,
-            "kb_cancelled": self.kb_cancelled,
-            "kb_has_claims": self.kb_has_claims,
-            "kb_avg_rating": self.kb_avg_rating,
-            "kb_last_rating": self.kb_last_rating,
-            "loan_status_details_json": self.bi_loan_status_details_json,
-            "enrichment_source": self.enrichment_source,
-            "source_account_tag": self.source_account_tag,
-            "loan_url": self.loan_url,
-            "components": {
-                "snapshot": {
-                    "id": self.snapshot.id,
-                    "service": self.snapshot.service,
-                    "request_type": self.snapshot.request_type,
-                    "amount": self.snapshot.amount,
-                    "period_days": self.snapshot.period_days,
-                    "interest_day": self.snapshot.interest_day,
-                    "interest_year": self.snapshot.interest_year,
-                    "penalty_interest": self.snapshot.penalty_interest,
-                    "credit_score": self.snapshot.credit_score,
-                    "created_at": _serialize_datetime(self.snapshot.created_at),
-                    "updated_at": _serialize_datetime(self.snapshot.updated_at),
-                    "profit_gross": self.snapshot.profit_gross,
-                    "profit_net": self.snapshot.profit_net,
-                    "amount_return": self.snapshot.amount_return,
-                    "platform_fee_open": self.snapshot.platform_fee_open,
-                    "platform_fee_close": self.snapshot.platform_fee_close,
-                    "note": self.snapshot.note,
-                    "status": self.snapshot.status,
-                    "loans_count": self.snapshot.loans_count,
-                    "loans_count_settled": self.snapshot.loans_count_settled,
-                    "loans_count_overdue": self.snapshot.loans_count_overdue,
-                },
-                "borrower": {
-                    "full_name": self.borrower.full_name,
-                    "document_id": self.borrower.document_id,
-                    "display_name": self.borrower.display_name,
-                    "display_names": list(self.borrower.display_names),
-                    "borrower_user_id": self.borrower.borrower_user_id,
-                },
-                "enrichment": {
-                    "is_income_confirmed": self.enrichment.is_income_confirmed,
-                    "is_employed": self.enrichment.is_employed,
-                    "scoring_assessed_at": _serialize_datetime(self.enrichment.scoring_assessed_at),
-                    "debt_load_score": self.enrichment.debt_load_score,
-                    "has_active_loan": self.enrichment.has_active_loan,
-                    "has_overdue": self.enrichment.has_overdue,
-                    "opi_checked": self.enrichment.opi_checked,
-                    "opi_has_debt": self.enrichment.opi_has_debt,
-                    "opi_debt_amount": self.enrichment.opi_debt_amount,
-                    "opi_full_name": self.enrichment.opi_full_name,
-                    "opi_checked_at": _serialize_datetime(self.enrichment.opi_checked_at),
-                    "opi_error": self.enrichment.opi_error,
-                    "kb_known": self.enrichment.kb_known,
-                    "kb_total_loans": self.enrichment.kb_total_loans,
-                    "kb_cancelled": self.enrichment.kb_cancelled,
-                    "kb_has_claims": self.enrichment.kb_has_claims,
-                    "kb_avg_rating": self.enrichment.kb_avg_rating,
-                    "kb_last_rating": self.enrichment.kb_last_rating,
-                    "bi_loan_status": self.enrichment.bi_loan_status,
-                    "bi_loan_status_details_json": self.enrichment.bi_loan_status_details_json,
-                    "bi_sum_category": self.enrichment.bi_sum_category,
-                    "bi_rating": self.enrichment.bi_rating,
-                    "enrichment_source": self.enrichment.enrichment_source,
-                    "source_account_tag": self.enrichment.source_account_tag,
-                },
-                "documents": {
-                    "contract_url": self.documents.contract_url,
-                    "loan_url": self.documents.loan_url,
-                },
-            },
-        }
-        if self.raw_data:
-            payload["raw_data"] = self.raw_data
-        return payload
-
 
 __all__ = [
     "BorrowEntry",

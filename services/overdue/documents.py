@@ -373,6 +373,8 @@ def _postal_address_lines(case: dict, target: dict[str, str]) -> list[str]:
         or ""
     ).strip() or None
     lines = [case.get("full_name") or "Получатель не указан"]
+    if case.get("borrower_phone"):
+        lines.append(f"Тел: {case['borrower_phone']}")
     if street_line:
         lines.append(street_line)
     if city:
@@ -381,8 +383,6 @@ def _postal_address_lines(case: dict, target: dict[str, str]) -> list[str]:
         lines.append(str(target.get("address")).strip())
     if postcode:
         lines.append(postcode)
-    if case.get("borrower_phone"):
-        lines.append(f"Тел: {case['borrower_phone']}")
     return lines
 
 
@@ -408,7 +408,8 @@ def _debtor_header_lines(
     addresses = [target] if target else _case_borrower_addresses(case)
     for idx, address_target in enumerate(addresses, start=1):
         if target is not None:
-            prefix = "Адрес"
+            lines.append(_compact_postal_address(case, address_target))
+            continue
         else:
             prefix = "Адрес" if len(addresses) == 1 else f"Адрес {idx}"
         lines.append(f"{prefix}: {_compact_postal_address(case, address_target)}")

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 from bot.domain.credentials import UserCredentials
 from bot.integrations.geolocation_client import lookup_belarus_zip, lookup_belarus_zip_details
@@ -27,6 +27,28 @@ def _safe_float(value) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _safe_int(value) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _days_overdue_from_due(due_at: str | None) -> int | None:
+    if not due_at:
+        return None
+    try:
+        parsed = datetime.fromisoformat(due_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    delta = datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)
+    return max(int(delta.total_seconds() // 86400), 0)
 
 
 def _parse_case_payload(case: dict) -> dict:
@@ -95,10 +117,28 @@ async def _get_finkit_parser_for_case(case: dict):
 
 
 async def _persist_finkit_detail(case: dict, payload: dict, detail: dict) -> None:
+    item = payload.get("list") or {}
     principal = _safe_float(_coalesce(detail.get("principal_outstanding"), case.get("principal_outstanding"), case.get("amount")))
     accrued = _safe_float(_coalesce(detail.get("accrued_percent"), case.get("accrued_percent")))
     fine = _safe_float(_coalesce(detail.get("fine_outstanding"), case.get("fine_outstanding")))
     total_due = _safe_float(_coalesce(detail.get("total_due"), case.get("total_due")))
+    due_at = _coalesce(
+        detail.get("maturity_date"),
+        detail.get("payment_date"),
+        detail.get("due_at"),
+        detail.get("due_date"),
+        item.get("payment_date"),
+        item.get("due_at"),
+        item.get("due_date"),
+        case.get("due_at"),
+    )
+    schedule_days = None
+    schedules = detail.get("schedules") or []
+    if schedules:
+        schedule_days = _safe_int(schedules[0].get("days_delayed"))
+    days_overdue = _safe_int(_coalesce(detail.get("overdue_days"), item.get("overdue_days"), schedule_days, case.get("days_overdue")))
+    if days_overdue is None:
+        days_overdue = _days_overdue_from_due(due_at)
     if total_due is None:
         total_due = sum(part or 0 for part in (principal, accrued, fine)) or None
 
@@ -111,7 +151,9 @@ async def _persist_finkit_detail(case: dict, payload: dict, detail: dict) -> Non
         loan_id=str(_coalesce(detail.get("loan"), case.get("loan_id")) or "") or None,
         loan_number=str(_coalesce(detail.get("loan_number"), case.get("loan_number")) or "") or None,
         issued_at=_coalesce(detail.get("created"), case.get("issued_at")),
-        due_at=_coalesce(detail.get("payment_date"), detail.get("due_at"), detail.get("due_date"), case.get("due_at")),
+        due_at=due_at,
+        overdue_started_at=_coalesce(detail.get("overdue_started_at"), item.get("overdue_started_at"), case.get("overdue_started_at"), due_at),
+        days_overdue=days_overdue,
         amount=_safe_float(_coalesce(detail.get("amount"), case.get("amount"))),
         principal_outstanding=principal,
         accrued_percent=accrued,

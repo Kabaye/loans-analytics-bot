@@ -7,6 +7,11 @@ from typing import Iterable
 from bot.repositories.db import get_db
 from bot.repositories.settings import save_api_change_alert
 from bot.utils.borrower_address import sanitize_borrower_address
+from bot.utils.borrower_addresses import (
+    merge_primary_borrower_address,
+    primary_borrower_address,
+    serialize_borrower_addresses,
+)
 
 _NAME_MASK_CHAR = "*"
 _LEGAL_FULL_NAME_RE = re.compile(r"^[A-ZА-ЯЁ]+(?:[-'][A-ZА-ЯЁ]+)?(?:\s+[A-ZА-ЯЁ]+(?:[-'][A-ZА-ЯЁ]+)?){2,}$")
@@ -661,14 +666,16 @@ async def lookup_borrower_contacts(document_id: str) -> dict | None:
         rows = await db.execute_fetchall(
             """
             SELECT document_id, full_name, borrower_phone, borrower_email,
-                   borrower_address, borrower_zip, contact_source, source, source_account_tag
+                   borrower_address, borrower_addresses_json, borrower_zip,
+                   contact_source, source, source_account_tag
             FROM borrower_info
             WHERE document_id = ?
               AND (
                     NULLIF(TRIM(COALESCE(borrower_phone, '')), '') IS NOT NULL
                  OR NULLIF(TRIM(COALESCE(borrower_email, '')), '') IS NOT NULL
                  OR NULLIF(TRIM(COALESCE(borrower_address, '')), '') IS NOT NULL
-              )
+                 OR NULLIF(TRIM(COALESCE(borrower_addresses_json, '')), '') IS NOT NULL
+               )
             LIMIT 1
             """,
             (document_id,),
@@ -677,7 +684,13 @@ async def lookup_borrower_contacts(document_id: str) -> dict | None:
             return None
         row = dict(rows[0])
         display_names = await _collect_display_names_by_document(db, document_id)
-        clean_address = sanitize_borrower_address(row.get("borrower_address"), row.get("full_name"))
+        addresses = merge_primary_borrower_address(
+            row.get("borrower_address"),
+            row.get("borrower_zip"),
+            row.get("borrower_addresses_json"),
+            full_name=row.get("full_name"),
+        )
+        clean_address, zip_code = primary_borrower_address(addresses, full_name=row.get("full_name"))
         return {
             "document_id": row.get("document_id"),
             "full_name": row.get("full_name"),
@@ -686,7 +699,8 @@ async def lookup_borrower_contacts(document_id: str) -> dict | None:
             "phone": row.get("borrower_phone"),
             "email": row.get("borrower_email"),
             "address": clean_address,
-            "zip": row.get("borrower_zip"),
+            "addresses": addresses,
+            "zip": zip_code or row.get("borrower_zip"),
             "source": row.get("contact_source") or row.get("source"),
             "source_account_tag": row.get("source_account_tag"),
         }
@@ -866,6 +880,7 @@ async def upsert_borrower_contacts(
     borrower_phone: str | None = None,
     borrower_email: str | None = None,
     borrower_address: str | None = None,
+    borrower_addresses: list[dict[str, str]] | list[str] | tuple[str, ...] | None = None,
     borrower_zip: str | None = None,
     source: str = "manual",
     source_account_tag: str | None = None,
@@ -897,23 +912,38 @@ async def upsert_borrower_contacts(
             source_account_tag or contact_tag or normalized_tag,
         )
         merged_full_name = _merge_full_name((existing or {}).get("full_name"), normalized_full_name)
+        merged_addresses = merge_primary_borrower_address(
+            borrower_address,
+            borrower_zip,
+            borrower_addresses or (existing or {}).get("borrower_addresses_json"),
+            full_name=merged_full_name or (existing or {}).get("full_name"),
+        )
+        borrower_address, borrower_zip = primary_borrower_address(
+            merged_addresses,
+            full_name=merged_full_name or (existing or {}).get("full_name"),
+        )
         borrower_address = sanitize_borrower_address(
             borrower_address,
             merged_full_name or (existing or {}).get("full_name"),
+        )
+        borrower_addresses_json = serialize_borrower_addresses(
+            merged_addresses,
+            full_name=merged_full_name or (existing or {}).get("full_name"),
         )
         if not _can_write_borrower_info(existing, merged_full_name):
             return
         await db.execute(
             """
             INSERT INTO borrower_info
-                (document_id, full_name, borrower_phone, borrower_email, borrower_address, borrower_zip,
+                (document_id, full_name, borrower_phone, borrower_email, borrower_address, borrower_addresses_json, borrower_zip,
                  contact_source, source, source_account_tag, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
             ON CONFLICT(document_id) DO UPDATE SET
                 full_name = ?,
                 borrower_phone = COALESCE(excluded.borrower_phone, borrower_info.borrower_phone),
                 borrower_email = COALESCE(excluded.borrower_email, borrower_info.borrower_email),
                 borrower_address = COALESCE(excluded.borrower_address, borrower_info.borrower_address),
+                borrower_addresses_json = COALESCE(excluded.borrower_addresses_json, borrower_info.borrower_addresses_json),
                 borrower_zip = COALESCE(excluded.borrower_zip, borrower_info.borrower_zip),
                 contact_source = COALESCE(excluded.contact_source, borrower_info.contact_source),
                 source = COALESCE(excluded.source, borrower_info.source),
@@ -926,6 +956,7 @@ async def upsert_borrower_contacts(
                 borrower_phone,
                 borrower_email,
                 borrower_address,
+                borrower_addresses_json,
                 borrower_zip,
                 chosen_contact_source,
                 chosen_source,

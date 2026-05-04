@@ -27,6 +27,11 @@ from bot.repositories.overdue import (
 )
 from bot.services.base.providers import ensure_zaimis_parser, telegram_user_tag
 from bot.services.borrowers.enrichment import list_borrower_ids_with_documents
+from bot.utils.borrower_addresses import (
+    merge_primary_borrower_address,
+    normalize_borrower_addresses,
+    primary_borrower_address,
+)
 
 log = logging.getLogger(__name__)
 
@@ -66,6 +71,7 @@ class ZaimisNormalizedOrder:
     borrower_phone: str | None = None
     borrower_email: str | None = None
     borrower_address: str | None = None
+    borrower_addresses: list[dict[str, str]] = field(default_factory=list)
     borrower_zip: str | None = None
     amount: float | None = None
     rating: float | None = None
@@ -161,6 +167,10 @@ def _zaimis_zip(address: str | None) -> str | None:
         return None
     match = _ZIP_RE.search(address)
     return match.group(1) if match else None
+
+
+def _zaimis_addresses(expired_info: dict | None) -> list[dict[str, str]]:
+    return normalize_borrower_addresses((expired_info or {}).get("addressStr"))
 
 
 def _days_overdue_from_due(due_at: str | None) -> int | None:
@@ -275,7 +285,11 @@ def normalize_zaimis_order(
             list_row.get("returnAmount"),
         )
     )
-    borrower_address = _zaimis_address(expired_info)
+    borrower_addresses = _zaimis_addresses(expired_info)
+    borrower_address, borrower_zip = primary_borrower_address(borrower_addresses)
+    if not borrower_address:
+        borrower_address = _zaimis_address(expired_info)
+        borrower_zip = _zaimis_zip(borrower_address)
     return ZaimisNormalizedOrder(
         order_id=str(_coalesce(payload.get("id"), list_row.get("id")) or "").strip(),
         list_row=list_row,
@@ -293,7 +307,8 @@ def normalize_zaimis_order(
         borrower_phone=_first_text((expired_info or {}).get("phone")) or _first_text((expired_info or {}).get("otherPhones")),
         borrower_email=_first_text((expired_info or {}).get("email")),
         borrower_address=borrower_address,
-        borrower_zip=_zaimis_zip(borrower_address),
+        borrower_addresses=borrower_addresses,
+        borrower_zip=borrower_zip,
         amount=detail_amount,
         rating=_safe_float(_coalesce(offer.get("score"), payload.get("score"), list_row.get("score"))),
         issued_at=_coalesce(payload.get("createdAt"), list_row.get("createdAt"), offer.get("createdAt")),
@@ -491,16 +506,24 @@ async def sync_zaimis_account(
                         normalized.borrower_phone,
                         normalized.borrower_email,
                         normalized.borrower_address,
+                        normalized.borrower_addresses,
                         normalized.borrower_zip,
                     )
                 ):
                     contact_source = f"zaimis_investment_detail_{user_tag}"
+                    merged_addresses = merge_primary_borrower_address(
+                        normalized.borrower_address,
+                        normalized.borrower_zip,
+                        normalized.borrower_addresses,
+                        full_name=effective_full_name,
+                    )
                     await upsert_borrower_contacts(
                         effective_document_id,
                         full_name=effective_full_name,
                         borrower_phone=normalized.borrower_phone,
                         borrower_email=normalized.borrower_email,
                         borrower_address=normalized.borrower_address,
+                        borrower_addresses=merged_addresses,
                         borrower_zip=normalized.borrower_zip,
                         source=contact_source,
                         source_account_tag=user_tag,
@@ -509,6 +532,7 @@ async def sync_zaimis_account(
                         case_id,
                         cred.chat_id,
                         borrower_address=normalized.borrower_address,
+                        borrower_addresses=merged_addresses,
                         borrower_zip=normalized.borrower_zip,
                         borrower_phone=normalized.borrower_phone,
                         borrower_email=normalized.borrower_email,

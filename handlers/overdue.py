@@ -42,6 +42,7 @@ from bot.services.overdue.cases import (
     send_finkit_pretrial_claim,
 )
 from bot.services.overdue.documents import (
+    build_case_address_summary,
     build_case_loan_ref,
     CLAIM_VOLUNTARY_TERM_DAYS,
     build_postal_address_text,
@@ -353,6 +354,7 @@ async def _enrich_finkit_case_from_claims(case: dict) -> dict:
 
 def _format_case_text(case: dict) -> str:
     loan_ref = build_case_loan_ref(case)
+    address_summary = build_case_address_summary(case)
     lines = [
         "⚖️ <b>Просроченный кейс</b>",
         "",
@@ -365,8 +367,7 @@ def _format_case_text(case: dict) -> str:
         "",
         f"<b>Заемщик:</b> {_display_html(case.get('full_name'))}",
         f"<b>ИН:</b> {_display_html(case.get('document_id'))}",
-        f"<b>Адрес:</b> {_display_html(case.get('borrower_address'))}",
-        f"<b>ZIP:</b> {_display_html(case.get('borrower_zip'))}",
+        f"<b>Адрес(а):</b> {_display_html(address_summary)}",
         f"<b>Телефон:</b> {_display_html(case.get('borrower_phone'))}",
         f"<b>Email:</b> {_display_html(case.get('borrower_email'))}",
         "",

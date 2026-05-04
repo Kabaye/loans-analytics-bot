@@ -12,6 +12,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Mm, Pt
 
 from bot import config
+from bot.utils.borrower_addresses import merge_primary_borrower_address, normalize_borrower_addresses
 
 log = logging.getLogger(__name__)
 
@@ -221,6 +222,37 @@ def _parse_case_raw(case: dict) -> dict:
         return {}
 
 
+def _case_borrower_addresses(case: dict) -> list[dict[str, str]]:
+    payload = _parse_case_raw(case)
+    overrides = payload.get("contact_overrides") or {}
+    raw_addresses = normalize_borrower_addresses((payload.get("expired_info") or {}).get("addressStr"))
+    return merge_primary_borrower_address(
+        case.get("borrower_address"),
+        case.get("borrower_zip"),
+        case.get("borrower_addresses") or overrides.get("borrower_addresses") or raw_addresses,
+        full_name=case.get("full_name"),
+    )
+
+
+def _format_address_with_zip(address_entry: dict[str, str]) -> str:
+    address = str(address_entry.get("address") or "").strip()
+    zip_code = str(address_entry.get("zip") or "").strip()
+    if not address:
+        return zip_code or "—"
+    if zip_code and zip_code not in address:
+        return f"{address} ({zip_code})"
+    return address
+
+
+def build_case_address_summary(case: dict) -> str:
+    addresses = _case_borrower_addresses(case)
+    if not addresses:
+        return "—"
+    if len(addresses) == 1:
+        return _format_address_with_zip(addresses[0])
+    return "\n".join(f"{idx}. {_format_address_with_zip(entry)}" for idx, entry in enumerate(addresses, start=1))
+
+
 def _latest_claim(case: dict) -> dict:
     payload = _parse_case_raw(case)
     detail = payload.get("detail") or {}
@@ -283,14 +315,17 @@ def _split_address(address: str | None) -> dict[str, str | None]:
     return {"city": city, "street_line": street_line or None}
 
 
-def _postal_lookup_meta(case: dict) -> dict[str, str | None]:
+def _postal_lookup_meta(case: dict, target: dict[str, str] | None = None) -> dict[str, str | None]:
     payload = _parse_case_raw(case)
     lookup = payload.get("postal_lookup") or {}
-    postcode = str(lookup.get("postcode") or case.get("borrower_zip") or "").strip() or None
+    target_address = str((target or {}).get("address") or "").strip()
+    primary_address = str(case.get("borrower_address") or "").strip()
+    use_lookup = not target_address or target_address == primary_address
+    postcode = str((target or {}).get("zip") or (lookup.get("postcode") if use_lookup else None) or case.get("borrower_zip") or "").strip() or None
     match_address = str(lookup.get("match_address") or "").strip()
     region = None
     locality = None
-    if match_address:
+    if match_address and use_lookup:
         parts = [part.strip() for part in match_address.split(",") if part.strip()]
         if parts and re.fullmatch(r"\d{6}", parts[0]):
             parts = parts[1:]
@@ -301,9 +336,9 @@ def _postal_lookup_meta(case: dict) -> dict[str, str | None]:
     return {"postcode": postcode, "region": region, "locality": locality}
 
 
-def _postal_address_lines(case: dict) -> list[str]:
-    address_parts = _split_address(case.get("borrower_address"))
-    lookup = _postal_lookup_meta(case)
+def _postal_address_lines(case: dict, target: dict[str, str]) -> list[str]:
+    address_parts = _split_address(target.get("address"))
+    lookup = _postal_lookup_meta(case, target)
     lines = [case.get("full_name") or "Получатель не указан"]
     if address_parts.get("street_line"):
         lines.append(str(address_parts["street_line"]))
@@ -318,11 +353,11 @@ def _postal_address_lines(case: dict) -> list[str]:
 
 
 def _debtor_header_lines(case: dict) -> list[str]:
-    address_parts = _split_address(case.get("borrower_address"))
     lines = [case.get("full_name") or "—"]
-    compact_address = ", ".join(part for part in [address_parts.get("city"), address_parts.get("street_line")] if part)
-    if compact_address:
-        lines.append(compact_address)
+    addresses = _case_borrower_addresses(case)
+    for idx, target in enumerate(addresses, start=1):
+        prefix = "Адрес" if len(addresses) == 1 else f"Адрес {idx}"
+        lines.append(f"{prefix}: {_format_address_with_zip(target)}")
     if case.get("borrower_phone"):
         lines.append(f"Тел: {case['borrower_phone']}")
     if case.get("borrower_email"):
@@ -357,13 +392,14 @@ def collect_sms_missing_fields(case: dict, creditor: dict | None) -> list[str]:
 
 def collect_claim_missing_fields(case: dict, creditor: dict | None, signature: dict | None) -> list[str]:
     missing = collect_sms_missing_fields(case, creditor)
+    borrower_addresses = _case_borrower_addresses(case)
     if not creditor or not creditor.get("full_name"):
         missing.append("ФИО кредитора")
     if not case.get("document_id"):
         missing.append("ИН заемщика")
-    if not case.get("borrower_address"):
+    if not borrower_addresses:
         missing.append("адрес заемщика")
-    if not case.get("borrower_zip"):
+    if not any(str(item.get("zip") or "").strip() for item in borrower_addresses):
         missing.append("ZIP-код заемщика")
     if not case.get("issued_at"):
         missing.append("дата договора / займа")
@@ -401,7 +437,15 @@ def build_sms_text(case: dict, creditor: dict, variant: str = "soft") -> str:
 
 
 def build_postal_address_text(case: dict) -> str:
-    return "📮 <b>Адрес для отправки через Белпочту</b>\n\n<pre>" + "\n".join(_postal_address_lines(case)) + "</pre>"
+    targets = _case_borrower_addresses(case)
+    if not targets:
+        targets = [{"address": str(case.get("borrower_address") or "").strip(), "zip": str(case.get("borrower_zip") or "").strip()}]
+    header = "📮 <b>Адрес для отправки через Белпочту</b>" if len(targets) == 1 else "📮 <b>Адреса для отправки через Белпочту</b>"
+    blocks = []
+    for idx, target in enumerate(targets, start=1):
+        prefix = [] if len(targets) == 1 else [f"[Адрес {idx}]"]
+        blocks.append("\n".join(prefix + _postal_address_lines(case, target)))
+    return header + "\n\n<pre>" + "\n\n".join(blocks) + "</pre>"
 
 
 def _claim_amount_rows(case: dict) -> tuple[str, list[tuple[str, str, bool]]]:

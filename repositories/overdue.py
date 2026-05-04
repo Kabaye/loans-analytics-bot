@@ -2,6 +2,12 @@ import json
 
 from bot.repositories.db import get_db
 from bot.utils.borrower_address import sanitize_borrower_address
+from bot.utils.borrower_addresses import (
+    merge_primary_borrower_address,
+    normalize_borrower_addresses,
+    primary_borrower_address,
+    serialize_borrower_addresses,
+)
 
 
 def _coalesce_non_empty(*values):
@@ -46,15 +52,22 @@ def _raw_borrower_display_name(payload: dict) -> str | None:
     )
 
 
-def _raw_contact_overrides(payload: dict) -> dict[str, str]:
+def _raw_contact_overrides(payload: dict) -> dict[str, object]:
     value = payload.get("contact_overrides")
     if not isinstance(value, dict):
         return {}
-    result: dict[str, str] = {}
+    result: dict[str, object] = {}
     for key in ("borrower_address", "borrower_zip", "borrower_phone", "borrower_email"):
         normalized = _coalesce_non_empty(value.get(key))
         if normalized:
             result[key] = normalized
+    addresses = merge_primary_borrower_address(
+        value.get("borrower_address"),
+        value.get("borrower_zip"),
+        value.get("borrower_addresses"),
+    )
+    if addresses:
+        result["borrower_addresses"] = addresses
     return result
 
 
@@ -62,11 +75,17 @@ def _apply_contact_overrides(
     payload: dict,
     *,
     borrower_address: str | None = None,
+    borrower_addresses: list[dict[str, str]] | list[str] | tuple[str, ...] | None = None,
     borrower_zip: str | None = None,
     borrower_phone: str | None = None,
     borrower_email: str | None = None,
 ) -> None:
     overrides = _raw_contact_overrides(payload)
+    merged_addresses = merge_primary_borrower_address(
+        borrower_address,
+        borrower_zip,
+        borrower_addresses or overrides.get("borrower_addresses"),
+    )
     for key, value in {
         "borrower_address": borrower_address,
         "borrower_zip": borrower_zip,
@@ -76,8 +95,29 @@ def _apply_contact_overrides(
         normalized = _coalesce_non_empty(value)
         if normalized:
             overrides[key] = normalized
+    if merged_addresses:
+        primary_address, primary_zip = primary_borrower_address(merged_addresses)
+        if primary_address:
+            overrides["borrower_address"] = primary_address
+        if primary_zip:
+            overrides["borrower_zip"] = primary_zip
+        overrides["borrower_addresses"] = merged_addresses
     if overrides:
         payload["contact_overrides"] = overrides
+
+
+def _raw_borrower_addresses(payload: dict, full_name: str | None = None) -> list[dict[str, str]]:
+    overrides = _raw_contact_overrides(payload)
+    addresses = merge_primary_borrower_address(
+        overrides.get("borrower_address"),
+        overrides.get("borrower_zip"),
+        overrides.get("borrower_addresses"),
+        full_name=full_name,
+    )
+    if addresses:
+        return addresses
+    expired_info = payload.get("expired_info") or {}
+    return normalize_borrower_addresses(expired_info.get("addressStr"), full_name=full_name)
 
 
 def _current_display_name(value) -> str | None:
@@ -133,16 +173,43 @@ def _apply_borrower_overlay(payload: dict) -> dict:
     mapped_display_name = _current_display_name(payload.get("borrower_display_names"))
     payload["display_name"] = mapped_display_name or raw_display_name or payload.get("display_name")
     payload["full_name"] = payload.get("borrower_full_name") or payload.get("display_name") or raw_full_name or payload.get("full_name")
+    borrower_addresses = merge_primary_borrower_address(
+        payload.get("effective_borrower_address"),
+        payload.get("effective_borrower_zip"),
+        payload.get("effective_borrower_addresses_json"),
+        full_name=payload.get("full_name") or raw_full_name,
+    )
+    if not borrower_addresses:
+        borrower_addresses = _raw_borrower_addresses(raw_payload, payload.get("full_name") or raw_full_name)
+    borrower_addresses = merge_primary_borrower_address(
+        contact_overrides.get("borrower_address"),
+        contact_overrides.get("borrower_zip"),
+        contact_overrides.get("borrower_addresses") or borrower_addresses,
+        full_name=payload.get("full_name") or raw_full_name,
+    )
+    if not borrower_addresses:
+        borrower_addresses = merge_primary_borrower_address(
+            payload.get("borrower_address"),
+            payload.get("borrower_zip"),
+            None,
+            full_name=payload.get("full_name") or raw_full_name,
+        )
+    primary_address, primary_zip = primary_borrower_address(
+        borrower_addresses,
+        full_name=payload.get("full_name") or raw_full_name,
+    )
+    payload["borrower_addresses"] = borrower_addresses
     payload["borrower_address"] = sanitize_borrower_address(
-        payload.get("effective_borrower_address") or contact_overrides.get("borrower_address") or payload.get("borrower_address"),
+        primary_address or payload.get("borrower_address"),
         payload.get("full_name") or raw_full_name,
     )
-    payload["borrower_zip"] = payload.get("effective_borrower_zip") or contact_overrides.get("borrower_zip") or payload.get("borrower_zip")
+    payload["borrower_zip"] = primary_zip or payload.get("effective_borrower_zip") or contact_overrides.get("borrower_zip") or payload.get("borrower_zip")
     payload["borrower_phone"] = payload.get("effective_borrower_phone") or contact_overrides.get("borrower_phone") or payload.get("borrower_phone")
     payload["borrower_email"] = payload.get("effective_borrower_email") or contact_overrides.get("borrower_email") or payload.get("borrower_email")
     payload.pop("borrower_full_name", None)
     payload.pop("borrower_display_names", None)
     payload.pop("effective_borrower_address", None)
+    payload.pop("effective_borrower_addresses_json", None)
     payload.pop("effective_borrower_zip", None)
     payload.pop("effective_borrower_phone", None)
     payload.pop("effective_borrower_email", None)
@@ -284,6 +351,7 @@ async def list_overdue_cases(chat_id: int, active_only: bool = True, limit: int 
                    NULLIF(TRIM(bi.full_name), '') AS borrower_full_name,
                    b.display_names AS borrower_display_names,
                    NULLIF(TRIM(bi.borrower_address), '') AS effective_borrower_address,
+                   NULLIF(TRIM(bi.borrower_addresses_json), '') AS effective_borrower_addresses_json,
                    NULLIF(TRIM(bi.borrower_zip), '') AS effective_borrower_zip,
                    NULLIF(TRIM(bi.borrower_phone), '') AS effective_borrower_phone,
                    NULLIF(TRIM(bi.borrower_email), '') AS effective_borrower_email
@@ -311,6 +379,7 @@ async def get_overdue_case(case_id: int, chat_id: int) -> dict | None:
                    NULLIF(TRIM(bi.full_name), '') AS borrower_full_name,
                    b.display_names AS borrower_display_names,
                    NULLIF(TRIM(bi.borrower_address), '') AS effective_borrower_address,
+                   NULLIF(TRIM(bi.borrower_addresses_json), '') AS effective_borrower_addresses_json,
                    NULLIF(TRIM(bi.borrower_zip), '') AS effective_borrower_zip,
                    NULLIF(TRIM(bi.borrower_phone), '') AS effective_borrower_phone,
                    NULLIF(TRIM(bi.borrower_email), '') AS effective_borrower_email
@@ -353,11 +422,13 @@ async def lookup_latest_borrower_contacts(document_id: str) -> dict | None:
             phone = contact_overrides.get("borrower_phone") or row.get("borrower_phone")
             email = contact_overrides.get("borrower_email") or row.get("borrower_email")
             full_name = row.get("full_name") or _raw_borrower_full_name(payload)
-            address = sanitize_borrower_address(
-                contact_overrides.get("borrower_address") or row.get("borrower_address"),
-                full_name,
+            addresses = merge_primary_borrower_address(
+                row.get("borrower_address"),
+                row.get("borrower_zip"),
+                contact_overrides.get("borrower_addresses") or _raw_borrower_addresses(payload, full_name),
+                full_name=full_name,
             )
-            zip_code = contact_overrides.get("borrower_zip") or row.get("borrower_zip")
+            address, zip_code = primary_borrower_address(addresses, full_name=full_name)
             if not any((phone, email, address, zip_code)):
                 continue
             source = payload.get("contact_source") or row.get("service")
@@ -370,6 +441,7 @@ async def lookup_latest_borrower_contacts(document_id: str) -> dict | None:
                 "phone": phone,
                 "email": email,
                 "address": address,
+                "addresses": addresses,
                 "zip": zip_code,
                 "source": source,
             }
@@ -383,6 +455,7 @@ async def update_overdue_case_contacts(
     chat_id: int,
     *,
     borrower_address: str | None = None,
+    borrower_addresses: list[dict[str, str]] | list[str] | tuple[str, ...] | None = None,
     borrower_zip: str | None = None,
     borrower_phone: str | None = None,
     borrower_email: str | None = None,
@@ -417,15 +490,31 @@ async def update_overdue_case_contacts(
         persist_in_info = False
         if document_id:
             info_rows = await db.execute_fetchall(
-                "SELECT document_id, full_name, source FROM borrower_info WHERE document_id = ? LIMIT 1",
+                "SELECT document_id, full_name, source, borrower_addresses_json FROM borrower_info WHERE document_id = ? LIMIT 1",
                 (document_id,),
             )
             existing_info = dict(info_rows[0]) if info_rows else None
             info_full_name = str((existing_info or {}).get("full_name") or case_full_name or "").strip() or None
             persist_in_info = bool(existing_info or info_full_name)
+        merged_addresses = merge_primary_borrower_address(
+            borrower_address,
+            borrower_zip,
+            borrower_addresses
+            or (existing_info or {}).get("borrower_addresses_json")
+            or _raw_borrower_addresses(raw_payload, info_full_name or case_full_name),
+            full_name=info_full_name or case_full_name,
+        )
+        borrower_address, borrower_zip = primary_borrower_address(
+            merged_addresses,
+            full_name=info_full_name or case_full_name,
+        )
         borrower_address = sanitize_borrower_address(
             borrower_address,
             info_full_name or case_full_name,
+        )
+        borrower_addresses_json = serialize_borrower_addresses(
+            merged_addresses,
+            full_name=info_full_name or case_full_name,
         )
         if postal_lookup is not None:
             raw_payload["postal_lookup"] = postal_lookup
@@ -434,6 +523,7 @@ async def update_overdue_case_contacts(
         _apply_contact_overrides(
             raw_payload,
             borrower_address=borrower_address,
+            borrower_addresses=merged_addresses,
             borrower_zip=borrower_zip,
             borrower_phone=borrower_phone,
             borrower_email=borrower_email,
@@ -455,13 +545,14 @@ async def update_overdue_case_contacts(
             await db.execute(
                 """
                 INSERT INTO borrower_info (
-                    document_id, full_name, borrower_address, borrower_zip, borrower_phone, borrower_email,
+                    document_id, full_name, borrower_address, borrower_addresses_json, borrower_zip, borrower_phone, borrower_email,
                     contact_source, source, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
                 ON CONFLICT(document_id) DO UPDATE SET
                     full_name = COALESCE(borrower_info.full_name, excluded.full_name),
                     borrower_address = COALESCE(excluded.borrower_address, borrower_info.borrower_address),
+                    borrower_addresses_json = COALESCE(excluded.borrower_addresses_json, borrower_info.borrower_addresses_json),
                     borrower_zip = COALESCE(excluded.borrower_zip, borrower_info.borrower_zip),
                     borrower_phone = COALESCE(excluded.borrower_phone, borrower_info.borrower_phone),
                     borrower_email = COALESCE(excluded.borrower_email, borrower_info.borrower_email),
@@ -473,6 +564,7 @@ async def update_overdue_case_contacts(
                     document_id,
                     info_full_name,
                     borrower_address,
+                    borrower_addresses_json,
                     borrower_zip,
                     borrower_phone,
                     borrower_email,

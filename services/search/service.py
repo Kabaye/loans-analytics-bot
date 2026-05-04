@@ -44,6 +44,32 @@ def extract_document_id_batch(text: str) -> list[str]:
     return doc_ids
 
 
+def _address_lines(payload: dict) -> list[str]:
+    addresses = payload.get("addresses") or []
+    if addresses:
+        result: list[str] = []
+        for idx, entry in enumerate(addresses, start=1):
+            address = str(entry.get("address") or "").strip()
+            zip_code = str(entry.get("zip") or "").strip()
+            if not address and not zip_code:
+                continue
+            line = address or zip_code
+            if address and zip_code and zip_code not in address:
+                line = f"{address} ({zip_code})"
+            prefix = "📍" if len(addresses) == 1 else f"📍 {idx}."
+            result.append(f"{prefix} {line}")
+        if result:
+            return result
+    if payload.get("address"):
+        line = str(payload["address"])
+        if payload.get("zip"):
+            line = f"{line} ({payload['zip']})"
+        return [f"📍 {line}"]
+    if payload.get("zip"):
+        return [f"📮 {payload['zip']}"]
+    return []
+
+
 def format_borrower_card(info: dict) -> str:
     lines = ["<b>📋 Карточка заёмщика</b>"]
     lines.append(f"\n<b>ИН:</b> <code>{info['document_id']}</code>")
@@ -92,13 +118,7 @@ def format_borrower_card(info: dict) -> str:
             lines.append(f"📞 <code>{info['phone']}</code>")
         if info.get("email"):
             lines.append(f"✉️ <code>{info['email']}</code>")
-        if info.get("address"):
-            address_line = str(info["address"])
-            if info.get("zip"):
-                address_line = f"{address_line} ({info['zip']})"
-            lines.append(f"📍 {address_line}")
-        elif info.get("zip"):
-            lines.append(f"📮 {info['zip']}")
+        lines.extend(_address_lines(info))
 
     if info.get("opi_checked_at"):
         if info.get("opi_has_debt"):
@@ -137,8 +157,11 @@ def format_contact_card(document_id: str, payload: dict) -> str:
         lines.append(f"<b>Телефон:</b> <code>{payload['phone']}</code>")
     if payload.get("email"):
         lines.append(f"<b>Email:</b> <code>{payload['email']}</code>")
-    if payload.get("address"):
-        lines.append(f"<b>Адрес:</b> {payload['address']}")
+    address_lines = _address_lines(payload)
+    if address_lines:
+        title = "<b>Адрес:</b>" if len(address_lines) == 1 else "<b>Адреса:</b>"
+        lines.append(title)
+        lines.extend(address_lines)
     if payload.get("service"):
         lines.append(f"<b>Сервис:</b> {SERVICE_NAMES.get(str(payload['service']), str(payload['service']))}")
     source_label = humanize_borrower_source(payload.get("source"))
@@ -162,6 +185,8 @@ async def lookup_borrower_contact_info(document_id: str) -> dict | None:
             "phone": payload.get("phone") or overdue_payload.get("phone"),
             "email": payload.get("email") or overdue_payload.get("email"),
             "address": payload.get("address") or overdue_payload.get("address"),
+            "addresses": payload.get("addresses") or overdue_payload.get("addresses") or [],
+            "zip": payload.get("zip") or overdue_payload.get("zip"),
             "source": payload.get("source") or overdue_payload.get("source"),
         }
     return payload or overdue_payload
@@ -178,6 +203,7 @@ async def build_borrower_card_payload(document_id: str) -> dict | None:
     merged["phone"] = contacts.get("phone")
     merged["email"] = contacts.get("email")
     merged["address"] = contacts.get("address")
+    merged["addresses"] = contacts.get("addresses") or []
     merged["zip"] = contacts.get("zip")
     if not merged.get("source"):
         merged["source"] = contacts.get("source")

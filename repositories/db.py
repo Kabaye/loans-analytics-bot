@@ -97,6 +97,7 @@ async def init_db() -> None:
             borrower_phone      TEXT,
             borrower_email      TEXT,
             borrower_address    TEXT,
+            borrower_addresses_json TEXT,
             borrower_zip        TEXT,
             contact_source      TEXT,
             created_at          TEXT DEFAULT (datetime('now')),

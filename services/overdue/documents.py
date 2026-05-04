@@ -372,25 +372,18 @@ def _postal_address_lines(case: dict, target: dict[str, str]) -> list[str]:
         or case.get("borrower_zip")
         or ""
     ).strip() or None
-    lines = [f"Кому   {case.get('full_name') or 'Получатель не указан'}"]
-    if city:
-        lines.append(f"Куда   {city}")
+    lines = [case.get("full_name") or "Получатель не указан"]
     if street_line:
-        lines.append(f"{'       ' if city else 'Куда   '}{street_line}")
-    if not city and not street_line and str(target.get("address") or "").strip():
-        lines.append(f"Куда   {str(target.get('address')).strip()}")
+        lines.append(street_line)
+    if city:
+        lines.append(city)
+    if not street_line and not city and str(target.get("address") or "").strip():
+        lines.append(str(target.get("address")).strip())
     if postcode:
-        lines.append(f"Индекс {_postcode_boxes(postcode)}")
+        lines.append(postcode)
     if case.get("borrower_phone"):
-        lines.append(f"Тел.   {case['borrower_phone']}")
+        lines.append(f"Тел: {case['borrower_phone']}")
     return lines
-
-
-def _postcode_boxes(value: str | None) -> str:
-    digits = "".join(ch for ch in str(value or "") if ch.isdigit())[:6]
-    if not digits:
-        return "[ ][ ][ ][ ][ ][ ]"
-    return "".join(f"[{digit}]" for digit in digits.ljust(6))
 
 
 def _compact_postal_address(case: dict, target: dict[str, str]) -> str:
@@ -401,15 +394,6 @@ def _compact_postal_address(case: dict, target: dict[str, str]) -> str:
     line = ", ".join(part for part in [city, street_line] if part)
     if not line:
         line = str(target.get("address") or "").strip() or "—"
-    postcode = str(
-        target.get("zip")
-        or address_parts.get("postcode")
-        or lookup.get("postcode")
-        or case.get("borrower_zip")
-        or ""
-    ).strip() or None
-    if postcode and postcode not in line:
-        return f"{line} ({postcode})"
     return line
 
 
@@ -423,8 +407,8 @@ def _debtor_header_lines(
     lines = [case.get("full_name") or "—"]
     addresses = [target] if target else _case_borrower_addresses(case)
     for idx, address_target in enumerate(addresses, start=1):
-        if address_target is not None and address_total and address_total > 1:
-            prefix = f"Адрес {address_index or idx}"
+        if target is not None:
+            prefix = "Адрес"
         else:
             prefix = "Адрес" if len(addresses) == 1 else f"Адрес {idx}"
         lines.append(f"{prefix}: {_compact_postal_address(case, address_target)}")

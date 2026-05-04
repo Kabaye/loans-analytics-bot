@@ -356,22 +356,51 @@ def _postal_lookup_meta(case: dict, target: dict[str, str] | None = None) -> dic
     return {"postcode": postcode, "region": region, "locality": locality}
 
 
+def _strip_postcode_prefix(address: str | None, postcode: str | None) -> str:
+    text = str(address or "").strip()
+    zip_text = str(postcode or "").strip()
+    if zip_text and text:
+        text = re.sub(rf"^\s*{re.escape(zip_text)}\s*,\s*", "", text, count=1).strip()
+    return text
+
+
+def _postal_address_score(address: str | None) -> tuple[int, int]:
+    text = str(address or "").strip()
+    if not text:
+        return (0, 0)
+    low = text.lower()
+    score = 0
+    if "область" in low:
+        score += 2
+    if "район" in low:
+        score += 2
+    if any(low.startswith(prefix) or f", {prefix}" in low for prefix in LOCALITY_PREFIXES):
+        score += 2
+    if any(marker in low for marker in ("ул.", "улица", "пер.", "пр-т", "проспект")):
+        score += 2
+    if "д." in low or "дом" in low:
+        score += 2
+    if "кв." in low or "квартира" in low:
+        score += 2
+    return (score, len(text))
+
+
 def _full_postal_address(case: dict, target: dict[str, str]) -> str | None:
     lookup = _postal_lookup_meta(case, target)
     address = str(target.get("address") or "").strip()
     match_address = str((_parse_case_raw(case).get("postal_lookup") or {}).get("match_address") or "").strip()
-    primary_address = str(case.get("borrower_address") or "").strip()
-    if match_address and address and address == primary_address:
-        address = match_address
     postcode = str(
         target.get("zip")
         or lookup.get("postcode")
         or case.get("borrower_zip")
         or ""
     ).strip()
-    if postcode and address:
-        address = re.sub(rf"^\s*{re.escape(postcode)}\s*,\s*", "", address, count=1).strip()
-    return address or None
+    original = _strip_postcode_prefix(address, postcode)
+    matched = _strip_postcode_prefix(match_address, postcode)
+    best = original
+    if _postal_address_score(matched) > _postal_address_score(original):
+        best = matched
+    return best or None
 
 
 def _postal_address_lines(case: dict, target: dict[str, str]) -> list[str]:

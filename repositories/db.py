@@ -104,6 +104,23 @@ async def init_db() -> None:
             updated_at          TEXT DEFAULT (datetime('now'))
         );
 
+        CREATE TABLE IF NOT EXISTS borrower_addresses (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            document_id         TEXT NOT NULL,
+            address_line        TEXT NOT NULL,
+            zip                 TEXT,
+            is_primary          INTEGER DEFAULT 0,
+            sort_order          INTEGER DEFAULT 0,
+            source              TEXT,
+            source_account_tag  TEXT,
+            created_at          TEXT DEFAULT (datetime('now')),
+            updated_at          TEXT DEFAULT (datetime('now')),
+            UNIQUE(document_id, address_line)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_borrower_addresses_document
+            ON borrower_addresses(document_id, is_primary DESC, sort_order ASC);
+
         CREATE TABLE IF NOT EXISTS site_settings (
             service             TEXT PRIMARY KEY,
             polling_enabled     INTEGER DEFAULT 1,
@@ -114,13 +131,26 @@ async def init_db() -> None:
 
         CREATE TABLE IF NOT EXISTS seen_entries (
             service             TEXT NOT NULL,
+            request_type        TEXT NOT NULL DEFAULT 'borrow',
             entry_id            TEXT NOT NULL,
-            first_seen          TEXT DEFAULT (datetime('now')),
-            PRIMARY KEY (service, entry_id)
+            fingerprint         TEXT,
+            detected_at         TEXT DEFAULT (datetime('now')),
+            first_seen_at       TEXT DEFAULT (datetime('now')),
+            last_seen_at        TEXT DEFAULT (datetime('now')),
+            last_detected_at    TEXT DEFAULT (datetime('now')),
+            is_active           INTEGER DEFAULT 1,
+            deactivated_at      TEXT,
+            PRIMARY KEY (service, request_type, entry_id)
         );
 
-        CREATE INDEX IF NOT EXISTS idx_seen_entries_service_first_seen
-            ON seen_entries(service, first_seen);
+        CREATE INDEX IF NOT EXISTS idx_seen_entries_service_seen
+            ON seen_entries(service, is_active, last_seen_at);
+
+        CREATE TABLE IF NOT EXISTS seen_entry_services (
+            service             TEXT PRIMARY KEY,
+            initialized_at      TEXT DEFAULT (datetime('now')),
+            last_scan_at        TEXT DEFAULT (datetime('now'))
+        );
 
         CREATE TABLE IF NOT EXISTS credential_sessions (
             credential_id       INTEGER PRIMARY KEY,

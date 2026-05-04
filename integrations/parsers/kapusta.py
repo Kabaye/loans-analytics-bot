@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 from curl_cffi.requests import AsyncSession
 
-from bot.domain.borrowers import BorrowEntry
+from bot.domain.borrowers import BorrowEntry, DocumentRefs, EntrySnapshot
 from bot.integrations.parsers.base import BaseParser
 
 log = logging.getLogger(__name__)
@@ -171,22 +171,24 @@ class KapustaParser(BaseParser):
                         pass
 
                 entry = BorrowEntry(
-                    id=str(item.get("id", "")),
-                    service=self.SERVICE_NAME,
-                    amount=amount,
-                    period_days=period,
-                    interest_day=interest_day,
-                    interest_year=interest_year,
-                    penalty_interest=penalty,
-                    credit_score=rating,
-                    created_at=created_at,
-                    profit_gross=percent_amount,
-                    profit_net=profit_net,
-                    amount_return=amount_return,
-                    platform_fee_open=platform_fee,
-                    platform_fee_close=0,
-                    loans_count=loans_count,
-                    loan_url=f"{LOAN_URL}/{item.get('id', '')}",
+                    snapshot=EntrySnapshot(
+                        id=str(item.get("id", "")),
+                        service=self.SERVICE_NAME,
+                        amount=amount,
+                        period_days=period,
+                        interest_day=interest_day,
+                        interest_year=interest_year,
+                        penalty_interest=penalty,
+                        credit_score=rating,
+                        created_at=created_at,
+                        profit_gross=percent_amount,
+                        profit_net=profit_net,
+                        amount_return=amount_return,
+                        platform_fee_open=platform_fee,
+                        platform_fee_close=0,
+                        loans_count=loans_count,
+                    ),
+                    documents=DocumentRefs(loan_url=f"{LOAN_URL}/{item.get('id', '')}"),
                     raw_data=item,
                 )
                 results.append(entry)
@@ -235,16 +237,18 @@ class KapustaParser(BaseParser):
                 percent_amount = float(item.get("percent_amount", 0))
 
                 entry = BorrowEntry(
-                    id=str(item.get("id", "")),
-                    service=self.SERVICE_NAME,
-                    request_type="lend",
-                    amount=amount,
-                    period_days=period,
-                    interest_day=interest_day,
-                    interest_year=interest_year,
-                    credit_score=rating,
-                    profit_gross=percent_amount,
-                    loans_count=item.get("loans_count"),
+                    snapshot=EntrySnapshot(
+                        id=str(item.get("id", "")),
+                        service=self.SERVICE_NAME,
+                        request_type="lend",
+                        amount=amount,
+                        period_days=period,
+                        interest_day=interest_day,
+                        interest_year=interest_year,
+                        credit_score=rating,
+                        profit_gross=percent_amount,
+                        loans_count=item.get("loans_count"),
+                    ),
                     raw_data=item,
                 )
                 results.append(entry)

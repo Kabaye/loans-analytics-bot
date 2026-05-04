@@ -2,30 +2,31 @@ from __future__ import annotations
 
 from bot.domain.borrowers import BorrowEntry
 from bot.repositories.seen_entries import (
-    load_seen_entry_ids,
-    seed_seen_entry_ids,
-    sync_seen_entry_ids,
+    bootstrap_seen_entries,
+    is_seen_service_initialized,
+    load_seen_entry_keys,
+    sync_seen_entries,
 )
 
-_seen_ids: dict[str, set[str]] = {}
-_seen_ids_loaded: dict[str, bool] = {}
+_seen_keys: dict[str, set[tuple[str, str]]] = {}
+_seen_keys_loaded: dict[str, bool] = {}
 
 
 async def compute_fresh(entries: list[BorrowEntry], service: str) -> list[BorrowEntry]:
-    current_ids = {entry.id for entry in entries}
+    current_keys = {(str(entry.request_type or "borrow"), str(entry.id)) for entry in entries}
 
-    if not _seen_ids_loaded.get(service):
-        _seen_ids[service] = await load_seen_entry_ids(service)
-        _seen_ids_loaded[service] = True
-        if not _seen_ids[service]:
-            await seed_seen_entry_ids(service, current_ids)
-            _seen_ids[service] = current_ids
+    if not _seen_keys_loaded.get(service):
+        _seen_keys[service] = await load_seen_entry_keys(service)
+        _seen_keys_loaded[service] = True
+        if not await is_seen_service_initialized(service):
+            await bootstrap_seen_entries(service, entries)
+            _seen_keys[service] = current_keys
             return []
 
-    previous_ids = _seen_ids[service]
-    fresh = [entry for entry in entries if entry.id not in previous_ids]
-    await sync_seen_entry_ids(service, previous_ids, current_ids)
-    _seen_ids[service] = current_ids
+    previous_keys = _seen_keys[service]
+    fresh = [entry for entry in entries if (str(entry.request_type or "borrow"), str(entry.id)) not in previous_keys]
+    await sync_seen_entries(service, entries)
+    _seen_keys[service] = current_keys
     return fresh
 
 

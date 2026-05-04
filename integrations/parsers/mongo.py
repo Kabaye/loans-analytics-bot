@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
-from bot.domain.borrowers import BorrowEntry
+from bot.domain.borrowers import BorrowEntry, DocumentRefs, EntrySnapshot
 from bot.integrations.parsers.base import BaseParser
 
 log = logging.getLogger(__name__)
@@ -63,22 +63,24 @@ class MongoParser(BaseParser):
                         pass
 
                 entry = BorrowEntry(
-                    id=str(item.get("id", "")),
-                    service=self.SERVICE_NAME,
-                    amount=amount,
-                    period_days=term,
-                    interest_day=interest_day,
-                    interest_year=interest_year,
-                    penalty_interest=penalty,
-                    credit_score=credit_score,
-                    created_at=created_at,
-                    profit_gross=profit_gross,
-                    profit_net=profit_net,
-                    amount_return=amount_return,
-                    platform_fee_open=amount * 0.05,
-                    platform_fee_close=amount_return * 0.05,
-                    status=str(item.get("status", "")),
-                    loan_url=f"{LOAN_URL}/{item.get('id', '')}",
+                    snapshot=EntrySnapshot(
+                        id=str(item.get("id", "")),
+                        service=self.SERVICE_NAME,
+                        amount=amount,
+                        period_days=term,
+                        interest_day=interest_day,
+                        interest_year=interest_year,
+                        penalty_interest=penalty,
+                        credit_score=credit_score,
+                        created_at=created_at,
+                        profit_gross=profit_gross,
+                        profit_net=profit_net,
+                        amount_return=amount_return,
+                        platform_fee_open=amount * 0.05,
+                        platform_fee_close=amount_return * 0.05,
+                        status=str(item.get("status", "")),
+                    ),
+                    documents=DocumentRefs(loan_url=f"{LOAN_URL}/{item.get('id', '')}"),
                     raw_data=item,
                 )
                 results.append(entry)
@@ -130,22 +132,24 @@ class MongoParser(BaseParser):
                         pass
 
                 entry = BorrowEntry(
-                    id=str(item.get("id", "")),
-                    service=self.SERVICE_NAME,
-                    request_type="lend",
-                    amount=amount,
-                    period_days=term,
-                    interest_day=interest_day,
-                    interest_year=interest_year,
-                    penalty_interest=penalty,
-                    credit_score=credit_score,
-                    created_at=created_at,
-                    profit_gross=profit_gross,
-                    profit_net=profit_net,
-                    amount_return=amount_return,
-                    platform_fee_open=amount * 0.05,
-                    platform_fee_close=amount_return * 0.05,
-                    status=str(item.get("status", "")),
+                    snapshot=EntrySnapshot(
+                        id=str(item.get("id", "")),
+                        service=self.SERVICE_NAME,
+                        request_type="lend",
+                        amount=amount,
+                        period_days=term,
+                        interest_day=interest_day,
+                        interest_year=interest_year,
+                        penalty_interest=penalty,
+                        credit_score=credit_score,
+                        created_at=created_at,
+                        profit_gross=profit_gross,
+                        profit_net=profit_net,
+                        amount_return=amount_return,
+                        platform_fee_open=amount * 0.05,
+                        platform_fee_close=amount_return * 0.05,
+                        status=str(item.get("status", "")),
+                    ),
                     raw_data=item,
                 )
                 results.append(entry)

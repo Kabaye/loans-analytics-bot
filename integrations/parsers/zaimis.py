@@ -12,7 +12,13 @@ from enum import IntEnum
 
 import pdfplumber
 
-from bot.domain.borrowers import BorrowEntry
+from bot.domain.borrowers import (
+    BorrowEntry,
+    BorrowerEnrichmentSnapshot,
+    BorrowerIdentityHint,
+    DocumentRefs,
+    EntrySnapshot,
+)
 from bot.domain.subscriptions import Subscription
 from bot.integrations.parsers.base import BROWSER_UA, BaseParser
 
@@ -256,30 +262,36 @@ class ZaimisParser(BaseParser):
             offer_id = str(item.get("id", ""))
 
             return BorrowEntry(
-                id=offer_id,
-                service=self.SERVICE_NAME,
-                request_type=request_type,
-                amount=amount,
-                period_days=term,
-                interest_day=rate_day,
-                interest_year=rate_year,
-                penalty_interest=penalty,
-                credit_score=score,
-                created_at=self._parse_dt(item.get("createdAt")),
-                updated_at=self._parse_dt(item.get("updatedAt")),
-                profit_gross=profit_gross,
-                profit_net=profit_net,
-                amount_return=amount_return,
-                platform_fee_open=fee_open,
-                platform_fee_close=fee_close,
-                is_income_confirmed=item.get("isIncomeConfirmed"),
-                is_employed=item.get("isUserEmployed"),
-                loans_count=item.get("count"),
-                display_name=item.get("owner", {}).get("displayName") if isinstance(item.get("owner"), dict) else None,
-                borrower_user_id=item.get("owner", {}).get("id") if isinstance(item.get("owner"), dict) else None,
-                note=item.get("note"),
-                status=str(item.get("state", "")),
-                loan_url=LOAN_BASE_URL,
+                snapshot=EntrySnapshot(
+                    id=offer_id,
+                    service=self.SERVICE_NAME,
+                    request_type=request_type,
+                    amount=amount,
+                    period_days=term,
+                    interest_day=rate_day,
+                    interest_year=rate_year,
+                    penalty_interest=penalty,
+                    credit_score=score,
+                    created_at=self._parse_dt(item.get("createdAt")),
+                    updated_at=self._parse_dt(item.get("updatedAt")),
+                    profit_gross=profit_gross,
+                    profit_net=profit_net,
+                    amount_return=amount_return,
+                    platform_fee_open=fee_open,
+                    platform_fee_close=fee_close,
+                    note=item.get("note"),
+                    status=str(item.get("state", "")),
+                    loans_count=item.get("count"),
+                ),
+                borrower=BorrowerIdentityHint(
+                    display_name=item.get("owner", {}).get("displayName") if isinstance(item.get("owner"), dict) else None,
+                    borrower_user_id=item.get("owner", {}).get("id") if isinstance(item.get("owner"), dict) else None,
+                ),
+                enrichment=BorrowerEnrichmentSnapshot(
+                    is_income_confirmed=item.get("isIncomeConfirmed"),
+                    is_employed=item.get("isUserEmployed"),
+                ),
+                documents=DocumentRefs(loan_url=LOAN_BASE_URL),
                 raw_data=item,
             )
         except Exception as e:

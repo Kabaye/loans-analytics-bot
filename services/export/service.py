@@ -5,6 +5,7 @@ import logging
 from datetime import datetime, timezone
 
 from bot.domain.borrowers import BorrowEntry
+from bot.domain.borrower_views import export_entry_payload
 from bot.integrations.opi_client import OPIChecker
 from bot.services.base.providers import get_export_parsers as get_live_export_parsers
 from bot.services.borrowers.enrichment import enrich_entries_from_borrowers
@@ -100,7 +101,7 @@ async def collect_export_entries(services: list[str], chat_id: int) -> list[dict
         finally:
             await opi.close()
 
-    return [entry.to_dict() for entry in all_entries]
+    return [export_entry_payload(entry) for entry in all_entries]
 
 
 __all__ = ["collect_export_entries"]

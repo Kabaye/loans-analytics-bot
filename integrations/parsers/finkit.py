@@ -11,7 +11,13 @@ from datetime import datetime
 import aiohttp
 import pdfplumber
 
-from bot.domain.borrowers import BorrowEntry
+from bot.domain.borrowers import (
+    BorrowEntry,
+    BorrowerEnrichmentSnapshot,
+    BorrowerIdentityHint,
+    DocumentRefs,
+    EntrySnapshot,
+)
 from bot.integrations.parsers.base import BROWSER_UA, BaseParser
 from bot.utils.borrower_address import sanitize_borrower_address
 
@@ -413,36 +419,44 @@ class FinkitParser(BaseParser):
 
                     loan_id = str(item.get("loan_number", item.get("id", "")))
                     entry = BorrowEntry(
-                        id=loan_id,
-                        service=self.SERVICE_NAME,
-                        amount=amount,
-                        period_days=term,
-                        interest_day=interest_day,
-                        interest_year=interest_year,
-                        penalty_interest=1.5,  # fixed for finkit
-                        credit_score=score,
-                        created_at=created_at,
-                        profit_gross=profit_gross,
-                        profit_net=profit_net,
-                        amount_return=amount_return,
-                        platform_fee_open=platform_fee,
-                        platform_fee_close=0,
-                        contract_url=item.get("latest_contract_url"),
-                        status=item.get("status"),
-                        is_employed=_parse_work(item.get("borrower_work")),
-                        is_income_confirmed=item.get("borrower_income_confirmed"),
-                        scoring_assessed_at=scoring_assessed_at,
-                        debt_load_score=debt_load_score,
-                        has_active_loan=item.get("borrower_has_active_loan_now"),
-                        has_overdue=item.get("borrower_has_overdue_history_gt_1_day"),
-                        display_name=BORROWER_WORK_MAP.get(
-                            item.get("borrower_work", ""), item.get("borrower_work")
+                        snapshot=EntrySnapshot(
+                            id=loan_id,
+                            service=self.SERVICE_NAME,
+                            amount=amount,
+                            period_days=term,
+                            interest_day=interest_day,
+                            interest_year=interest_year,
+                            penalty_interest=1.5,  # fixed for finkit
+                            credit_score=score,
+                            created_at=created_at,
+                            profit_gross=profit_gross,
+                            profit_net=profit_net,
+                            amount_return=amount_return,
+                            platform_fee_open=platform_fee,
+                            platform_fee_close=0,
+                            status=item.get("status"),
+                            loans_count=None,
+                            loans_count_settled=item.get("borrower_repaid_on_time_loans_count"),
+                            loans_count_overdue=item.get("borrower_repaid_with_overdue_loans_count"),
                         ),
-                        borrower_user_id=item.get("user"),
-                        loans_count=None,
-                        loans_count_settled=item.get("borrower_repaid_on_time_loans_count"),
-                        loans_count_overdue=item.get("borrower_repaid_with_overdue_loans_count"),
-                        loan_url=f"{LOAN_URL}/{loan_id}",
+                        borrower=BorrowerIdentityHint(
+                            display_name=BORROWER_WORK_MAP.get(
+                                item.get("borrower_work", ""), item.get("borrower_work")
+                            ),
+                            borrower_user_id=item.get("user"),
+                        ),
+                        enrichment=BorrowerEnrichmentSnapshot(
+                            is_employed=_parse_work(item.get("borrower_work")),
+                            is_income_confirmed=item.get("borrower_income_confirmed"),
+                            scoring_assessed_at=scoring_assessed_at,
+                            debt_load_score=debt_load_score,
+                            has_active_loan=item.get("borrower_has_active_loan_now"),
+                            has_overdue=item.get("borrower_has_overdue_history_gt_1_day"),
+                        ),
+                        documents=DocumentRefs(
+                            contract_url=item.get("latest_contract_url"),
+                            loan_url=f"{LOAN_URL}/{loan_id}",
+                        ),
                         raw_data=item,
                     )
                     all_entries.append(entry)

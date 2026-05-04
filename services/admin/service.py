@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
+from bot.domain.borrower_views import AdminTestEntryView
 from bot.config import ADMIN_CHAT_ID
 from bot.repositories.borrowers import get_borrowers_stats
 from bot.repositories.credentials import get_first_credential_owner_chat_id
@@ -157,9 +158,8 @@ async def run_full_app_test(requester_chat_id: int) -> list[str]:
             entries = await asyncio.wait_for(parser.fetch_borrows(), timeout=30)
             results.append(f"🥬 <b>Kapusta</b>: {len(entries)} заявок")
         if entries:
-            entry = entries[0] if hasattr(entries[0], "amount") else type("E", (), entries[0])()
-            amount = entry.amount if hasattr(entry, "amount") else entry.get("amount", 0) if isinstance(entry, dict) else 0
-            results.append(f"  └ первая: {amount:.0f} BYN")
+            entry = AdminTestEntryView.from_entry(entries[0])
+            results.append(f"  └ первая: {entry.amount:.0f} BYN")
     except Exception as exc:
         results.append(f"🥬 <b>Kapusta</b>: ❌ {exc}")
 
@@ -171,15 +171,15 @@ async def run_full_app_test(requester_chat_id: int) -> list[str]:
             entries = await parser.fetch_borrows()
             results.append(f"🔵 <b>FinKit</b>: {len(entries)} заявок")
             if entries:
-                entry = entries[0]
+                entry = AdminTestEntryView.from_entry(entries[0])
                 results.append(
                     f"  └ #{entry.id}: {entry.amount:.0f} BYN, {entry.period_days}д, "
                     f"рейт {entry.credit_score:.0f}, {entry.interest_day:.2f}%/д"
                 )
-                to_enrich = [candidate for candidate in entries if candidate.contract_url][:1]
+                to_enrich = [candidate for candidate in entries if getattr(candidate, 'contract_url', None)][:1]
                 if to_enrich:
                     await parser.enrich_with_pdf(to_enrich)
-                    enriched = to_enrich[0]
+                    enriched = AdminTestEntryView.from_entry(to_enrich[0])
                     results.append(f"  └ PDF: ФИО={enriched.full_name or '—'}, ИН={enriched.document_id or '—'}")
                     if enriched.document_id:
                         opi = OPIChecker()
@@ -210,7 +210,7 @@ async def run_full_app_test(requester_chat_id: int) -> list[str]:
             entries = await parser.fetch_borrows()
             results.append(f"🟪 <b>ЗАЙМись</b>: {len(entries)} заявок")
             if entries:
-                entry = entries[0]
+                entry = AdminTestEntryView.from_entry(entries[0])
                 results.append(
                     f"  └ #{entry.id[:8]}…: {entry.amount:.0f} BYN, {entry.period_days}д, "
                     f"рейт {entry.credit_score:.0f}, {entry.interest_day:.2f}%/д"

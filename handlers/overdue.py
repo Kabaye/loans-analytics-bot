@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timedelta
 from pathlib import Path
 from html import escape
 from aiogram import Router, F
@@ -21,9 +22,12 @@ from bot.services.overdue.service import (
     clone_credential_creditor_profile,
     get_credential_by_id,
     get_credential_creditor_profile,
+    get_generated_document,
     get_credential_signature_asset,
     get_overdue_case,
+    list_overdue_case_actions,
     list_overdue_cases,
+    log_overdue_case_action,
     list_user_credentials,
     copy_credential_signature_asset,
     save_generated_document,
@@ -62,6 +66,7 @@ SIGNATURES_DIR = Path(config.BASE_DIR) / "data" / "signatures"
 BELPOST_INDEX_URL = "https://www.belpost.by/services/post-index.html"
 CASES_PER_PAGE = 10
 _PAGE_DELIMITER = "@"
+SMS_FOLLOWUP_DAYS = 3
 
 
 class OverdueStates(StatesGroup):
@@ -155,6 +160,7 @@ def _case_actions_kb(case_id: int, credential_id: int | None = None, page: int |
             InlineKeyboardButton(text="⚠️ Жесткое SMS", callback_data=_with_page(f"overdue_sms_hard_{case_id}", page)),
         ],
         [InlineKeyboardButton(text="📄 Сформировать претензию", callback_data=_with_page(f"overdue_claim_{case_id}", page))],
+        [InlineKeyboardButton(text="🕓 История действий", callback_data=_with_page(f"overdue_history_{case_id}", page))],
         [InlineKeyboardButton(text="🧾 Данные API", callback_data=_with_page(f"overdue_raw_{case_id}", page))],
         [InlineKeyboardButton(text="↩ К списку просрочек", callback_data=_case_list_callback(page))],
     ])
@@ -218,13 +224,221 @@ def _parse_raw(case: dict) -> dict:
         return {}
 
 
-def _sms_result_kb(case: dict, sms_text: str, page: int | None = None) -> InlineKeyboardMarkup:
-    del sms_text
-    return _case_actions_kb(case["id"], int(case["credential_id"]) if case.get("credential_id") else None, page)
+def _now_action_at() -> str:
+    return datetime.now().astimezone().replace(microsecond=0).isoformat()
 
 
-def _claim_result_kb(case: dict, latest_claim: dict | None, page: int | None = None) -> InlineKeyboardMarkup:
+def _followup_action_at(days: int) -> str:
+    return (datetime.now().astimezone() + timedelta(days=days)).replace(microsecond=0).isoformat()
+
+
+def _parse_action_datetime(value: object | None) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _format_action_datetime(value: object | None) -> str:
+    parsed = _parse_action_datetime(value)
+    if not parsed:
+        return _display(value)
+    return parsed.strftime("%d.%m.%Y %H:%M")
+
+
+def _action_sort_key(action: dict) -> datetime:
+    return _parse_action_datetime(action.get("effective_at") or action.get("created_at")) or datetime.min
+
+
+def _latest_action(actions: list[dict], *action_types: str) -> dict | None:
+    allowed = set(action_types)
+    for action in actions:
+        if action.get("action_type") in allowed:
+            return action
+    return None
+
+
+def _first_unsent_postal_address(case: dict, actions: list[dict]) -> int | None:
+    targets = list_case_borrower_addresses(case)
+    if not targets:
+        return None
+    sent_indexes = {
+        int(action["target_index"])
+        for action in actions
+        if action.get("action_type") == "claim_posted" and action.get("target_index") is not None
+    }
+    for index, _target in enumerate(targets, start=1):
+        if index not in sent_indexes:
+            return index
+    return None
+
+
+def _tracking_notes(case: dict, actions: list[dict]) -> list[str]:
+    notes: list[str] = []
+    last_sms_sent = _latest_action(actions, "sms_soft_sent", "sms_hard_sent")
+    last_sms_generated = _latest_action(actions, "sms_soft_generated", "sms_hard_generated")
+    if last_sms_sent:
+        label = "жесткое SMS" if last_sms_sent.get("action_type") == "sms_hard_sent" else "SMS"
+        notes.append(f"<b>Последнее SMS:</b> {label} — {_display_html(_format_action_datetime(last_sms_sent.get('effective_at') or last_sms_sent.get('created_at')))}")
+    elif last_sms_generated:
+        label = "жесткое SMS" if last_sms_generated.get("action_type") == "sms_hard_generated" else "SMS"
+        notes.append(f"<b>SMS подготовлено:</b> {label} — {_display_html(_format_action_datetime(last_sms_generated.get('effective_at') or last_sms_generated.get('created_at')))} (не отмечено отправленным)")
+
+    postal_targets = list_case_borrower_addresses(case)
+    for index, _target in enumerate(postal_targets, start=1):
+        sent = next(
+            (
+                action
+                for action in actions
+                if action.get("action_type") == "claim_posted" and int(action.get("target_index") or 0) == index
+            ),
+            None,
+        )
+        generated = next(
+            (
+                action
+                for action in actions
+                if action.get("action_type") == "claim_generated" and int(action.get("target_index") or 0) == index
+            ),
+            None,
+        )
+        label = "Письмо" if len(postal_targets) == 1 else f"Письмо {index}"
+        if sent:
+            notes.append(f"<b>{label}:</b> отправлено {_display_html(_format_action_datetime(sent.get('effective_at') or sent.get('created_at')))}")
+        elif generated:
+            notes.append(f"<b>{label}:</b> подготовлено {_display_html(_format_action_datetime(generated.get('effective_at') or generated.get('created_at')))}")
+
+    latest_finkit_sent = _latest_action(actions, "claim_finkit_sent")
+    if latest_finkit_sent:
+        notes.append(f"<b>FinKit-претензия:</b> отправлена {_display_html(_format_action_datetime(latest_finkit_sent.get('effective_at') or latest_finkit_sent.get('created_at')))}")
+    else:
+        payload = _parse_raw(case)
+        detail = payload.get("detail") or {}
+        claim_sent_at = detail.get("latest_claim_sent_at") or next(
+            (claim.get("sent_at") for claim in detail.get("claims") or [] if claim.get("sent_at")),
+            None,
+        )
+        if claim_sent_at:
+            notes.append(f"<b>FinKit-претензия:</b> уже отправлялась {_display_html(_format_action_datetime(claim_sent_at))}")
+
+    sent_actions = [
+        action
+        for action in actions
+        if action.get("action_type") in {"sms_soft_sent", "sms_hard_sent", "claim_posted", "claim_finkit_sent"}
+    ]
+    sent_actions.sort(key=_action_sort_key, reverse=True)
+    latest_sent = sent_actions[0] if sent_actions else None
+    pending_postal_index = _first_unsent_postal_address(case, actions)
+    pending_postal_generated = next(
+        (
+            action
+            for action in actions
+            if action.get("action_type") == "claim_generated"
+            and int(action.get("target_index") or 0) == int(pending_postal_index or 0)
+        ),
+        None,
+    )
+    next_step = None
+    if latest_sent:
+        followup_due = latest_sent.get("followup_due_at")
+        followup_dt = _parse_action_datetime(followup_due)
+        now_dt = datetime.now(followup_dt.tzinfo) if followup_dt and followup_dt.tzinfo else datetime.now()
+        if followup_dt and followup_dt > now_dt:
+            next_step = f"следующий контакт ориентировочно после {_format_action_datetime(followup_due)}"
+        elif pending_postal_index is not None:
+            next_label = "отправить письмо" if len(postal_targets) == 1 else f"отправить письмо на адрес {pending_postal_index}"
+            next_step = next_label
+        else:
+            next_step = "можно делать следующий контакт / повторное напоминание"
+    elif last_sms_generated:
+        next_step = "отправить подготовленное SMS и отметить отправку"
+    elif pending_postal_generated:
+        next_label = "отправить подготовленное письмо" if len(postal_targets) == 1 else f"отправить письмо на адрес {pending_postal_index}"
+        next_step = next_label
+    elif pending_postal_index is not None:
+        next_step = "отправить soft SMS"
+    else:
+        next_step = "отправить soft SMS"
+    if next_step:
+        notes.append(f"<b>Следующий шаг:</b> {_display_html(next_step)}")
+    return notes
+
+
+def _action_title(action: dict) -> str:
+    action_type = str(action.get("action_type") or "")
+    titles = {
+        "sms_soft_generated": "SMS подготовлено",
+        "sms_soft_sent": "SMS отмечено отправленным",
+        "sms_hard_generated": "Жесткое SMS подготовлено",
+        "sms_hard_sent": "Жесткое SMS отмечено отправленным",
+        "claim_generated": "Претензия подготовлена",
+        "claim_posted": "Письмо отмечено отправленным",
+        "claim_finkit_sent": "Претензия отправлена через FinKit",
+    }
+    return titles.get(action_type, action_type or "Действие")
+
+
+def _format_action_history(case: dict, actions: list[dict]) -> str:
+    lines = [
+        "🕓 <b>История действий</b>",
+        "",
+        f"<b>Займ / договор:</b> {_display_html(build_case_loan_ref(case))}",
+        f"<b>Заемщик:</b> {_display_html(case.get('full_name'))}",
+    ]
+    if not actions:
+        lines.extend(["", "История действий пока пустая."])
+        return "\n".join(lines)
+    lines.append("")
+    for action in actions:
+        timestamp = _format_action_datetime(action.get("effective_at") or action.get("created_at"))
+        title = _action_title(action)
+        suffix_parts: list[str] = []
+        if action.get("target_index"):
+            suffix_parts.append(f"адрес {action['target_index']}")
+        elif action.get("target_value"):
+            suffix_parts.append(str(action["target_value"]))
+        if action.get("followup_due_at"):
+            suffix_parts.append(f"след. ориентир {_format_action_datetime(action['followup_due_at'])}")
+        suffix = f" ({'; '.join(suffix_parts)})" if suffix_parts else ""
+        lines.append(f"• <b>{_display_html(timestamp)}</b> — {_display_html(title)}{_display_html(suffix)}")
+    return "\n".join(lines)
+
+
+def _sms_result_kb(case: dict, generated_document_id: int, variant: str, page: int | None = None) -> InlineKeyboardMarkup:
+    rows = [[
+        InlineKeyboardButton(
+            text="✅ Отметить SMS отправленной",
+            callback_data=_with_page(f"overdue_mark_sms_sent_{case['id']}_{generated_document_id}_{variant}", page),
+        )
+    ]]
+    rows.extend(_case_actions_kb(case["id"], int(case["credential_id"]) if case.get("credential_id") else None, page).inline_keyboard)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _claim_result_kb(
+    case: dict,
+    latest_claim: dict | None,
+    generated_document_id: int | None = None,
+    target_index: int | None = None,
+    page: int | None = None,
+) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
+    if generated_document_id is not None:
+        rows.append([
+            InlineKeyboardButton(
+                text="✅ Отметить письмо отправленным",
+                callback_data=_with_page(f"overdue_mark_postal_sent_{case['id']}_{generated_document_id}", page),
+            )
+        ])
     if (
         case.get("service") == "finkit"
         and latest_claim
@@ -240,6 +454,14 @@ def _claim_result_kb(case: dict, latest_claim: dict | None, page: int | None = N
         ])
     rows.extend(_case_actions_kb(case["id"], int(case["credential_id"]) if case.get("credential_id") else None, page).inline_keyboard)
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _history_kb(case_id: int, credential_id: int | None = None, page: int | None = None) -> InlineKeyboardMarkup:
+    del credential_id
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="↩ К кейсу", callback_data=_with_page(f"overdue_case_{case_id}", page))],
+        [InlineKeyboardButton(text="↩ К списку просрочек", callback_data=_case_list_callback(page))],
+    ])
 
 
 def _postal_lookup_note(case: dict) -> list[str]:
@@ -285,12 +507,6 @@ def _case_notes(case: dict) -> list[str]:
         partial_value = _money(paid_total) if paid_total > 0 else "да"
         notes.append(f"<b>Частичное погашение:</b> {_display_html(partial_value)}")
 
-    claim_sent_at = (
-        detail.get("latest_claim_sent_at")
-        or next((claim.get("sent_at") for claim in detail.get("claims") or [] if claim.get("sent_at")), None)
-    )
-    if claim_sent_at:
-        notes.append(f"<b>Претензия уже отправлялась:</b> {_display_html(claim_sent_at)}")
     contact_source = humanize_borrower_source(payload.get("contact_source"))
     if contact_source:
         notes.append(f"<b>Контакты подтянуты из:</b> {_display_html(contact_source)}")
@@ -407,7 +623,7 @@ async def _ensure_case_claim_addresses(case_id: int, chat_id: int, case: dict) -
     return await get_overdue_case(case_id, chat_id) or case
 
 
-def _format_case_text(case: dict) -> str:
+def _format_case_text(case: dict, actions: list[dict] | None = None) -> str:
     loan_ref = build_case_loan_ref(case)
     address_summary = build_case_address_summary(case)
     lines = [
@@ -433,6 +649,9 @@ def _format_case_text(case: dict) -> str:
         f"<b>Итого:</b> {_money(case.get('total_due'))}",
         f"<b>Срок добровольного погашения:</b> {CLAIM_VOLUNTARY_TERM_DAYS} дн.",
     ]
+    tracking_notes = _tracking_notes(case, actions or [])
+    if tracking_notes:
+        lines.extend(["", *tracking_notes])
     notes = _case_notes(case)
     if notes:
         lines.extend(["", *notes])
@@ -462,12 +681,36 @@ async def _show_case(callback: CallbackQuery, case_id: int, page: int | None = N
     if not case:
         await callback.answer("Кейс не найден", show_alert=True)
         return
+    actions = await list_overdue_case_actions(case_id, callback.message.chat.id, limit=30)
     await callback.message.edit_text(
-        _format_case_text(case),
+        _format_case_text(case, actions),
         reply_markup=_case_actions_kb(case_id, int(case["credential_id"]) if case.get("credential_id") else None, page),
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
+
+
+async def _show_case_history(callback: CallbackQuery, case_id: int, page: int | None = None) -> None:
+    case = await get_overdue_case(case_id, callback.message.chat.id)
+    if not case:
+        await callback.answer("Кейс не найден", show_alert=True)
+        return
+    actions = await list_overdue_case_actions(case_id, callback.message.chat.id, limit=30)
+    await callback.message.edit_text(
+        _format_action_history(case, actions),
+        reply_markup=_history_kb(case_id, int(case["credential_id"]) if case.get("credential_id") else None, page),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
+@router.callback_query(F.data.startswith("overdue_history_"))
+async def cb_overdue_history(callback: CallbackQuery):
+    if not await is_allowed(callback.message.chat.id):
+        return
+    callback_base, page = _parse_page_callback(callback.data or "")
+    case_id = int(callback_base.replace("overdue_history_", ""))
+    await _show_case_history(callback, case_id, page)
 
 
 async def _handle_claim_generation(callback: CallbackQuery, case_id: int, page: int | None = None) -> None:
@@ -529,13 +772,24 @@ async def _handle_claim_generation(callback: CallbackQuery, case_id: int, page: 
         payload["target_address"] = target or {}
         payload["address_index"] = idx
         payload["address_total"] = total_targets
-        await save_generated_document(
+        generated_document_id = await save_generated_document(
             case_id,
             callback.message.chat.id,
             doc_type="claim_docx",
             file_path=str(doc_path),
             text_content=claim_text,
             payload=payload,
+        )
+        await log_overdue_case_action(
+            case_id,
+            callback.message.chat.id,
+            action_type="claim_generated",
+            channel="postal",
+            target_value=str((target or {}).get("address") or "").strip() or None,
+            target_index=idx,
+            generated_document_id=generated_document_id,
+            effective_at=_now_action_at(),
+            meta={"address_total": total_targets, "doc_type": "claim_docx"},
         )
         caption = "📄 Претензия сформирована." if total_targets == 1 else f"📄 Претензия {idx}/{total_targets} сформирована."
         await callback.message.answer_document(
@@ -550,7 +804,7 @@ async def _handle_claim_generation(callback: CallbackQuery, case_id: int, page: 
                 address_total=total_targets,
             ),
             parse_mode="HTML",
-            reply_markup=_claim_result_kb(case, latest_claim, page) if idx == total_targets else None,
+            reply_markup=_claim_result_kb(case, latest_claim if idx == total_targets else None, generated_document_id, idx, page),
         )
     await _show_case(callback, case_id, page)
 
@@ -1149,12 +1403,22 @@ async def cb_overdue_sms(callback: CallbackQuery):
         )
         return
     sms_text = build_sms_text(case, {}, variant=variant)
-    await save_generated_document(
+    generated_document_id = await save_generated_document(
         case_id,
         callback.message.chat.id,
         doc_type="sms_hard" if variant == "hard" else "sms",
         text_content=sms_text,
         payload=serialize_case_payload(case, None),
+    )
+    await log_overdue_case_action(
+        case_id,
+        callback.message.chat.id,
+        action_type="sms_hard_generated" if variant == "hard" else "sms_soft_generated",
+        channel="sms",
+        target_value=str(case.get("borrower_phone") or "").strip() or None,
+        generated_document_id=generated_document_id,
+        effective_at=_now_action_at(),
+        meta={"variant": variant},
     )
     title = "⚠️ <b>Жесткое SMS</b>" if variant == "hard" else "✉️ <b>SMS</b>"
     message_text = f"{title}\n\n<pre>{escape(sms_text)}</pre>"
@@ -1162,9 +1426,39 @@ async def cb_overdue_sms(callback: CallbackQuery):
         message_text += f"\n\n<b>Номер:</b> <code>{escape(str(case['borrower_phone']))}</code>"
     await callback.message.edit_text(
         message_text,
-        reply_markup=_sms_result_kb(case, sms_text, page),
+        reply_markup=_sms_result_kb(case, generated_document_id, variant, page),
         parse_mode="HTML",
     )
+
+
+@router.callback_query(F.data.startswith("overdue_mark_sms_sent_"))
+async def cb_overdue_mark_sms_sent(callback: CallbackQuery):
+    if not await is_allowed(callback.message.chat.id):
+        return
+    callback_base, page = _parse_page_callback(callback.data or "")
+    payload = callback_base.replace("overdue_mark_sms_sent_", "")
+    case_id_raw, document_id_raw, variant = payload.split("_", 2)
+    case_id = int(case_id_raw)
+    generated_document_id = int(document_id_raw)
+    case = await get_overdue_case(case_id, callback.message.chat.id)
+    generated = await get_generated_document(generated_document_id, callback.message.chat.id)
+    if not case or not generated or int(generated.get("overdue_case_id") or 0) != case_id:
+        await callback.answer("Не удалось найти сохраненную SMS", show_alert=True)
+        return
+    await log_overdue_case_action(
+        case_id,
+        callback.message.chat.id,
+        action_type="sms_hard_sent" if variant == "hard" else "sms_soft_sent",
+        channel="sms",
+        target_value=str(case.get("borrower_phone") or "").strip() or None,
+        target_index=None,
+        generated_document_id=generated_document_id,
+        effective_at=_now_action_at(),
+        followup_due_at=_followup_action_at(SMS_FOLLOWUP_DAYS),
+        meta={"variant": variant},
+    )
+    await callback.answer("SMS отмечена отправленной")
+    await _show_case(callback, case_id, page)
 
 
 @router.callback_query(
@@ -1197,8 +1491,55 @@ async def cb_overdue_claim_send(callback: CallbackQuery):
     if not ok:
         await callback.answer("Не удалось отправить претензию через FinKit", show_alert=True)
         return
+    latest_claim = get_latest_finkit_claim(refreshed)
+    await log_overdue_case_action(
+        refreshed["id"],
+        callback.message.chat.id,
+        action_type="claim_finkit_sent",
+        channel="finkit",
+        generated_document_id=None,
+        effective_at=str((latest_claim or {}).get("sent_at") or _now_action_at()),
+        followup_due_at=_followup_action_at(CLAIM_VOLUNTARY_TERM_DAYS),
+        meta={"claim_id": claim_id},
+    )
     await callback.message.answer("✅ Претензия отправлена заемщику через FinKit.")
     await _show_case(callback, refreshed["id"], page)
+
+
+@router.callback_query(F.data.startswith("overdue_mark_postal_sent_"))
+async def cb_overdue_mark_postal_sent(callback: CallbackQuery):
+    if not await is_allowed(callback.message.chat.id):
+        return
+    callback_base, page = _parse_page_callback(callback.data or "")
+    payload = callback_base.replace("overdue_mark_postal_sent_", "")
+    case_id_raw, document_id_raw = payload.split("_", 1)
+    case_id = int(case_id_raw)
+    generated_document_id = int(document_id_raw)
+    case = await get_overdue_case(case_id, callback.message.chat.id)
+    generated = await get_generated_document(generated_document_id, callback.message.chat.id)
+    if not case or not generated or int(generated.get("overdue_case_id") or 0) != case_id:
+        await callback.answer("Не удалось найти сохраненную претензию", show_alert=True)
+        return
+    payload_json = generated.get("payload_json") or {}
+    target = payload_json.get("target_address") or {}
+    target_value = str((target or {}).get("address") or "").strip() or None
+    target_index = payload_json.get("address_index")
+    await log_overdue_case_action(
+        case_id,
+        callback.message.chat.id,
+        action_type="claim_posted",
+        channel="postal",
+        target_value=target_value,
+        target_index=int(target_index) if target_index is not None else None,
+        generated_document_id=generated_document_id,
+        effective_at=_now_action_at(),
+        followup_due_at=_followup_action_at(CLAIM_VOLUNTARY_TERM_DAYS),
+        meta={"address_total": payload_json.get("address_total")},
+    )
+    await callback.answer("Письмо отмечено отправленным")
+    await callback.message.edit_reply_markup(
+        reply_markup=_history_kb(case_id, int(case["credential_id"]) if case.get("credential_id") else None, page)
+    )
 
 
 @router.callback_query(F.data.startswith("overdue_claim_retry_"))

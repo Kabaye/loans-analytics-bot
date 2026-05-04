@@ -5,9 +5,12 @@ from bot.repositories.credentials import list_user_credentials
 from bot.repositories.overdue import copy_credential_creditor_profile as clone_credential_creditor_profile
 from bot.repositories.overdue import copy_credential_signature_asset as copy_credential_signature_asset
 from bot.repositories.overdue import get_credential_creditor_profile
+from bot.repositories.overdue import get_generated_document
 from bot.repositories.overdue import get_credential_signature_asset
 from bot.repositories.overdue import get_overdue_case
+from bot.repositories.overdue import list_overdue_case_actions
 from bot.repositories.overdue import list_overdue_cases
+from bot.repositories.overdue import log_overdue_case_action
 from bot.repositories.overdue import save_credential_signature_asset
 from bot.repositories.overdue import save_generated_document
 from bot.repositories.overdue import update_overdue_case_contacts
@@ -20,9 +23,12 @@ __all__ = [
     "copy_credential_signature_asset",
     "get_credential_by_id",
     "get_credential_creditor_profile",
+    "get_generated_document",
     "get_credential_signature_asset",
     "get_overdue_case",
+    "list_overdue_case_actions",
     "list_overdue_cases",
+    "log_overdue_case_action",
     "list_user_credentials",
     "save_credential_signature_asset",
     "save_generated_document",

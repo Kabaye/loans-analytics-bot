@@ -866,10 +866,10 @@ async def save_generated_document(
     text_content: str | None = None,
     payload: dict | None = None,
     missing_fields: list[str] | None = None,
-) -> None:
+) -> int:
     db = await get_db()
     try:
-        await db.execute(
+        cursor = await db.execute(
             """
             INSERT INTO generated_documents (
                 overdue_case_id, chat_id, doc_type, file_path, text_content, payload_json, missing_fields
@@ -886,6 +886,92 @@ async def save_generated_document(
             ),
         )
         await db.commit()
+        return int(cursor.lastrowid)
+    finally:
+        await db.close()
+
+
+async def get_generated_document(document_id: int, chat_id: int) -> dict | None:
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            """
+            SELECT *
+            FROM generated_documents
+            WHERE id = ? AND chat_id = ?
+            """,
+            (document_id, chat_id),
+        )
+        if not rows:
+            return None
+        payload = dict(rows[0])
+        payload["payload_json"] = _parse_raw_payload(payload.get("payload_json"))
+        payload["missing_fields"] = _parse_raw_payload(payload.get("missing_fields")) or []
+        return payload
+    finally:
+        await db.close()
+
+
+async def log_overdue_case_action(
+    overdue_case_id: int,
+    chat_id: int,
+    *,
+    action_type: str,
+    channel: str,
+    target_value: str | None = None,
+    target_index: int | None = None,
+    generated_document_id: int | None = None,
+    effective_at: str | None = None,
+    followup_due_at: str | None = None,
+    meta: dict | None = None,
+) -> int:
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            """
+            INSERT INTO overdue_case_actions (
+                overdue_case_id, chat_id, action_type, channel, target_value, target_index,
+                generated_document_id, effective_at, followup_due_at, meta_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                overdue_case_id,
+                chat_id,
+                action_type,
+                channel,
+                target_value,
+                target_index,
+                generated_document_id,
+                effective_at,
+                followup_due_at,
+                json.dumps(meta or {}, ensure_ascii=False),
+            ),
+        )
+        await db.commit()
+        return int(cursor.lastrowid)
+    finally:
+        await db.close()
+
+
+async def list_overdue_case_actions(overdue_case_id: int, chat_id: int, limit: int = 50) -> list[dict]:
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            """
+            SELECT *
+            FROM overdue_case_actions
+            WHERE overdue_case_id = ? AND chat_id = ?
+            ORDER BY COALESCE(effective_at, created_at) DESC, id DESC
+            LIMIT ?
+            """,
+            (overdue_case_id, chat_id, limit),
+        )
+        actions: list[dict] = []
+        for row in rows:
+            payload = dict(row)
+            payload["meta_json"] = _parse_raw_payload(payload.get("meta_json"))
+            actions.append(payload)
+        return actions
     finally:
         await db.close()
 
@@ -930,12 +1016,15 @@ __all__ = [
     "copy_credential_creditor_profile",
     "copy_credential_signature_asset",
     "deactivate_missing_overdue_cases",
+    "get_generated_document",
     "get_creditor_profile",
     "get_credential_creditor_profile",
     "get_credential_signature_asset",
     "lookup_latest_borrower_contacts",
     "get_overdue_case",
+    "list_overdue_case_actions",
     "list_overdue_cases",
+    "log_overdue_case_action",
     "save_credential_signature_asset",
     "save_generated_document",
     "update_overdue_case_contacts",

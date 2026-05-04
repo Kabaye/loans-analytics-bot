@@ -261,6 +261,30 @@ async def init_db() -> None:
             FOREIGN KEY (overdue_case_id) REFERENCES overdue_cases(id) ON DELETE CASCADE,
             FOREIGN KEY (chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS overdue_case_actions (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            overdue_case_id     INTEGER NOT NULL,
+            chat_id             INTEGER NOT NULL,
+            action_type         TEXT NOT NULL,
+            channel             TEXT NOT NULL,
+            target_value        TEXT,
+            target_index        INTEGER,
+            generated_document_id INTEGER,
+            effective_at        TEXT,
+            followup_due_at     TEXT,
+            meta_json           TEXT NOT NULL DEFAULT '{}',
+            created_at          TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (overdue_case_id) REFERENCES overdue_cases(id) ON DELETE CASCADE,
+            FOREIGN KEY (chat_id) REFERENCES users(chat_id) ON DELETE CASCADE,
+            FOREIGN KEY (generated_document_id) REFERENCES generated_documents(id) ON DELETE SET NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_overdue_case_actions_case_created
+            ON overdue_case_actions(overdue_case_id, created_at DESC, id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_overdue_case_actions_followup
+            ON overdue_case_actions(chat_id, followup_due_at);
         """)
 
         for service, enabled, interval, hour_start, hour_end in [

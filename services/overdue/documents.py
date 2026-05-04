@@ -57,6 +57,8 @@ ADDRESS_ABBREVIATIONS = (
     (r"^кв\.?\s+", "кв. "),
 )
 LOCALITY_PREFIXES = ("г.", "город ", "д.", "деревня ", "аг.", "агрогородок ", "пос.", "поселок ", "посёлок ")
+_POSTCODE_ONLY_RE = re.compile(r"^\d{6}$")
+_BARE_ADDRESS_NUMBER_RE = re.compile(r"^\d+[A-ZА-ЯЁ]?(?:[-/]\d+[A-ZА-ЯЁ]?)?$", re.IGNORECASE)
 
 
 def _money(value: float | int | None) -> str:
@@ -302,21 +304,39 @@ def _split_address(address: str | None) -> dict[str, str | None]:
         if str(part).strip()
     ]
     city: str | None = None
+    postcode: str | None = None
     street_parts: list[str] = []
     extra: list[str] = []
+    fallback: list[str] = []
     for part in parts:
         low = part.lower()
         if "беларус" in low:
+            continue
+        if _POSTCODE_ONLY_RE.fullmatch(part):
+            postcode = part
             continue
         if city is None and low.startswith(LOCALITY_PREFIXES):
             city = part
             continue
         if low.startswith(("ул.", "пер.", "пр-т", "д.", "кв.")):
             street_parts.append(part)
-        else:
+            continue
+        if street_parts and _BARE_ADDRESS_NUMBER_RE.fullmatch(part):
+            if not any(item.lower().startswith("д.") for item in street_parts):
+                street_parts.append(f"д. {part}")
+            elif not any(item.lower().startswith("кв.") for item in street_parts):
+                street_parts.append(f"кв. {part}")
+            else:
+                street_parts.append(part)
+            continue
+        if city is None:
+            if "область" in low or "район" in low:
+                continue
             extra.append(part)
-    street_line = ", ".join(street_parts) if street_parts else ", ".join(extra)
-    return {"city": city, "street_line": street_line or None}
+            continue
+        fallback.append(part)
+    street_line = ", ".join(street_parts) if street_parts else ", ".join(fallback or extra)
+    return {"city": city, "street_line": street_line or None, "postcode": postcode}
 
 
 def _postal_lookup_meta(case: dict, target: dict[str, str] | None = None) -> dict[str, str | None]:
@@ -343,17 +363,54 @@ def _postal_lookup_meta(case: dict, target: dict[str, str] | None = None) -> dic
 def _postal_address_lines(case: dict, target: dict[str, str]) -> list[str]:
     address_parts = _split_address(target.get("address"))
     lookup = _postal_lookup_meta(case, target)
-    lines = [case.get("full_name") or "Получатель не указан"]
-    if address_parts.get("street_line"):
-        lines.append(str(address_parts["street_line"]))
-    if address_parts.get("city") or lookup.get("locality"):
-        lines.append(str(address_parts.get("city") or lookup.get("locality")))
-    zip_region = ", ".join(part for part in [lookup.get("postcode"), lookup.get("region")] if part)
-    if zip_region:
-        lines.append(zip_region)
+    city = str(address_parts.get("city") or lookup.get("locality") or lookup.get("region") or "").strip() or None
+    street_line = str(address_parts.get("street_line") or "").strip() or None
+    postcode = str(
+        target.get("zip")
+        or address_parts.get("postcode")
+        or lookup.get("postcode")
+        or case.get("borrower_zip")
+        or ""
+    ).strip() or None
+    lines = [f"Кому   {case.get('full_name') or 'Получатель не указан'}"]
+    if city:
+        lines.append(f"Куда   {city}")
+    if street_line:
+        lines.append(f"{'       ' if city else 'Куда   '}{street_line}")
+    if not city and not street_line and str(target.get("address") or "").strip():
+        lines.append(f"Куда   {str(target.get('address')).strip()}")
+    if postcode:
+        lines.append(f"Индекс {_postcode_boxes(postcode)}")
     if case.get("borrower_phone"):
-        lines.append(f"Тел: {case['borrower_phone']}")
+        lines.append(f"Тел.   {case['borrower_phone']}")
     return lines
+
+
+def _postcode_boxes(value: str | None) -> str:
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())[:6]
+    if not digits:
+        return "[ ][ ][ ][ ][ ][ ]"
+    return "".join(f"[{digit}]" for digit in digits.ljust(6))
+
+
+def _compact_postal_address(case: dict, target: dict[str, str]) -> str:
+    address_parts = _split_address(target.get("address"))
+    lookup = _postal_lookup_meta(case, target)
+    city = str(address_parts.get("city") or lookup.get("locality") or lookup.get("region") or "").strip() or None
+    street_line = str(address_parts.get("street_line") or "").strip() or None
+    line = ", ".join(part for part in [city, street_line] if part)
+    if not line:
+        line = str(target.get("address") or "").strip() or "—"
+    postcode = str(
+        target.get("zip")
+        or address_parts.get("postcode")
+        or lookup.get("postcode")
+        or case.get("borrower_zip")
+        or ""
+    ).strip() or None
+    if postcode and postcode not in line:
+        return f"{line} ({postcode})"
+    return line
 
 
 def _debtor_header_lines(
@@ -365,12 +422,12 @@ def _debtor_header_lines(
 ) -> list[str]:
     lines = [case.get("full_name") or "—"]
     addresses = [target] if target else _case_borrower_addresses(case)
-    for idx, target in enumerate(addresses, start=1):
-        if target is not None and address_total and address_total > 1:
+    for idx, address_target in enumerate(addresses, start=1):
+        if address_target is not None and address_total and address_total > 1:
             prefix = f"Адрес {address_index or idx}"
         else:
             prefix = "Адрес" if len(addresses) == 1 else f"Адрес {idx}"
-        lines.append(f"{prefix}: {_format_address_with_zip(target)}")
+        lines.append(f"{prefix}: {_compact_postal_address(case, address_target)}")
     if case.get("borrower_phone"):
         lines.append(f"Тел: {case['borrower_phone']}")
     if case.get("borrower_email"):

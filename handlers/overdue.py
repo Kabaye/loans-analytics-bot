@@ -61,6 +61,7 @@ router = Router(name="overdue")
 SIGNATURES_DIR = Path(config.BASE_DIR) / "data" / "signatures"
 BELPOST_INDEX_URL = "https://www.belpost.by/services/post-index.html"
 CASES_PER_PAGE = 10
+_PAGE_DELIMITER = "@"
 
 
 class OverdueStates(StatesGroup):
@@ -102,6 +103,28 @@ def _paginate_cases(cases: list[dict], page: int) -> tuple[list[dict], int, int]
     return cases[start:end], current_page, total_pages
 
 
+def _with_page(callback_data: str, page: int | None) -> str:
+    if page is None or page < 0:
+        return callback_data
+    return f"{callback_data}{_PAGE_DELIMITER}{page}"
+
+
+def _parse_page_callback(callback_data: str) -> tuple[str, int | None]:
+    base, separator, page_raw = callback_data.rpartition(_PAGE_DELIMITER)
+    if not separator:
+        return callback_data, None
+    try:
+        return base, int(page_raw)
+    except (TypeError, ValueError):
+        return callback_data, None
+
+
+def _case_list_callback(page: int | None) -> str:
+    if page is None:
+        return "overdue_cases"
+    return f"overdue_cases_page_{max(page, 0)}"
+
+
 def _case_list_kb(cases: list[dict], page: int) -> InlineKeyboardMarkup:
     page_items, current_page, total_pages = _paginate_cases(cases, page)
     rows: list[list[InlineKeyboardButton]] = []
@@ -109,14 +132,14 @@ def _case_list_kb(cases: list[dict], page: int) -> InlineKeyboardMarkup:
         rows.append([
             InlineKeyboardButton(
                 text=_case_button_label(case),
-                callback_data=f"overdue_case_{case['id']}",
+                callback_data=_with_page(f"overdue_case_{case['id']}", current_page),
             )
         ])
     if total_pages > 1:
         nav: list[InlineKeyboardButton] = []
         if current_page > 0:
             nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"overdue_cases_page_{current_page - 1}"))
-        nav.append(InlineKeyboardButton(text=f"{current_page + 1}/{total_pages}", callback_data="overdue_cases"))
+        nav.append(InlineKeyboardButton(text=f"{current_page + 1}/{total_pages}", callback_data=_case_list_callback(current_page)))
         if current_page + 1 < total_pages:
             nav.append(InlineKeyboardButton(text="➡️", callback_data=f"overdue_cases_page_{current_page + 1}"))
         rows.append(nav)
@@ -124,16 +147,16 @@ def _case_list_kb(cases: list[dict], page: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _case_actions_kb(case_id: int, credential_id: int | None = None) -> InlineKeyboardMarkup:
+def _case_actions_kb(case_id: int, credential_id: int | None = None, page: int | None = None) -> InlineKeyboardMarkup:
     del credential_id
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="✉️ SMS", callback_data=f"overdue_sms_soft_{case_id}"),
-            InlineKeyboardButton(text="⚠️ Жесткое SMS", callback_data=f"overdue_sms_hard_{case_id}"),
+            InlineKeyboardButton(text="✉️ SMS", callback_data=_with_page(f"overdue_sms_soft_{case_id}", page)),
+            InlineKeyboardButton(text="⚠️ Жесткое SMS", callback_data=_with_page(f"overdue_sms_hard_{case_id}", page)),
         ],
-        [InlineKeyboardButton(text="📄 Сформировать претензию", callback_data=f"overdue_claim_{case_id}")],
-        [InlineKeyboardButton(text="🧾 Данные API", callback_data=f"overdue_raw_{case_id}")],
-        [InlineKeyboardButton(text="↩ К списку просрочек", callback_data="overdue_cases")],
+        [InlineKeyboardButton(text="📄 Сформировать претензию", callback_data=_with_page(f"overdue_claim_{case_id}", page))],
+        [InlineKeyboardButton(text="🧾 Данные API", callback_data=_with_page(f"overdue_raw_{case_id}", page))],
+        [InlineKeyboardButton(text="↩ К списку просрочек", callback_data=_case_list_callback(page))],
     ])
 
 
@@ -195,12 +218,12 @@ def _parse_raw(case: dict) -> dict:
         return {}
 
 
-def _sms_result_kb(case: dict, sms_text: str) -> InlineKeyboardMarkup:
+def _sms_result_kb(case: dict, sms_text: str, page: int | None = None) -> InlineKeyboardMarkup:
     del sms_text
-    return _case_actions_kb(case["id"], int(case["credential_id"]) if case.get("credential_id") else None)
+    return _case_actions_kb(case["id"], int(case["credential_id"]) if case.get("credential_id") else None, page)
 
 
-def _claim_result_kb(case: dict, latest_claim: dict | None) -> InlineKeyboardMarkup:
+def _claim_result_kb(case: dict, latest_claim: dict | None, page: int | None = None) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     if (
         case.get("service") == "finkit"
@@ -212,10 +235,10 @@ def _claim_result_kb(case: dict, latest_claim: dict | None) -> InlineKeyboardMar
         rows.append([
             InlineKeyboardButton(
                 text="📨 Отправить претензию через FinKit",
-                callback_data=f"overdue_claim_send_{case['id']}_{latest_claim['id']}",
+                callback_data=_with_page(f"overdue_claim_send_{case['id']}_{latest_claim['id']}", page),
             )
         ])
-    rows.extend(_case_actions_kb(case["id"], int(case["credential_id"]) if case.get("credential_id") else None).inline_keyboard)
+    rows.extend(_case_actions_kb(case["id"], int(case["credential_id"]) if case.get("credential_id") else None, page).inline_keyboard)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -419,35 +442,35 @@ def _format_case_text(case: dict) -> str:
     return "\n".join(lines)
 
 
-def _missing_claim_kb(case: dict, missing: list[str]) -> InlineKeyboardMarkup:
+def _missing_claim_kb(case: dict, missing: list[str], page: int | None = None) -> InlineKeyboardMarkup:
     missing_set = set(missing)
     rows: list[list[InlineKeyboardButton]] = []
     if "адрес заемщика" in missing_set:
-        rows.append([InlineKeyboardButton(text="🏠 Указать адрес заемщика", callback_data=f"overdue_fill_address_{case['id']}")])
+        rows.append([InlineKeyboardButton(text="🏠 Указать адрес заемщика", callback_data=_with_page(f"overdue_fill_address_{case['id']}", page))])
     if "ZIP-код заемщика" in missing_set:
-        rows.append([InlineKeyboardButton(text="📮 Указать / найти ZIP", callback_data=f"overdue_fill_zip_{case['id']}")])
+        rows.append([InlineKeyboardButton(text="📮 Указать / найти ZIP", callback_data=_with_page(f"overdue_fill_zip_{case['id']}", page))])
     if {"ФИО кредитора", "адрес кредитора", "подпись пользователя"} & missing_set and case.get("credential_id"):
         rows.append([InlineKeyboardButton(text="🏦 Настройки займодавца", callback_data=f"cred_creditor_{case['credential_id']}")])
     if "ИН заемщика" in missing_set and case.get("service") == "finkit":
-        rows.append([InlineKeyboardButton(text="🔄 Повторно подтянуть данные FinKit", callback_data=f"overdue_claim_retry_{case['id']}")])
-    rows.append([InlineKeyboardButton(text="↩ К кейсу", callback_data=f"overdue_case_{case['id']}")])
+        rows.append([InlineKeyboardButton(text="🔄 Повторно подтянуть данные FinKit", callback_data=_with_page(f"overdue_claim_retry_{case['id']}", page))])
+    rows.append([InlineKeyboardButton(text="↩ К кейсу", callback_data=_with_page(f"overdue_case_{case['id']}", page))])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def _show_case(callback: CallbackQuery, case_id: int) -> None:
+async def _show_case(callback: CallbackQuery, case_id: int, page: int | None = None) -> None:
     case = await get_overdue_case(case_id, callback.message.chat.id)
     if not case:
         await callback.answer("Кейс не найден", show_alert=True)
         return
     await callback.message.edit_text(
         _format_case_text(case),
-        reply_markup=_case_actions_kb(case_id, int(case["credential_id"]) if case.get("credential_id") else None),
+        reply_markup=_case_actions_kb(case_id, int(case["credential_id"]) if case.get("credential_id") else None, page),
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
 
 
-async def _handle_claim_generation(callback: CallbackQuery, case_id: int) -> None:
+async def _handle_claim_generation(callback: CallbackQuery, case_id: int, page: int | None = None) -> None:
     case = await get_overdue_case(case_id, callback.message.chat.id)
     if not case:
         await callback.answer("Кейс не найден", show_alert=True)
@@ -461,7 +484,7 @@ async def _handle_claim_generation(callback: CallbackQuery, case_id: int) -> Non
             await callback.message.edit_text(
                 "⚠️ <b>Нельзя сформировать претензию</b>\n\n"
                 f"{escape(str(reason))}",
-                reply_markup=_case_actions_kb(case_id, int(case["credential_id"]) if case.get("credential_id") else None),
+                reply_markup=_case_actions_kb(case_id, int(case["credential_id"]) if case.get("credential_id") else None, page),
                 parse_mode="HTML",
             )
             return
@@ -486,7 +509,7 @@ async def _handle_claim_generation(callback: CallbackQuery, case_id: int) -> Non
         await callback.message.edit_text(
             "⚠️ <b>Нельзя сформировать претензию</b>\n\n"
             + "\n".join(f"• {escape(item)}" for item in missing),
-            reply_markup=_missing_claim_kb(case, missing),
+            reply_markup=_missing_claim_kb(case, missing, page),
             parse_mode="HTML",
         )
         return
@@ -527,16 +550,17 @@ async def _handle_claim_generation(callback: CallbackQuery, case_id: int) -> Non
                 address_total=total_targets,
             ),
             parse_mode="HTML",
-            reply_markup=_claim_result_kb(case, latest_claim) if idx == total_targets else None,
+            reply_markup=_claim_result_kb(case, latest_claim, page) if idx == total_targets else None,
         )
-    await _show_case(callback, case_id)
+    await _show_case(callback, case_id, page)
 
 
 @router.callback_query(F.data.startswith("overdue_raw_"))
 async def cb_overdue_raw(callback: CallbackQuery):
     if not await is_allowed(callback.message.chat.id):
         return
-    case_id = int(callback.data.replace("overdue_raw_", ""))
+    callback_base, page = _parse_page_callback(callback.data or "")
+    case_id = int(callback_base.replace("overdue_raw_", ""))
     case = await get_overdue_case(case_id, callback.message.chat.id)
     if not case:
         await callback.answer("Кейс не найден", show_alert=True)
@@ -544,7 +568,7 @@ async def cb_overdue_raw(callback: CallbackQuery):
     pretty = format_raw_payload_preview(case.get("raw_data"), limit=3500)
     await callback.message.edit_text(
         f"🧾 <b>Данные API</b>\n\n<pre>{escape(pretty)}</pre>",
-        reply_markup=_case_actions_kb(case_id, int(case["credential_id"]) if case.get("credential_id") else None),
+        reply_markup=_case_actions_kb(case_id, int(case["credential_id"]) if case.get("credential_id") else None, page),
         parse_mode="HTML",
     )
 
@@ -599,8 +623,9 @@ async def cb_overdue_cases_page(callback: CallbackQuery):
 async def cb_overdue_case(callback: CallbackQuery):
     if not await is_allowed(callback.message.chat.id):
         return
-    case_id = int(callback.data.replace("overdue_case_", ""))
-    await _show_case(callback, case_id)
+    callback_base, page = _parse_page_callback(callback.data or "")
+    case_id = int(callback_base.replace("overdue_case_", ""))
+    await _show_case(callback, case_id, page)
 
 
 @router.callback_query(F.data == "overdue_profile")
@@ -922,19 +947,20 @@ async def msg_overdue_signature_invalid(message: Message):
 async def cb_overdue_fill_address(callback: CallbackQuery, state: FSMContext):
     if not await is_allowed(callback.message.chat.id):
         return
-    case_id = int(callback.data.replace("overdue_fill_address_", ""))
+    callback_base, page = _parse_page_callback(callback.data or "")
+    case_id = int(callback_base.replace("overdue_fill_address_", ""))
     case = await get_overdue_case(case_id, callback.message.chat.id)
     if not case:
         await callback.answer("Кейс не найден", show_alert=True)
         return
     await state.set_state(OverdueStates.waiting_case_field)
-    await state.update_data(case_id=case_id, field_name="borrower_address")
+    await state.update_data(case_id=case_id, field_name="borrower_address", case_page=page)
     await callback.message.edit_text(
         "🏠 <b>Адрес заемщика</b>\n\n"
         f"<b>Текущее значение:</b> {_display_html(case.get('borrower_address'))}\n\n"
         "Отправьте только адрес заемщика. После этого я попробую сразу найти ZIP.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="↩ К кейсу", callback_data=f"overdue_case_{case_id}")],
+            [InlineKeyboardButton(text="↩ К кейсу", callback_data=_with_page(f"overdue_case_{case_id}", page))],
         ]),
         parse_mode="HTML",
     )
@@ -944,7 +970,8 @@ async def cb_overdue_fill_address(callback: CallbackQuery, state: FSMContext):
 async def cb_overdue_fill_zip(callback: CallbackQuery, state: FSMContext):
     if not await is_allowed(callback.message.chat.id):
         return
-    case_id = int(callback.data.replace("overdue_fill_zip_", ""))
+    callback_base, page = _parse_page_callback(callback.data or "")
+    case_id = int(callback_base.replace("overdue_fill_zip_", ""))
     case = await get_overdue_case(case_id, callback.message.chat.id)
     if not case:
         await callback.answer("Кейс не найден", show_alert=True)
@@ -953,21 +980,21 @@ async def cb_overdue_fill_zip(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text(
             "⚠️ <b>Сначала нужен адрес заемщика</b>\n\nБез адреса я не смогу нормально найти ZIP.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🏠 Указать адрес", callback_data=f"overdue_fill_address_{case_id}")],
-                [InlineKeyboardButton(text="↩ К кейсу", callback_data=f"overdue_case_{case_id}")],
+                [InlineKeyboardButton(text="🏠 Указать адрес", callback_data=_with_page(f"overdue_fill_address_{case_id}", page))],
+                [InlineKeyboardButton(text="↩ К кейсу", callback_data=_with_page(f"overdue_case_{case_id}", page))],
             ]),
             parse_mode="HTML",
         )
         return
     await state.set_state(OverdueStates.waiting_case_field)
-    await state.update_data(case_id=case_id, field_name="borrower_zip")
+    await state.update_data(case_id=case_id, field_name="borrower_zip", case_page=page)
     await callback.message.edit_text(
         "📮 <b>ZIP-код заемщика</b>\n\n"
         f"<b>Адрес:</b> {_display_html(case.get('borrower_address'))}\n"
         f"<b>Текущее значение:</b> {_display_html(case.get('borrower_zip'))}\n\n"
         "Отправьте ZIP вручную или <code>-</code>, чтобы я попробовал найти его автоматически.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="↩ К кейсу", callback_data=f"overdue_case_{case_id}")],
+            [InlineKeyboardButton(text="↩ К кейсу", callback_data=_with_page(f"overdue_case_{case_id}", page))],
         ]),
         parse_mode="HTML",
     )
@@ -1098,7 +1125,8 @@ async def msg_overdue_contacts(message: Message, state: FSMContext):
 async def cb_overdue_sms(callback: CallbackQuery):
     if not await is_allowed(callback.message.chat.id):
         return
-    payload = callback.data.replace("overdue_sms_", "")
+    callback_base, page = _parse_page_callback(callback.data or "")
+    payload = callback_base.replace("overdue_sms_", "")
     variant = "soft"
     if payload.startswith("soft_"):
         case_id = int(payload.replace("soft_", "", 1))
@@ -1116,7 +1144,7 @@ async def cb_overdue_sms(callback: CallbackQuery):
         await callback.message.edit_text(
             "⚠️ <b>Нельзя сформировать SMS</b>\n\n"
             + "\n".join(f"• {escape(item)}" for item in missing),
-            reply_markup=_case_actions_kb(case_id, int(case["credential_id"]) if case.get("credential_id") else None),
+            reply_markup=_case_actions_kb(case_id, int(case["credential_id"]) if case.get("credential_id") else None, page),
             parse_mode="HTML",
         )
         return
@@ -1134,7 +1162,7 @@ async def cb_overdue_sms(callback: CallbackQuery):
         message_text += f"\n\n<b>Номер:</b> <code>{escape(str(case['borrower_phone']))}</code>"
     await callback.message.edit_text(
         message_text,
-        reply_markup=_sms_result_kb(case, sms_text),
+        reply_markup=_sms_result_kb(case, sms_text, page),
         parse_mode="HTML",
     )
 
@@ -1148,15 +1176,17 @@ async def cb_overdue_sms(callback: CallbackQuery):
 async def cb_overdue_claim(callback: CallbackQuery):
     if not await is_allowed(callback.message.chat.id):
         return
-    case_id = int(callback.data.replace("overdue_claim_", ""))
-    await _handle_claim_generation(callback, case_id)
+    callback_base, page = _parse_page_callback(callback.data or "")
+    case_id = int(callback_base.replace("overdue_claim_", ""))
+    await _handle_claim_generation(callback, case_id, page)
 
 
 @router.callback_query(F.data.startswith("overdue_claim_send_"))
 async def cb_overdue_claim_send(callback: CallbackQuery):
     if not await is_allowed(callback.message.chat.id):
         return
-    payload = callback.data.replace("overdue_claim_send_", "")
+    callback_base, page = _parse_page_callback(callback.data or "")
+    payload = callback_base.replace("overdue_claim_send_", "")
     case_id_raw, claim_id = payload.split("_", 1)
     case_id = int(case_id_raw)
     case = await get_overdue_case(case_id, callback.message.chat.id)
@@ -1168,18 +1198,19 @@ async def cb_overdue_claim_send(callback: CallbackQuery):
         await callback.answer("Не удалось отправить претензию через FinKit", show_alert=True)
         return
     await callback.message.answer("✅ Претензия отправлена заемщику через FinKit.")
-    await _show_case(callback, refreshed["id"])
+    await _show_case(callback, refreshed["id"], page)
 
 
 @router.callback_query(F.data.startswith("overdue_claim_retry_"))
 async def cb_overdue_claim_retry(callback: CallbackQuery):
     if not await is_allowed(callback.message.chat.id):
         return
-    case_id = int(callback.data.replace("overdue_claim_retry_", ""))
+    callback_base, page = _parse_page_callback(callback.data or "")
+    case_id = int(callback_base.replace("overdue_claim_retry_", ""))
     case = await get_overdue_case(case_id, callback.message.chat.id)
     if not case:
         await callback.answer("Кейс не найден", show_alert=True)
         return
     await _enrich_finkit_case_from_claims(case)
     await callback.answer("Данные обновлены, проверяю снова…")
-    await _handle_claim_generation(callback, case_id)
+    await _handle_claim_generation(callback, case_id, page)

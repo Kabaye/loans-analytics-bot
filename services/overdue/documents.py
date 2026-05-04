@@ -234,6 +234,10 @@ def _case_borrower_addresses(case: dict) -> list[dict[str, str]]:
     )
 
 
+def list_case_borrower_addresses(case: dict) -> list[dict[str, str]]:
+    return [dict(item) for item in _case_borrower_addresses(case)]
+
+
 def _format_address_with_zip(address_entry: dict[str, str]) -> str:
     address = str(address_entry.get("address") or "").strip()
     zip_code = str(address_entry.get("zip") or "").strip()
@@ -352,11 +356,20 @@ def _postal_address_lines(case: dict, target: dict[str, str]) -> list[str]:
     return lines
 
 
-def _debtor_header_lines(case: dict) -> list[str]:
+def _debtor_header_lines(
+    case: dict,
+    target: dict[str, str] | None = None,
+    *,
+    address_index: int | None = None,
+    address_total: int | None = None,
+) -> list[str]:
     lines = [case.get("full_name") or "—"]
-    addresses = _case_borrower_addresses(case)
+    addresses = [target] if target else _case_borrower_addresses(case)
     for idx, target in enumerate(addresses, start=1):
-        prefix = "Адрес" if len(addresses) == 1 else f"Адрес {idx}"
+        if target is not None and address_total and address_total > 1:
+            prefix = f"Адрес {address_index or idx}"
+        else:
+            prefix = "Адрес" if len(addresses) == 1 else f"Адрес {idx}"
         lines.append(f"{prefix}: {_format_address_with_zip(target)}")
     if case.get("borrower_phone"):
         lines.append(f"Тел: {case['borrower_phone']}")
@@ -399,7 +412,7 @@ def collect_claim_missing_fields(case: dict, creditor: dict | None, signature: d
         missing.append("ИН заемщика")
     if not borrower_addresses:
         missing.append("адрес заемщика")
-    if not any(str(item.get("zip") or "").strip() for item in borrower_addresses):
+    elif any(not str(item.get("zip") or "").strip() for item in borrower_addresses):
         missing.append("ZIP-код заемщика")
     if not case.get("issued_at"):
         missing.append("дата договора / займа")
@@ -436,14 +449,25 @@ def build_sms_text(case: dict, creditor: dict, variant: str = "soft") -> str:
     return _fit_sms(prefix)
 
 
-def build_postal_address_text(case: dict) -> str:
-    targets = _case_borrower_addresses(case)
+def build_postal_address_text(
+    case: dict,
+    target: dict[str, str] | None = None,
+    *,
+    address_index: int | None = None,
+    address_total: int | None = None,
+) -> str:
+    targets = [target] if target else _case_borrower_addresses(case)
     if not targets:
         targets = [{"address": str(case.get("borrower_address") or "").strip(), "zip": str(case.get("borrower_zip") or "").strip()}]
-    header = "📮 <b>Адрес для отправки через Белпочту</b>" if len(targets) == 1 else "📮 <b>Адреса для отправки через Белпочту</b>"
+    if target is not None:
+        header = "📮 <b>Адрес для отправки через Белпочту</b>"
+        if address_total and address_total > 1:
+            header = f"📮 <b>Адрес для отправки через Белпочту ({address_index or 1}/{address_total})</b>"
+    else:
+        header = "📮 <b>Адрес для отправки через Белпочту</b>" if len(targets) == 1 else "📮 <b>Адреса для отправки через Белпочту</b>"
     blocks = []
     for idx, target in enumerate(targets, start=1):
-        prefix = [] if len(targets) == 1 else [f"[Адрес {idx}]"]
+        prefix = [] if target is not None or len(targets) == 1 else [f"[Адрес {idx}]"]
         blocks.append("\n".join(prefix + _postal_address_lines(case, target)))
     return header + "\n\n<pre>" + "\n\n".join(blocks) + "</pre>"
 
@@ -605,6 +629,34 @@ def _claim_titles(case: dict) -> tuple[str, str]:
     return "ПРЕТЕНЗИЯ", "о добровольном урегулировании задолженности"
 
 
+def _safe_filename_token(value: object | None, fallback: str) -> str:
+    text = re.sub(r"[^0-9A-Za-z_-]+", "-", str(value or "").strip()).strip("-_")
+    return text or fallback
+
+
+def _claim_service_slug(case: dict) -> str:
+    return _safe_filename_token(str(case.get("service") or "").lower(), "loan")
+
+
+def _claim_filename(
+    case: dict,
+    timestamp: str,
+    *,
+    address_index: int | None = None,
+    address_total: int | None = None,
+) -> str:
+    parts = [
+        "claim",
+        _claim_service_slug(case),
+        _safe_filename_token(_loan_ref(case), "loan"),
+        f"case{_safe_filename_token(case.get('id'), '0')}",
+    ]
+    if address_total and address_total > 1:
+        parts.append(f"addr{address_index or 1}")
+    parts.append(timestamp)
+    return "_".join(parts) + ".docx"
+
+
 def _set_default_style(doc: Document) -> None:
     style = doc.styles["Normal"]
     style.font.name = "Times New Roman"
@@ -713,18 +765,36 @@ def _cleanup_generated_docs() -> None:
                 pass
 
 
-def render_claim_docx(case: dict, creditor: dict, signature_path: str) -> tuple[Path, str]:
+def render_claim_docx(
+    case: dict,
+    creditor: dict,
+    signature_path: str,
+    *,
+    target_address: dict[str, str] | None = None,
+    address_index: int | None = None,
+    address_total: int | None = None,
+) -> tuple[Path, str]:
     _cleanup_generated_docs()
     GENERATED_DOCS_DIR.mkdir(parents=True, exist_ok=True)
     case_dir = GENERATED_DOCS_DIR / f"chat_{case['chat_id']}" / f"case_{case['id']}"
     case_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = case_dir / f"claim_{case['service']}_{case['id']}_{timestamp}.docx"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    out_path = case_dir / _claim_filename(
+        case,
+        timestamp,
+        address_index=address_index,
+        address_total=address_total,
+    )
 
     doc = Document()
     _set_default_style(doc)
 
-    debtor_lines = _debtor_header_lines(case)
+    debtor_lines = _debtor_header_lines(
+        case,
+        target_address,
+        address_index=address_index,
+        address_total=address_total,
+    )
     creditor_lines = _build_contacts_block(
         creditor.get("full_name"),
         creditor.get("address"),

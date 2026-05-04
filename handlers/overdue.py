@@ -50,6 +50,7 @@ from bot.services.overdue.documents import (
     build_sms_text,
     collect_claim_missing_fields,
     collect_sms_missing_fields,
+    list_case_borrower_addresses,
     render_claim_docx,
     serialize_case_payload,
 )
@@ -351,6 +352,38 @@ async def _enrich_finkit_case_from_claims(case: dict) -> dict:
     return await enrich_finkit_case_from_claims(case)
 
 
+async def _ensure_case_claim_addresses(case_id: int, chat_id: int, case: dict) -> dict:
+    addresses = list_case_borrower_addresses(case)
+    if not addresses:
+        return case
+    updated = False
+    merged_addresses: list[dict[str, str]] = []
+    primary_lookup: dict | None = None
+    for idx, item in enumerate(addresses):
+        current = dict(item)
+        if not str(current.get("zip") or "").strip() and str(current.get("address") or "").strip():
+            lookup = await resolve_belarus_zip_details(current["address"])
+            postcode = str((lookup or {}).get("postcode") or "").strip()
+            if postcode:
+                current["zip"] = postcode
+                updated = True
+                if idx == 0:
+                    primary_lookup = lookup
+        merged_addresses.append(current)
+    if not updated:
+        return case
+    primary = merged_addresses[0] if merged_addresses else {}
+    await update_overdue_case_contacts(
+        case_id,
+        chat_id,
+        borrower_address=primary.get("address"),
+        borrower_addresses=merged_addresses,
+        borrower_zip=primary.get("zip"),
+        postal_lookup=primary_lookup,
+    )
+    return await get_overdue_case(case_id, chat_id) or case
+
+
 def _format_case_text(case: dict) -> str:
     loan_ref = build_case_loan_ref(case)
     address_summary = build_case_address_summary(case)
@@ -434,19 +467,7 @@ async def _handle_claim_generation(callback: CallbackQuery, case_id: int) -> Non
             return
     else:
         case = await _enrich_finkit_case_from_claims(case)
-    if case.get("borrower_address"):
-        payload = _parse_raw(case)
-        postal_lookup = payload.get("postal_lookup") or {}
-        if not postal_lookup.get("postcode"):
-            lookup = await resolve_belarus_zip_details(case.get("borrower_address"))
-            if lookup and lookup.get("postcode"):
-                await update_overdue_case_contacts(
-                    case_id,
-                    callback.message.chat.id,
-                    borrower_zip=str(lookup.get("postcode")),
-                    postal_lookup=lookup,
-                )
-                case = await get_overdue_case(case_id, callback.message.chat.id) or case
+    case = await _ensure_case_claim_addresses(case_id, callback.message.chat.id, case)
     creditor = await _get_case_creditor_profile(case)
     signature = (
         await get_credential_signature_asset(callback.message.chat.id, int(case["credential_id"]))
@@ -470,24 +491,44 @@ async def _handle_claim_generation(callback: CallbackQuery, case_id: int) -> Non
         )
         return
 
-    doc_path, claim_text = render_claim_docx(case, creditor or {}, signature["file_path"])
-    await save_generated_document(
-        case_id,
-        callback.message.chat.id,
-        doc_type="claim_docx",
-        file_path=str(doc_path),
-        text_content=claim_text,
-        payload=serialize_case_payload(case, creditor),
-    )
-    await callback.message.answer_document(
-        FSInputFile(str(doc_path), filename=doc_path.name),
-        caption="📄 Претензия сформирована.",
-    )
-    await callback.message.answer(
-        build_postal_address_text(case),
-        parse_mode="HTML",
-        reply_markup=_claim_result_kb(case, latest_claim),
-    )
+    claim_targets = list_case_borrower_addresses(case)
+    total_targets = len(claim_targets) or 1
+    for idx, target in enumerate(claim_targets or [{}], start=1):
+        doc_path, claim_text = render_claim_docx(
+            case,
+            creditor or {},
+            signature["file_path"],
+            target_address=target or None,
+            address_index=idx,
+            address_total=total_targets,
+        )
+        payload = serialize_case_payload(case, creditor)
+        payload["target_address"] = target or {}
+        payload["address_index"] = idx
+        payload["address_total"] = total_targets
+        await save_generated_document(
+            case_id,
+            callback.message.chat.id,
+            doc_type="claim_docx",
+            file_path=str(doc_path),
+            text_content=claim_text,
+            payload=payload,
+        )
+        caption = "📄 Претензия сформирована." if total_targets == 1 else f"📄 Претензия {idx}/{total_targets} сформирована."
+        await callback.message.answer_document(
+            FSInputFile(str(doc_path), filename=doc_path.name),
+            caption=caption,
+        )
+        await callback.message.answer(
+            build_postal_address_text(
+                case,
+                target or None,
+                address_index=idx,
+                address_total=total_targets,
+            ),
+            parse_mode="HTML",
+            reply_markup=_claim_result_kb(case, latest_claim) if idx == total_targets else None,
+        )
     await _show_case(callback, case_id)
 
 

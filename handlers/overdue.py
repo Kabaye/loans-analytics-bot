@@ -89,7 +89,7 @@ def _profile_status_icon(profile: dict | None) -> str:
 def _signature_status_icon(signature: dict | None) -> str:
     if not signature or not signature.get("file_path"):
         return "⚠️"
-    return "♻️" if signature.get("source") == "legacy" else "✅"
+    return "✅"
 
 
 def _paginate_cases(cases: list[dict], page: int) -> tuple[list[dict], int, int]:
@@ -312,8 +312,6 @@ async def _show_credential_profile_message(callback: CallbackQuery, credential_i
         "",
         f"<b>Подпись:</b> {'загружена' if signature and signature.get('file_path') else 'не загружена'}",
     ])
-    if signature and signature.get("source") == "legacy":
-        lines.append("<i>Сейчас используется старая общая подпись. Можно закрепить отдельную для этого логина.</i>")
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Заполнить / обновить", callback_data=f"overdue_profile_edit_{credential_id}")],
         [InlineKeyboardButton(text="♻️ Скопировать с другого логина", callback_data=f"overdue_profile_copy_{credential_id}")],
@@ -792,8 +790,13 @@ async def cb_overdue_signature_copy(callback: CallbackQuery):
             )
         ])
     buttons.append([InlineKeyboardButton(text="↩ К подписи", callback_data=f"overdue_signature_cred_{target_credential_id}")])
+    text = (
+        "♻️ <b>Скопировать подпись</b>\n\nВыберите логин-источник."
+        if len(buttons) > 1
+        else "♻️ <b>Скопировать подпись</b>\n\nНет других логинов с загруженной подписью."
+    )
     await callback.message.edit_text(
-        "♻️ <b>Скопировать подпись</b>\n\nВыберите логин-источник.",
+        text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode="HTML",
     )

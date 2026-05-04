@@ -712,18 +712,6 @@ async def upsert_creditor_profile(
         await db.close()
 
 
-async def get_user_signature_asset(chat_id: int) -> dict | None:
-    db = await get_db()
-    try:
-        rows = await db.execute_fetchall(
-            "SELECT * FROM user_signature_assets WHERE chat_id = ?",
-            (chat_id,),
-        )
-        return dict(rows[0]) if rows else None
-    finally:
-        await db.close()
-
-
 async def get_credential_signature_asset(chat_id: int, credential_id: int) -> dict | None:
     db = await get_db()
     try:
@@ -740,46 +728,7 @@ async def get_credential_signature_asset(chat_id: int, credential_id: int) -> di
             data = dict(rows[0])
             data["source"] = "credential"
             return data
-
-        legacy_rows = await db.execute_fetchall(
-            "SELECT * FROM user_signature_assets WHERE chat_id = ?",
-            (chat_id,),
-        )
-        if not legacy_rows:
-            return None
-        data = dict(legacy_rows[0])
-        data["credential_id"] = credential_id
-        data["source"] = "legacy"
-        return data
-    finally:
-        await db.close()
-
-
-async def save_user_signature_asset(
-    chat_id: int,
-    *,
-    file_path: str,
-    mime_type: str | None = None,
-    telegram_file_id: str | None = None,
-    telegram_unique_id: str | None = None,
-) -> None:
-    db = await get_db()
-    try:
-        await db.execute(
-            """
-            INSERT INTO user_signature_assets (
-                chat_id, file_path, mime_type, telegram_file_id, telegram_unique_id, updated_at
-            ) VALUES (?, ?, ?, ?, ?, datetime('now'))
-            ON CONFLICT(chat_id) DO UPDATE SET
-                file_path = excluded.file_path,
-                mime_type = excluded.mime_type,
-                telegram_file_id = excluded.telegram_file_id,
-                telegram_unique_id = excluded.telegram_unique_id,
-                updated_at = datetime('now')
-            """,
-            (chat_id, file_path, mime_type, telegram_file_id, telegram_unique_id),
-        )
-        await db.commit()
+        return None
     finally:
         await db.close()
 
@@ -829,20 +778,9 @@ async def copy_credential_signature_asset(
             """,
             (chat_id, source_credential_id),
         )
-        if rows:
-            source = rows[0]
-        else:
-            legacy_rows = await db.execute_fetchall(
-                """
-                SELECT file_path, mime_type, telegram_file_id, telegram_unique_id
-                FROM user_signature_assets
-                WHERE chat_id = ?
-                """,
-                (chat_id,),
-            )
-            if not legacy_rows:
-                return False
-            source = legacy_rows[0]
+        if not rows:
+            return False
+        source = rows[0]
 
         await db.execute(
             """
@@ -949,11 +887,9 @@ __all__ = [
     "get_credential_signature_asset",
     "lookup_latest_borrower_contacts",
     "get_overdue_case",
-    "get_user_signature_asset",
     "list_overdue_cases",
     "save_credential_signature_asset",
     "save_generated_document",
-    "save_user_signature_asset",
     "update_overdue_case_contacts",
     "upsert_creditor_profile",
     "upsert_credential_creditor_profile",

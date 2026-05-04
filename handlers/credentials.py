@@ -77,7 +77,7 @@ def _profile_status_icon(profile: dict | None) -> str:
 def _signature_status_icon(signature: dict | None) -> str:
     if not signature or not signature.get("file_path"):
         return "⚠️"
-    return "♻️" if signature.get("source") == "legacy" else "✅"
+    return "✅"
 
 
 async def _show_creditor_profiles(target, chat_id: int, edit: bool = False):
@@ -131,7 +131,7 @@ async def _show_credential_creditor_detail(callback: CallbackQuery, credential_i
         f"<b>Адрес:</b> {_display_html(profile.get('address') if profile else None)}",
         f"<b>Телефон:</b> {_display_html(profile.get('phone') if profile else None)}",
         f"<b>Email:</b> {_display_html(profile.get('email') if profile else None)}",
-        f"<b>Подпись:</b> {'закреплена за логином' if signature and signature.get('file_path') and signature.get('source') != 'legacy' else 'используется общая' if signature and signature.get('file_path') else 'не загружена'}",
+        f"<b>Подпись:</b> {'закреплена за логином' if signature and signature.get('file_path') else 'не загружена'}",
     ]
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ ФИО", callback_data=f"cred_creditor_field_{credential_id}_full_name")],
@@ -156,7 +156,7 @@ async def _show_signature_detail(callback: CallbackQuery, credential_id: int, st
     text = (
         "✍️ <b>Подпись займодавца</b>\n\n"
         f"<b>Логин:</b> {_display_html(_credential_label(credential))}\n"
-        f"<b>Статус:</b> {'закреплена за логином' if signature and signature.get('file_path') and signature.get('source') != 'legacy' else 'используется общая' if signature and signature.get('file_path') else 'не загружена'}"
+        f"<b>Статус:</b> {'закреплена за логином' if signature and signature.get('file_path') else 'не загружена'}"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📤 Загрузить подпись", callback_data=f"cred_signature_upload_{credential_id}")],
@@ -416,8 +416,13 @@ async def cb_cred_signature_copy(callback: CallbackQuery):
             )
         ])
     buttons.append([InlineKeyboardButton(text="↩ К подписи", callback_data=f"cred_signature_{target_credential_id}")])
+    text = (
+        "♻️ <b>Скопировать подпись</b>\n\nВыберите логин-источник."
+        if len(buttons) > 1
+        else "♻️ <b>Скопировать подпись</b>\n\nНет других логинов с загруженной подписью."
+    )
     await callback.message.edit_text(
-        "♻️ <b>Скопировать подпись</b>\n\nВыберите логин-источник.",
+        text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode="HTML",
     )

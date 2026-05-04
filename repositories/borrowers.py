@@ -6,6 +6,7 @@ from typing import Iterable
 
 from bot.repositories.db import get_db
 from bot.repositories.settings import save_api_change_alert
+from bot.services.borrowers.source_labels import split_borrower_source, split_contact_source
 from bot.utils.borrower_address import sanitize_borrower_address
 from bot.utils.borrower_addresses import (
     merge_primary_borrower_address,
@@ -194,67 +195,12 @@ def _serialize_display_names(display_names: list[str]) -> str | None:
     return json.dumps(display_names, ensure_ascii=False) if display_names else None
 
 
-def _extract_account_tag(value: str, prefix: str) -> str | None:
-    if not value.startswith(prefix):
-        return None
-    suffix = value[len(prefix):].strip("_")
-    return suffix or None
-
-
 def _normalize_source(source: str | None) -> tuple[str | None, str | None]:
-    value = str(source or "").strip()
-    if not value:
-        return None, None
-    if value in {"added", "opi"}:
-        return "search", None
-    if value == "manual":
-        return "manual", None
-    if value == "sheets":
-        return "sheets", None
-    if value in {"finkit", "zaimis", "kapusta"}:
-        return value, None
-    if value.startswith("finkit_investment_detail"):
-        return "finkit_investment_detail", _extract_account_tag(value, "finkit_investment_detail_")
-    if value.startswith("zaimis_investment_detail"):
-        return "zaimis_investment_detail", _extract_account_tag(value, "zaimis_investment_detail_")
-    if value.startswith("finkit_claim_pdf"):
-        return "finkit_investment_detail", _extract_account_tag(value, "finkit_claim_pdf_")
-    if value.startswith("finkit_archive_"):
-        return "finkit_borrow", _extract_account_tag(value, "finkit_archive_")
-    if value.startswith("zaimis_archive_"):
-        return "zaimis_borrow", _extract_account_tag(value, "zaimis_archive_")
-    if value.startswith("kapusta_archive_"):
-        return "kapusta_borrow", _extract_account_tag(value, "kapusta_archive_")
-    if value.startswith("finkit_overdue_pdf_"):
-        return "finkit_investment_detail", _extract_account_tag(value, "finkit_overdue_pdf_")
-    if value == "finkit_name_match":
-        return "finkit_borrow", None
-    if value.endswith("_borrow"):
-        return value, None
-    if value.startswith("finkit_"):
-        return "finkit_borrow", None
-    if value.startswith("zaimis_"):
-        return "zaimis_borrow", None
-    if value.startswith("kapusta_"):
-        return "kapusta_borrow", None
-    return value, None
+    return split_borrower_source(source)
 
 
 def _normalize_contact_source(source: str | None) -> tuple[str | None, str | None]:
-    value = str(source or "").strip()
-    if not value:
-        return None, None
-    if value == "manual":
-        return "manual", None
-    if value.startswith("finkit_investment_detail"):
-        return "finkit_investment_detail", _extract_account_tag(value, "finkit_investment_detail_")
-    if value.startswith("finkit_claim_pdf"):
-        return "finkit_investment_detail", _extract_account_tag(value, "finkit_claim_pdf_")
-    if value.startswith("finkit_overdue_pdf_"):
-        return "finkit_investment_detail", _extract_account_tag(value, "finkit_overdue_pdf_")
-    if value.startswith("zaimis_investment_detail"):
-        return "zaimis_investment_detail", _extract_account_tag(value, "zaimis_investment_detail_")
-    return value, None
+    return split_contact_source(source)
 
 
 def _pick_source(existing: str | None, incoming: str | None, priorities: dict[str, int]) -> str | None:

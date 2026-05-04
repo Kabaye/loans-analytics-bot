@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from bot.domain.borrowers import BorrowEntry
+from bot.domain.borrower_views import NotificationEntryView
 from bot.domain.subscriptions import Subscription
 from bot.repositories.subscriptions import (
     has_active_subscriptions_for_service,
@@ -68,11 +69,11 @@ def _coerce_utc_datetime(value) -> datetime | None:
     return None
 
 
-def _entry_available_at(entry: BorrowEntry) -> datetime | None:
+def _entry_available_at(entry: NotificationEntryView) -> datetime | None:
     return _coerce_utc_datetime(entry.created_at) or _coerce_utc_datetime(entry.updated_at)
 
 
-def _subscription_is_active_for_entry(sub: Subscription, entry: BorrowEntry) -> bool:
+def _subscription_is_active_for_entry(sub: Subscription, entry: NotificationEntryView) -> bool:
     entry_dt = _entry_available_at(entry)
     sub_dt = _coerce_utc_datetime(sub.created_at)
     if entry_dt and sub_dt and entry_dt < sub_dt:
@@ -96,7 +97,7 @@ def _render_subscription_caption(subs: list[Subscription]) -> str:
     return " / ".join(labels) if labels else "подписка"
 
 
-def _rating_marker(entry: BorrowEntry) -> str:
+def _rating_marker(entry: NotificationEntryView) -> str:
     score = entry.credit_score or 0
     if entry.service == "finkit":
         if score < 30:
@@ -112,24 +113,24 @@ def _rating_marker(entry: BorrowEntry) -> str:
     return ""
 
 
-def _format_rating_line(entry: BorrowEntry) -> str:
+def _format_rating_line(entry: NotificationEntryView) -> str:
     marker = _rating_marker(entry)
     if marker:
         return f"{marker}<b>{entry.credit_score:.0f}</b> рейтинг"
     return f"<b>{entry.credit_score:.0f}</b> рейтинг"
 
 
-def _format_opi_date(entry: BorrowEntry) -> str | None:
+def _format_opi_date(entry: NotificationEntryView) -> str | None:
     dt = _coerce_utc_datetime(entry.opi_checked_at)
     return dt.strftime("%d.%m") if dt else None
 
 
-def _format_scoring_date(entry: BorrowEntry) -> str | None:
+def _format_scoring_date(entry: NotificationEntryView) -> str | None:
     dt = _coerce_utc_datetime(entry.scoring_assessed_at)
     return dt.strftime("%d.%m %H:%M") if dt else None
 
 
-def _format_debt_load(entry: BorrowEntry) -> str | None:
+def _format_debt_load(entry: NotificationEntryView) -> str | None:
     if entry.debt_load_score is None:
         return None
     return f"{entry.debt_load_score:.2f}"
@@ -156,7 +157,7 @@ def _calc_gross_profit(amount: float, daily_rate: float, days: int, service: str
     return amount * rate_frac * days
 
 
-def calc_profits(entry: BorrowEntry) -> dict:
+def calc_profits(entry: NotificationEntryView) -> dict:
     """Calculate all profit metrics for an entry."""
     gross = _calc_gross_profit(entry.amount, entry.interest_day, entry.period_days, entry.service)
     amount_return = entry.amount + gross
@@ -175,7 +176,7 @@ def calc_profits(entry: BorrowEntry) -> dict:
     }
 
 
-def _build_finkit_url(entry: BorrowEntry) -> str:
+def _build_finkit_url(entry: NotificationEntryView) -> str:
     """Build a direct FinKit invest-manually URL with filters matching this loan."""
     params = []
     params.append(f"ordering=-borrower_score_value")
@@ -188,7 +189,7 @@ def _build_finkit_url(entry: BorrowEntry) -> str:
     return "https://finkit.by/app/invest-manually?" + "&".join(params)
 
 
-def _format_opi_line(entry: BorrowEntry) -> str | None:
+def _format_opi_line(entry: NotificationEntryView) -> str | None:
     """Format OPI line with date and appropriate icon."""
     if entry.opi_error:
         date_str = _format_opi_date(entry)
@@ -207,7 +208,7 @@ def _format_opi_line(entry: BorrowEntry) -> str | None:
     return f"⚠️ ОПИ: ответ не получен{suffix}"
 
 
-def _format_finkit_borrower(entry: BorrowEntry) -> list[str]:
+def _format_finkit_borrower(entry: NotificationEntryView) -> list[str]:
     """Format borrower section for FinKit notifications."""
     lines = []
     if entry.full_name:
@@ -251,10 +252,10 @@ def _format_finkit_borrower(entry: BorrowEntry) -> list[str]:
     return lines
 
 
-def _format_zaimis_borrower(entry: BorrowEntry) -> list[str]:
+def _format_zaimis_borrower(entry: NotificationEntryView) -> list[str]:
     """Format borrower section for Zaimis notifications."""
     lines = []
-    current_display_name = entry.display_name or (entry.display_names[-1] if entry.display_names else None)
+    current_display_name = entry.current_display_name
     if current_display_name:
         lines.append(f"\n<b>{current_display_name}</b>")
 
@@ -277,7 +278,7 @@ def _format_zaimis_borrower(entry: BorrowEntry) -> list[str]:
     return lines
 
 
-def _format_kapusta_borrower(entry: BorrowEntry) -> list[str]:
+def _format_kapusta_borrower(entry: NotificationEntryView) -> list[str]:
     """Format borrower section for Kapusta notifications."""
     lines = []
     if entry.display_name:
@@ -285,7 +286,7 @@ def _format_kapusta_borrower(entry: BorrowEntry) -> list[str]:
     return lines
 
 
-def _format_enrichment_section(entry: BorrowEntry) -> list[str]:
+def _format_enrichment_section(entry: NotificationEntryView) -> list[str]:
     """Format the enrichment section with data from our DB (not from API).
     This section is shown separately to distinguish DB-sourced data."""
     lines = []
@@ -342,7 +343,7 @@ def _format_enrichment_section(entry: BorrowEntry) -> list[str]:
     return lines
 
 
-def format_notification(entry: BorrowEntry, sub: Subscription | list[Subscription]) -> str:
+def format_notification(entry: NotificationEntryView, sub: Subscription | list[Subscription]) -> str:
     subs = sub if isinstance(sub, list) else [sub]
     icon = SERVICE_ICONS.get(entry.service, "📋")
     svc = SERVICE_NAMES.get(entry.service, entry.service)
@@ -391,8 +392,9 @@ def format_notification(entry: BorrowEntry, sub: Subscription | list[Subscriptio
         # Direct link with loan ID + date as text
         url = _build_finkit_url(entry)
         link_text = entry.id or "Открыть"
-        if entry.created_at:
-            dt_str = entry.created_at.strftime("%d.%m %H:%M:%S")
+        created_at = _coerce_utc_datetime(entry.created_at)
+        if created_at:
+            dt_str = created_at.strftime("%d.%m %H:%M:%S")
             link_text = f"{entry.id}  {dt_str}"
         lines.append(f"\n<a href=\"{url}\">{link_text}</a>")
     else:
@@ -425,20 +427,21 @@ async def prepare_notifications(
     for entry in entries:
         if not skip_enrichment and service != "finkit":
             await enrich_entry_from_borrowers(entry)
+        entry_view = NotificationEntryView.from_entry(entry)
 
         matched_by_chat: dict[int, list[Subscription]] = {}
         for chat_id, sub in subs:
-            if not _subscription_is_active_for_entry(sub, entry):
+            if not _subscription_is_active_for_entry(sub, entry_view):
                 continue
-            if not sub.matches(entry):
+            if not sub.matches(entry_view):
                 continue
             matched_by_chat.setdefault(chat_id, []).append(sub)
 
         for chat_id, matched_subs in matched_by_chat.items():
-            text = format_notification(entry, matched_subs)
+            text = format_notification(entry_view, matched_subs)
             plans.append(
                 PreparedNotification(
-                    entry_id=entry.id,
+                    entry_id=entry_view.id,
                     chat_id=chat_id,
                     text=text,
                     matched_subscriptions=matched_subs,

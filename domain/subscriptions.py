@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
-from bot.domain.borrowers import BorrowEntry
+from bot.domain.borrower_views import SubscriptionEntryView
 
 
 @dataclass
@@ -28,7 +28,7 @@ class Subscription:
     min_settled_loans: Optional[int] = None
     created_at: Optional[datetime] = None
 
-    def matches(self, entry: BorrowEntry) -> bool:
+    def matches(self, entry: SubscriptionEntryView) -> bool:
         if self.sum_min is not None and entry.amount < self.sum_min:
             return False
         if self.sum_max is not None and entry.amount > self.sum_max:

@@ -151,6 +151,14 @@ async def init_db() -> None:
             last_scan_at        TEXT DEFAULT (datetime('now'))
         );
 
+        CREATE TABLE IF NOT EXISTS notification_watermarks (
+            service             TEXT PRIMARY KEY,
+            last_ts             TEXT,
+            ids_at_last_ts_json TEXT NOT NULL DEFAULT '[]',
+            initialized_at      TEXT DEFAULT (datetime('now')),
+            updated_at          TEXT DEFAULT (datetime('now'))
+        );
+
         CREATE TABLE IF NOT EXISTS credential_sessions (
             credential_id       INTEGER PRIMARY KEY,
             service             TEXT NOT NULL,

@@ -411,6 +411,13 @@ class FinkitParser(BaseParser):
                             created_at = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
                         except Exception:
                             pass
+                    modified_str = item.get("modified")
+                    modified_at = None
+                    if modified_str:
+                        try:
+                            modified_at = datetime.fromisoformat(modified_str.replace("Z", "+00:00"))
+                        except Exception:
+                            pass
                     scoring_assessed_at = item.get("borrower_scoring_assessed_at")
                     if scoring_assessed_at:
                         try:
@@ -437,6 +444,7 @@ class FinkitParser(BaseParser):
                             penalty_interest=1.5,  # fixed for finkit
                             credit_score=score,
                             created_at=created_at,
+                            updated_at=modified_at,
                             profit_gross=profit_gross,
                             profit_net=profit_net,
                             amount_return=amount_return,

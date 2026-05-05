@@ -961,6 +961,7 @@ async def list_overdue_case_actions(overdue_case_id: int, chat_id: int, limit: i
             SELECT *
             FROM overdue_case_actions
             WHERE overdue_case_id = ? AND chat_id = ?
+              AND action_type IN ('sms_soft_sent', 'sms_hard_sent', 'claim_posted', 'claim_finkit_sent')
             ORDER BY COALESCE(effective_at, created_at) DESC, id DESC
             LIMIT ?
             """,

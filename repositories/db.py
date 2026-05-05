@@ -308,6 +308,13 @@ async def init_db() -> None:
                 (service, enabled, interval, hour_start, hour_end),
             )
 
+        await db.execute(
+            """
+            DELETE FROM overdue_case_actions
+            WHERE action_type NOT IN ('sms_soft_sent', 'sms_hard_sent', 'claim_posted', 'claim_finkit_sent')
+            """
+        )
+
         await db.commit()
         log.info("Database initialized at %s", DB_PATH)
     finally:

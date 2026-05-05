@@ -285,13 +285,9 @@ def _first_unsent_postal_address(case: dict, actions: list[dict]) -> int | None:
 def _tracking_notes(case: dict, actions: list[dict]) -> list[str]:
     notes: list[str] = []
     last_sms_sent = _latest_action(actions, "sms_soft_sent", "sms_hard_sent")
-    last_sms_generated = _latest_action(actions, "sms_soft_generated", "sms_hard_generated")
     if last_sms_sent:
         label = "жесткое SMS" if last_sms_sent.get("action_type") == "sms_hard_sent" else "SMS"
         notes.append(f"<b>Последнее SMS:</b> {label} — {_display_html(_format_action_datetime(last_sms_sent.get('effective_at') or last_sms_sent.get('created_at')))}")
-    elif last_sms_generated:
-        label = "жесткое SMS" if last_sms_generated.get("action_type") == "sms_hard_generated" else "SMS"
-        notes.append(f"<b>SMS подготовлено:</b> {label} — {_display_html(_format_action_datetime(last_sms_generated.get('effective_at') or last_sms_generated.get('created_at')))} (не отмечено отправленным)")
 
     postal_targets = list_case_borrower_addresses(case)
     for index, _target in enumerate(postal_targets, start=1):
@@ -303,19 +299,9 @@ def _tracking_notes(case: dict, actions: list[dict]) -> list[str]:
             ),
             None,
         )
-        generated = next(
-            (
-                action
-                for action in actions
-                if action.get("action_type") == "claim_generated" and int(action.get("target_index") or 0) == index
-            ),
-            None,
-        )
         label = "Письмо" if len(postal_targets) == 1 else f"Письмо {index}"
         if sent:
             notes.append(f"<b>{label}:</b> отправлено {_display_html(_format_action_datetime(sent.get('effective_at') or sent.get('created_at')))}")
-        elif generated:
-            notes.append(f"<b>{label}:</b> подготовлено {_display_html(_format_action_datetime(generated.get('effective_at') or generated.get('created_at')))}")
 
     latest_finkit_sent = _latest_action(actions, "claim_finkit_sent")
     if latest_finkit_sent:
@@ -338,15 +324,6 @@ def _tracking_notes(case: dict, actions: list[dict]) -> list[str]:
     sent_actions.sort(key=_action_sort_key, reverse=True)
     latest_sent = sent_actions[0] if sent_actions else None
     pending_postal_index = _first_unsent_postal_address(case, actions)
-    pending_postal_generated = next(
-        (
-            action
-            for action in actions
-            if action.get("action_type") == "claim_generated"
-            and int(action.get("target_index") or 0) == int(pending_postal_index or 0)
-        ),
-        None,
-    )
     next_step = None
     if latest_sent:
         followup_due = latest_sent.get("followup_due_at")
@@ -359,11 +336,6 @@ def _tracking_notes(case: dict, actions: list[dict]) -> list[str]:
             next_step = next_label
         else:
             next_step = "можно делать следующий контакт / повторное напоминание"
-    elif last_sms_generated:
-        next_step = "отправить подготовленное SMS и отметить отправку"
-    elif pending_postal_generated:
-        next_label = "отправить подготовленное письмо" if len(postal_targets) == 1 else f"отправить письмо на адрес {pending_postal_index}"
-        next_step = next_label
     elif pending_postal_index is not None:
         next_step = "отправить soft SMS"
     else:
@@ -376,11 +348,8 @@ def _tracking_notes(case: dict, actions: list[dict]) -> list[str]:
 def _action_title(action: dict) -> str:
     action_type = str(action.get("action_type") or "")
     titles = {
-        "sms_soft_generated": "SMS подготовлено",
         "sms_soft_sent": "SMS отмечено отправленным",
-        "sms_hard_generated": "Жесткое SMS подготовлено",
         "sms_hard_sent": "Жесткое SMS отмечено отправленным",
-        "claim_generated": "Претензия подготовлена",
         "claim_posted": "Письмо отмечено отправленным",
         "claim_finkit_sent": "Претензия отправлена через FinKit",
     }
@@ -779,17 +748,6 @@ async def _handle_claim_generation(callback: CallbackQuery, case_id: int, page: 
             file_path=str(doc_path),
             text_content=claim_text,
             payload=payload,
-        )
-        await log_overdue_case_action(
-            case_id,
-            callback.message.chat.id,
-            action_type="claim_generated",
-            channel="postal",
-            target_value=str((target or {}).get("address") or "").strip() or None,
-            target_index=idx,
-            generated_document_id=generated_document_id,
-            effective_at=_now_action_at(),
-            meta={"address_total": total_targets, "doc_type": "claim_docx"},
         )
         caption = "📄 Претензия сформирована." if total_targets == 1 else f"📄 Претензия {idx}/{total_targets} сформирована."
         await callback.message.answer_document(
@@ -1409,16 +1367,6 @@ async def cb_overdue_sms(callback: CallbackQuery):
         doc_type="sms_hard" if variant == "hard" else "sms",
         text_content=sms_text,
         payload=serialize_case_payload(case, None),
-    )
-    await log_overdue_case_action(
-        case_id,
-        callback.message.chat.id,
-        action_type="sms_hard_generated" if variant == "hard" else "sms_soft_generated",
-        channel="sms",
-        target_value=str(case.get("borrower_phone") or "").strip() or None,
-        generated_document_id=generated_document_id,
-        effective_at=_now_action_at(),
-        meta={"variant": variant},
     )
     title = "⚠️ <b>Жесткое SMS</b>" if variant == "hard" else "✉️ <b>SMS</b>"
     message_text = f"{title}\n\n<pre>{escape(sms_text)}</pre>"

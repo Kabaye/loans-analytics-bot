@@ -162,7 +162,7 @@ class KapustaParser(BaseParser):
                 profit_net = amount_return * 0.955 - amount
                 platform_fee = amount_return * 0.045
 
-                created_str = item.get("created_at")
+                created_str = item.get("created") or item.get("createdAt") or item.get("created_at")
                 created_at = None
                 if created_str:
                     try:

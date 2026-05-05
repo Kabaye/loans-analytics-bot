@@ -338,22 +338,8 @@ def _split_address(address: str | None) -> dict[str, str | None]:
 def _postal_lookup_meta(case: dict, target: dict[str, str] | None = None) -> dict[str, str | None]:
     payload = _parse_case_raw(case)
     lookup = payload.get("postal_lookup") or {}
-    target_address = str((target or {}).get("address") or "").strip()
-    primary_address = str(case.get("borrower_address") or "").strip()
-    use_lookup = not target_address or target_address == primary_address
-    postcode = str((target or {}).get("zip") or (lookup.get("postcode") if use_lookup else None) or case.get("borrower_zip") or "").strip() or None
-    match_address = str(lookup.get("match_address") or "").strip()
-    region = None
-    locality = None
-    if match_address and use_lookup:
-        parts = [part.strip() for part in match_address.split(",") if part.strip()]
-        if parts and re.fullmatch(r"\d{6}", parts[0]):
-            parts = parts[1:]
-        if parts:
-            region = _normalize_address_token(parts[0])
-        if len(parts) >= 2:
-            locality = _normalize_address_token(parts[1])
-    return {"postcode": postcode, "region": region, "locality": locality}
+    postcode = str((target or {}).get("zip") or lookup.get("postcode") or case.get("borrower_zip") or "").strip() or None
+    return {"postcode": postcode}
 
 
 def _strip_postcode_prefix(address: str | None, postcode: str | None) -> str:
@@ -364,43 +350,15 @@ def _strip_postcode_prefix(address: str | None, postcode: str | None) -> str:
     return text
 
 
-def _postal_address_score(address: str | None) -> tuple[int, int]:
-    text = str(address or "").strip()
-    if not text:
-        return (0, 0)
-    low = text.lower()
-    score = 0
-    if "область" in low:
-        score += 2
-    if "район" in low:
-        score += 2
-    if any(low.startswith(prefix) or f", {prefix}" in low for prefix in LOCALITY_PREFIXES):
-        score += 2
-    if any(marker in low for marker in ("ул.", "улица", "пер.", "пр-т", "проспект")):
-        score += 2
-    if "д." in low or "дом" in low:
-        score += 2
-    if "кв." in low or "квартира" in low:
-        score += 2
-    return (score, len(text))
-
-
 def _full_postal_address(case: dict, target: dict[str, str]) -> str | None:
-    lookup = _postal_lookup_meta(case, target)
     address = str(target.get("address") or "").strip()
-    match_address = str((_parse_case_raw(case).get("postal_lookup") or {}).get("match_address") or "").strip()
     postcode = str(
         target.get("zip")
-        or lookup.get("postcode")
+        or _postal_lookup_meta(case, target).get("postcode")
         or case.get("borrower_zip")
         or ""
     ).strip()
-    original = _strip_postcode_prefix(address, postcode)
-    matched = _strip_postcode_prefix(match_address, postcode)
-    best = original
-    if _postal_address_score(matched) > _postal_address_score(original):
-        best = matched
-    return best or None
+    return _strip_postcode_prefix(address, postcode) or None
 
 
 def _postal_address_lines(case: dict, target: dict[str, str]) -> list[str]:
@@ -426,8 +384,7 @@ def _postal_address_lines(case: dict, target: dict[str, str]) -> list[str]:
 
 def _compact_postal_address(case: dict, target: dict[str, str]) -> str:
     address_parts = _split_address(target.get("address"))
-    lookup = _postal_lookup_meta(case, target)
-    city = str(address_parts.get("city") or lookup.get("locality") or lookup.get("region") or "").strip() or None
+    city = str(address_parts.get("city") or "").strip() or None
     street_line = str(address_parts.get("street_line") or "").strip() or None
     line = ", ".join(part for part in [city, street_line] if part)
     if not line:

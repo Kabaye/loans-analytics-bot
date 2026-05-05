@@ -7,18 +7,9 @@ from bot.repositories.notification_watermarks import (
     load_notification_watermark,
     save_notification_watermark,
 )
-from bot.repositories.seen_entries import (
-    bootstrap_seen_entries,
-    is_seen_service_initialized,
-    load_seen_entry_state,
-    sync_seen_entries,
-)
-
-_seen_state: dict[str, dict[tuple[str, str], str | None]] = {}
-_seen_keys_loaded: dict[str, bool] = {}
-_watermark_state: dict[str, tuple[datetime | None, set[str]]] = {}
+_watermark_state: dict[str, datetime | None] = {}
 _watermark_loaded: dict[str, bool] = {}
-_TIMESTAMP_WATERMARK_SERVICES = {"finkit", "zaimis"}
+_TIMESTAMP_WATERMARK_SERVICES = {"finkit", "zaimis", "kapusta"}
 
 
 def _parse_timestamp(value: datetime | str | None) -> datetime | None:
@@ -39,10 +30,6 @@ def _parse_timestamp(value: datetime | str | None) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _timestamp_marker(entry: BorrowEntry) -> str:
-    return f"{str(entry.request_type or 'borrow')}:{str(entry.id)}"
-
-
 def _entry_watermark_timestamp(entry: BorrowEntry, service: str) -> datetime | None:
     if service == "finkit":
         return (
@@ -58,74 +45,54 @@ def _entry_watermark_timestamp(entry: BorrowEntry, service: str) -> datetime | N
             or _parse_timestamp(entry.created_at)
             or _parse_timestamp((entry.raw_data or {}).get("createdAt"))
         )
+    if service == "kapusta":
+        return (
+            _parse_timestamp(entry.created_at)
+            or _parse_timestamp((entry.raw_data or {}).get("created"))
+            or _parse_timestamp((entry.raw_data or {}).get("createdAt"))
+            or _parse_timestamp((entry.raw_data or {}).get("created_at"))
+        )
     return _parse_timestamp(entry.updated_at) or _parse_timestamp(entry.created_at)
 
 
 async def _compute_fresh_with_watermark(entries: list[BorrowEntry], service: str) -> list[BorrowEntry]:
     if not _watermark_loaded.get(service):
         row = await load_notification_watermark(service)
-        _watermark_state[service] = (
-            _parse_timestamp((row or {}).get("last_ts")),
-            {str(item) for item in ((row or {}).get("ids_at_last_ts") or [])},
-        )
+        _watermark_state[service] = _parse_timestamp((row or {}).get("last_ts"))
         _watermark_loaded[service] = True
 
-    last_ts, ids_at_last_ts = _watermark_state.get(service, (None, set()))
-    timestamped_entries: list[tuple[BorrowEntry, datetime, str]] = []
+    last_ts = _watermark_state.get(service)
+    timestamped_entries: list[tuple[BorrowEntry, datetime]] = []
     for entry in entries:
         entry_ts = _entry_watermark_timestamp(entry, service)
         if entry_ts is None:
             continue
-        timestamped_entries.append((entry, entry_ts, _timestamp_marker(entry)))
+        timestamped_entries.append((entry, entry_ts))
 
     if last_ts is None:
         if timestamped_entries:
-            max_ts = max(entry_ts for _entry, entry_ts, _marker in timestamped_entries)
-            ids_at_max_ts = sorted(marker for _entry, entry_ts, marker in timestamped_entries if entry_ts == max_ts)
-            await save_notification_watermark(service, max_ts.isoformat(), ids_at_max_ts)
-            _watermark_state[service] = (max_ts, set(ids_at_max_ts))
+            max_ts = max(entry_ts for _entry, entry_ts in timestamped_entries)
+            await save_notification_watermark(service, max_ts.isoformat())
+            _watermark_state[service] = max_ts
         return []
 
     fresh: list[BorrowEntry] = []
-    for entry, entry_ts, marker in timestamped_entries:
-        if entry_ts > last_ts or (entry_ts == last_ts and marker not in ids_at_last_ts):
+    for entry, entry_ts in timestamped_entries:
+        if entry_ts > last_ts:
             fresh.append(entry)
 
     if timestamped_entries:
-        max_ts = max(entry_ts for _entry, entry_ts, _marker in timestamped_entries)
-        ids_at_max_ts = sorted(marker for _entry, entry_ts, marker in timestamped_entries if entry_ts == max_ts)
-        await save_notification_watermark(service, max_ts.isoformat(), ids_at_max_ts)
-        _watermark_state[service] = (max_ts, set(ids_at_max_ts))
+        max_ts = max(entry_ts for _entry, entry_ts in timestamped_entries)
+        await save_notification_watermark(service, max_ts.isoformat())
+        _watermark_state[service] = max_ts
 
     return fresh
 
 
 async def compute_fresh(entries: list[BorrowEntry], service: str) -> list[BorrowEntry]:
-    if service in _TIMESTAMP_WATERMARK_SERVICES:
-        return await _compute_fresh_with_watermark(entries, service)
-
-    current_state = {
-        (str(entry.request_type or "borrow"), str(entry.id)): entry.freshness_fingerprint()
-        for entry in entries
-    }
-
-    if not _seen_keys_loaded.get(service):
-        _seen_state[service] = await load_seen_entry_state(service)
-        _seen_keys_loaded[service] = True
-        if not await is_seen_service_initialized(service):
-            await bootstrap_seen_entries(service, entries)
-            _seen_state[service] = current_state
-            return []
-
-    previous_state = _seen_state[service]
-    fresh = [
-        entry
-        for entry in entries
-        if previous_state.get((str(entry.request_type or "borrow"), str(entry.id))) != entry.freshness_fingerprint()
-    ]
-    await sync_seen_entries(service, entries)
-    _seen_state[service] = current_state
-    return fresh
+    if service not in _TIMESTAMP_WATERMARK_SERVICES:
+        return []
+    return await _compute_fresh_with_watermark(entries, service)
 
 
 __all__ = ["compute_fresh"]

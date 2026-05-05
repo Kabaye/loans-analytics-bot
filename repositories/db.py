@@ -128,34 +128,9 @@ async def init_db() -> None:
             active_hour_end     INTEGER DEFAULT 24
         );
 
-        CREATE TABLE IF NOT EXISTS seen_entries (
-            service             TEXT NOT NULL,
-            request_type        TEXT NOT NULL DEFAULT 'borrow',
-            entry_id            TEXT NOT NULL,
-            fingerprint         TEXT,
-            detected_at         TEXT DEFAULT (datetime('now')),
-            first_seen_at       TEXT DEFAULT (datetime('now')),
-            last_seen_at        TEXT DEFAULT (datetime('now')),
-            last_detected_at    TEXT DEFAULT (datetime('now')),
-            is_active           INTEGER DEFAULT 1,
-            deactivated_at      TEXT,
-            PRIMARY KEY (service, request_type, entry_id)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_seen_entries_service_seen
-            ON seen_entries(service, is_active, last_seen_at);
-
-        CREATE TABLE IF NOT EXISTS seen_entry_services (
-            service             TEXT PRIMARY KEY,
-            initialized_at      TEXT DEFAULT (datetime('now')),
-            last_scan_at        TEXT DEFAULT (datetime('now'))
-        );
-
         CREATE TABLE IF NOT EXISTS notification_watermarks (
             service             TEXT PRIMARY KEY,
             last_ts             TEXT,
-            ids_at_last_ts_json TEXT NOT NULL DEFAULT '[]',
-            initialized_at      TEXT DEFAULT (datetime('now')),
             updated_at          TEXT DEFAULT (datetime('now'))
         );
 
@@ -294,6 +269,30 @@ async def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_overdue_case_actions_followup
             ON overdue_case_actions(chat_id, followup_due_at);
         """)
+
+        await db.execute("DROP TABLE IF EXISTS seen_entries")
+        await db.execute("DROP TABLE IF EXISTS seen_entry_services")
+
+        watermark_columns = {
+            str(row["name"])
+            for row in await db.execute_fetchall("PRAGMA table_info(notification_watermarks)")
+        }
+        expected_watermark_columns = {"service", "last_ts", "updated_at"}
+        if watermark_columns and watermark_columns != expected_watermark_columns:
+            await db.executescript("""
+            CREATE TABLE notification_watermarks_new (
+                service     TEXT PRIMARY KEY,
+                last_ts     TEXT,
+                updated_at  TEXT DEFAULT (datetime('now'))
+            );
+
+            INSERT INTO notification_watermarks_new (service, last_ts, updated_at)
+            SELECT service, last_ts, COALESCE(updated_at, datetime('now'))
+            FROM notification_watermarks;
+
+            DROP TABLE notification_watermarks;
+            ALTER TABLE notification_watermarks_new RENAME TO notification_watermarks;
+            """)
 
         for service, enabled, interval, hour_start, hour_end in [
             ("kapusta", 1, 600, 8, 23),
